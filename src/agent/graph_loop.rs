@@ -1147,7 +1147,7 @@ mod tests {
     fn build_loop_with(model_responses: Vec<&str>) -> GraphLoop {
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::new(model_responses));
         let tools = Arc::new(ToolRegistry::new());
-        let proposer = GraphProposer::new(model.clone(), tools.clone());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         GraphLoop::new("test task", proposer, verifier, None, tools, cfg)
@@ -1300,7 +1300,7 @@ mod tests {
             r#"{"step":"call_tool","tool":"bash","args":{"command":"echo from_tool"},"rationale":"smoke"}"#,
             r#"{"step":"ready_for_verify","rationale":"done"}"#,
         ]));
-        let proposer = GraphProposer::new(model.clone(), tools.clone());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         let mut gl = GraphLoop::new("smoke test", proposer, verifier, None, tools, cfg);
@@ -1544,7 +1544,7 @@ mod tests {
         let shared: Arc<dyn Model> =
             Arc::new(ScriptedModel::new(vec![patch_json, l1_json, ready_json]));
         let tools = Arc::new(ToolRegistry::new());
-        let proposer = GraphProposer::new(shared.clone(), tools.clone());
+        let proposer = GraphProposer::new(shared.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
 
         let mut sources = std::collections::HashMap::new();
@@ -1604,7 +1604,7 @@ mod tests {
         // sequence (ScriptedModel's mutex guarantees serial pop ordering).
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::new(model_responses));
         let tools = Arc::new(ToolRegistry::new());
-        let proposer = GraphProposer::new(model.clone(), tools.clone());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         let decomposer = super::super::decomposer::Decomposer::new(model.clone());
@@ -1789,7 +1789,7 @@ mod tests {
         // serves all components serially in the order responses are queued.
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::new(model_responses));
         let tools = Arc::new(ToolRegistry::new());
-        let proposer = GraphProposer::new(model.clone(), tools.clone());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         let decomposer = super::super::decomposer::Decomposer::new(model.clone());
@@ -1911,7 +1911,7 @@ mod tests {
     ) -> GraphLoop {
         let model: Arc<dyn Model> = Arc::new(ScriptedModel::new(model_responses));
         let tools = Arc::new(ToolRegistry::new());
-        let proposer = GraphProposer::new(model.clone(), tools.clone());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         let decomposer = super::super::decomposer::Decomposer::new(model.clone());

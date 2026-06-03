@@ -40,6 +40,10 @@ use graph_harness::agent::{
 };
 use graph_harness::context::FilesystemSources;
 use graph_harness::model::ModelConfig;
+use graph_harness::skills::{
+    capture::capture_skill, storage::LocalSkillStorage, CompositeSkillStorage, RepoSkillStorage,
+    SkillStorage,
+};
 use graph_harness::tools::{BashTool, ReadOnly, ToolRegistry};
 use std::fs;
 use std::io::{self, BufRead, Write};
@@ -102,8 +106,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let loader = Arc::new(FilesystemSources::new(cwd.clone()));
 
+    // ---- Skill storage (Phase: skill capture & reuse) ----
+    // Two roots: a `LocalSkillStorage` for new captures (default install at
+    // `~/.local/share/graph-centric/skills/`, with a tempdir fallback when
+    // `$HOME` isn't set) and a `RepoSkillStorage` at `<cwd>/skills/` for
+    // approved/curated skills. The Proposer sees the composite; `capture_skill`
+    // uses the local root directly because the spec is "new saves always go
+    // to local; promote to repo by filesystem". The composite's local and
+    // the capture's local share the same on-disk root (different in-process
+    // instances, since `LocalSkillStorage` is not `Clone`), but only the
+    // capture path writes — the composite is read-only by design
+    // (`CompositeSkillStorage::save` returns an error).
+    let local_storage: Arc<LocalSkillStorage> = Arc::new(
+        LocalSkillStorage::default_install().unwrap_or_else(|| {
+            LocalSkillStorage::new(std::env::temp_dir().join("graph-centric-skills-fallback"))
+        }),
+    );
+    let composite_local_root = local_storage
+        .local_root()
+        .expect("LocalSkillStorage always reports its local root");
+    let repo_storage = RepoSkillStorage::new(cwd.join("skills"));
+    let skill_storage: Arc<dyn graph_harness::skills::SkillStorage> =
+        Arc::new(CompositeSkillStorage::new(
+            Some(LocalSkillStorage::new(composite_local_root)),
+            repo_storage,
+        ));
+
     // ---- Build the loop ----
-    let proposer = GraphProposer::new(proposer_model, tools.clone());
+    let proposer = GraphProposer::new(
+        proposer_model.clone(),
+        tools.clone(),
+        Some(skill_storage.clone()),
+    );
     let verifier = Verifier::with_model(verifier_model).with_loader(loader.clone());
     let enricher = L1Enricher::new(enricher_model, loader.clone());
     let repairer = LocalRepairer::new(repairer_model).with_l1_enricher(enricher.clone());
@@ -353,6 +387,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 .map(|rc| format!(" [root_cause={:?}]", rc))
                                 .unwrap_or_default()
                         );
+                    }
+
+                    // Phase: skill capture & reuse. When the review passed,
+                    // fire `capture_skill` in the background — the returned
+                    // `JoinHandle` is dropped (fire-and-forget). The
+                    // `local_storage` Arc is shared with the in-loop
+                    // composite, but only the capture path actually writes
+                    // to it (the composite's `save` is intentionally
+                    // disabled in v1).
+                    if review.passed {
+                        let review_json = serde_json::to_value(review)
+                            .unwrap_or(serde_json::Value::Null);
+                        let handle = capture_skill(
+                            gl.graph.clone(),
+                            review_json,
+                            task.clone(),
+                            None,
+                            proposer_model.clone(),
+                            local_storage.clone(),
+                        );
+                        // Fire-and-forget: drop the handle. The capture
+                        // task continues to run in the background.
+                        drop(handle);
+                        println!(" Skill capture kicked off in the background.");
+                    } else {
+                        info!("review did not pass; skipping skill capture");
                     }
                 } else {
                     println!(" Review: (skipped — no Reviewer configured)");

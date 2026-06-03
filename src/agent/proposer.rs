@@ -73,6 +73,10 @@ impl ProposerStep {
 pub struct GraphProposer {
     pub model: Arc<dyn Model>,
     pub tools: Arc<ToolRegistry>,
+    /// Optional storage of past successful-run skills. When set, the
+    /// system prompt includes a "## Available skills" section listing
+    /// them. When `None`, no section is included.
+    pub skills: Option<std::sync::Arc<dyn crate::skills::SkillStorage>>,
     /// Sampling temperature for the proposer call. Default 0.2.
     pub temperature: f64,
     /// Output cap for proposer responses (mostly structured JSON, so small).
@@ -80,10 +84,15 @@ pub struct GraphProposer {
 }
 
 impl GraphProposer {
-    pub fn new(model: Arc<dyn Model>, tools: Arc<ToolRegistry>) -> Self {
+    pub fn new(
+        model: Arc<dyn Model>,
+        tools: Arc<ToolRegistry>,
+        skills: Option<std::sync::Arc<dyn crate::skills::SkillStorage>>,
+    ) -> Self {
         Self {
             model,
             tools,
+            skills,
             temperature: 0.2,
             // Generous default. Reasoning-style models (DeepSeek-v4-pro,
             // GPT-o1, Claude with extended thinking) can burn 8-20K tokens
@@ -109,6 +118,16 @@ impl GraphProposer {
         self
     }
 
+    /// Attach a skill storage. The Proposer will list available skills
+    /// in its system prompt.
+    pub fn with_skills(
+        mut self,
+        skills: std::sync::Arc<dyn crate::skills::SkillStorage>,
+    ) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
     /// Build the system prompt for a given task. Includes the schema for
     /// `ProposerStep` and the currently registered tools.
     pub fn build_system_prompt(&self, task: &str) -> String {
@@ -127,9 +146,20 @@ impl GraphProposer {
             }
         }
 
-        format!(
+        let mut prompt = format!(
             "{PROMPT_PREAMBLE}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{PROMPT_RULES}"
-        )
+        );
+
+        // Append the skills section if a storage is attached.
+        if let Some(skills) = &self.skills {
+            let section = crate::skills::retrieve::list_for_prompt(skills.as_ref());
+            if !section.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&section);
+            }
+        }
+
+        prompt
     }
 
     /// Compose a `Conversation` seeded with this proposer's system prompt
@@ -611,7 +641,7 @@ mod tests {
             responses.iter().rev().map(|s| s.to_string()).collect(),
         ));
         let tools = Arc::new(ToolRegistry::new());
-        GraphProposer::new(model, tools)
+        GraphProposer::new(model, tools, None)
     }
 
     #[test]
@@ -820,6 +850,54 @@ mod tests {
             prompt.contains("L1Enricher") || prompt.contains("automatically"),
             "missing instruction about L1 enrichment"
         );
+    }
+
+    #[test]
+    fn proposer_system_prompt_includes_skills_section_when_storage_set() {
+        use crate::graph::Graph;
+        use crate::skills::storage::{LocalSkillStorage, SkillStorage};
+        use crate::skills::types::{Skill, SkillMeta};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = LocalSkillStorage::new(dir.path().to_path_buf());
+        let skill = Skill {
+            slug: "demo-skill".to_string(),
+            task: "do X".to_string(),
+            trigger: "applies when X is needed".to_string(),
+            graph: Graph::new(),
+            review: serde_json::json!({}),
+            meta: SkillMeta {
+                created_at: "2026-06-03T00:00:00Z".to_string(),
+                task_id: None,
+                model_used: "test".to_string(),
+                domain_tags: vec![],
+                l1_avg_confidence: 0.0,
+            },
+        };
+        storage.save(&skill).unwrap();
+
+        let storage_arc: Arc<dyn crate::skills::SkillStorage> = Arc::new(storage);
+        let model = Arc::new(MockModel::new(vec![]));
+        let proposer = GraphProposer::new(
+            model,
+            Arc::new(ToolRegistry::new()),
+            Some(storage_arc),
+        );
+        let prompt = proposer.build_system_prompt("any task");
+        assert!(prompt.contains("## Available skills"));
+        assert!(prompt.contains("demo-skill"));
+    }
+
+    #[test]
+    fn proposer_system_prompt_omits_skills_section_when_storage_none() {
+        let model = Arc::new(MockModel::new(vec![]));
+        let proposer = GraphProposer::new(
+            model,
+            Arc::new(ToolRegistry::new()),
+            None,
+        );
+        let prompt = proposer.build_system_prompt("any task");
+        assert!(!prompt.contains("## Available skills"));
     }
 
     #[tokio::test]
