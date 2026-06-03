@@ -23,6 +23,7 @@ pub mod model;
 pub mod scheduler;
 pub mod skills;
 pub mod tools;
+pub mod web;
 
 pub use error::{HarnessError, Result};
 pub use graph::{

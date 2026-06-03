@@ -1,0 +1,70 @@
+//! Web gateway: axum HTTP/SSE server wrapping the existing agent loop.
+//!
+//! See `docs/superpowers/specs/2026-06-03-web-gateway-design.md` for the design.
+//!
+//! This module is a thin HTTP surface. The actual agent logic lives in
+//! `crate::agent` (GraphLoop, SubAgent, etc.) and `crate::skills` (skill
+//! storage). The web module just exposes these via REST + SSE.
+
+pub mod errors;
+pub mod state;
+pub mod events;
+pub mod run_session;
+pub mod api_runs;
+pub mod api_skills;
+pub mod api_files;
+
+use axum::{routing::get, Router};
+use std::sync::Arc;
+use tower_http::services::ServeDir;
+use crate::skills::SkillStorage;
+
+/// Shared application state passed to every axum handler.
+#[derive(Clone)]
+pub struct WebState {
+    pub runs: Arc<tokio::sync::RwLock<std::collections::HashMap<RunId, Arc<run_session::RunSession>>>>,
+    pub skills: Arc<dyn SkillStorage>,
+    pub config: state::WebConfig,
+}
+
+impl WebState {
+    pub fn new(skills: Arc<dyn SkillStorage>, config: state::WebConfig) -> Self {
+        Self {
+            runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            skills,
+            config,
+        }
+    }
+}
+
+/// Unique identifier for a run (UUID v4 string).
+pub type RunId = String;
+
+/// Build the axum Router. `static_dir` is the path to `webui/dist/`
+/// (or empty string to skip the static-file mount in tests).
+pub fn router(state: WebState, static_dir: &str) -> Router {
+    let state = Arc::new(state);
+    let api = Router::new()
+        .route("/health", get(api_runs::health))
+        .route("/runs", get(api_runs::list_runs).post(api_runs::create_run))
+        .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))
+        .route("/runs/:id/events", get(api_runs::run_events))
+        .route("/runs/:id/answer", axum::routing::post(api_runs::post_answer))
+        .route("/runs/:id/repair", axum::routing::post(api_runs::post_repair))
+        .route("/skills", get(api_skills::list_skills))
+        .route("/skills/:slug", get(api_skills::get_skill).delete(api_skills::delete_skill))
+        .route("/skills/:slug/promote", axum::routing::post(api_skills::promote_skill))
+        .route("/files/changed", get(api_files::files_changed))
+        .route("/files/diff", get(api_files::file_diff))
+        .with_state(state);
+
+    let mut app = Router::new().nest("/api", api);
+
+    if !static_dir.is_empty() {
+        app = app.fallback_service(ServeDir::new(static_dir));
+    }
+
+    app
+}
+
+pub use errors::ApiError;
