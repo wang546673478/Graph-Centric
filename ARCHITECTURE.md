@@ -5,6 +5,29 @@ aren't obvious from reading the code, the alternatives we considered and
 rejected, and the trade-offs that shape every component. Read `README.md`
 first if you haven't.
 
+**Other languages:** [English](ARCHITECTURE.md) | [简体中文](ARCHITECTURE.zh-CN.md)
+
+---
+
+## Recent changes
+
+- **v1.1 (2026-06-03) — IMPLICIT_CWD_WRITE_VERBS.** The `ScopeGuard` now
+  recognizes 12 common build tools (`cargo`, `rustc`, `go`, `node`,
+  `npm`, `yarn`, `pnpm`, `python`, `python3`, `pip`, `pip3`, `make`) as
+  "implicit cwd writes": when the command has no explicit out-of-scope
+  path argument, the scope check is skipped. Verb list is
+  runtime-configurable via `with_implicit_cwd_verb` /
+  `without_implicit_cwd_verb` / `reset_implicit_cwd_verbs`. The bash
+  algorithm grew from 7 steps to 10 (compound check now runs before
+  the "unrecognized" check; new "empty + implicit_cwd → Ok" branch).
+  See §5, §10, §13.
+- **v1 (2026-06-03) — Tool System Rework.** New `DangerousCommandDeny`
+  policy (default-allow, deny on a 20-pattern high-risk command list) and
+  `ScopeGuard` (write-scope derived from `task.involved_nodes`). The
+  SubAgent default policy switched from `AllowAll` to
+  `DangerousCommandDeny`; the dispatcher auto-derives a `ScopeGuard`
+  per task. See §10, §7.
+
 ---
 
 ## 1. Core thesis: binding-constraint on long agent tasks
@@ -282,6 +305,33 @@ We chose this over `success=true with graph_errors populated` because:
 - `all_succeeded` becomes a single boolean the caller checks; downstream
   code doesn't need to inspect both success and graph_errors.
 
+### Sub-agent tool access (v1 + v1.1)
+
+Sub-agents run the bash tool under a **two-guard** policy:
+
+1. **`DangerousCommandDeny`** (default) — permits every registered tool
+   freely, but blocks bash commands whose `command` field matches any of
+   20 high-risk patterns (rm -rf /, mkfs, kubectl delete, terraform
+   destroy, git push --force, pipe-to-shell, disk redirects, etc.).
+2. **`ScopeGuard`** (auto-derived per task) — constrains bash writes to
+   paths reachable from the task's `involved_nodes` (or their distance-1
+   neighbors). Reads are unconstrained by default — "exploring the
+   world" is a legitimate model behavior. The dispatcher (not the
+   caller, not the model) constructs this guard from the graph at task
+   spawn time.
+
+In **v1.1**, the `ScopeGuard` recognizes 12 common build tools as
+"implicit cwd writes": a bare `cargo build` or `npm install` is
+allowed even though it has no explicit path argument, because the
+guard trusts that the tool writes to a cwd-based subdirectory
+(`target/`, `node_modules/`, etc.) which is in scope when the agent's
+cwd is. Commands that DO specify an explicit out-of-scope path (e.g.
+`cargo build --target-dir /elsewhere`) still get the standard
+scope check. The verb list is runtime-configurable per
+`ScopeGuard` instance — see [`src/tools/scope_guard.rs`](src/tools/scope_guard.rs)
+and the design spec in
+[`docs/superpowers/specs/2026-06-03-implicit-cwd-write-verbs-design.md`](docs/superpowers/specs/2026-06-03-implicit-cwd-write-verbs-design.md).
+
 ---
 
 ## 6. Repair architecture
@@ -512,6 +562,23 @@ unconstrained by default — exploring the world is a legitimate model
 behavior. The model is free to pick any registered tool; the two guards
 are the only thing standing between it and the shell.
 
+**v1.1 extension (IMPLICIT_CWD_WRITE_VERBS):** the `ScopeGuard` also
+recognizes 12 common build tools as "implicit cwd writes"
+(`cargo`, `rustc`, `go`, `node`, `npm`, `yarn`, `pnpm`, `python`,
+`python3`, `pip`, `pip3`, `make`). When such a tool is invoked with
+no explicit path argument, the scope check is skipped (we assume the
+tool writes to a cwd-based subdir like `target/` or `node_modules/`).
+The bash algorithm grew from 7 steps to 10: the compound-operator
+check now runs **before** the "unrecognized" check, so a compound
+command of any verb is denied on structural grounds first; and a new
+"empty + implicit_cwd → Ok" branch lets bare `cargo build` through.
+The verb list is runtime-configurable:
+[`ScopeGuard::with_implicit_cwd_verb`](src/tools/scope_guard.rs) /
+`without_implicit_cwd_verb` / `reset_implicit_cwd_verbs`. See the spec
+in
+[`docs/superpowers/specs/2026-06-03-implicit-cwd-write-verbs-design.md`](docs/superpowers/specs/2026-06-03-implicit-cwd-write-verbs-design.md)
+and the disclosed limitations in `README.md` §Build tool caveats.
+
 Why not put the gate on `Tool::call` itself? Because then every tool
 would have to implement policy logic, and policy would be coupled to tool
 implementation. With separation:
@@ -711,6 +778,39 @@ sub-agent failure-to-converge.
 
 Phase 5+ scope item: nested GraphLoop with shared L0+L1 from parent and
 private L2 access.
+
+### v1.1 build-tool guard: three known limitations
+
+The `IMPLICIT_CWD_WRITE_VERBS` rule (allow bare `cargo build`, `npm
+install`, etc., without an explicit path) intentionally trades off
+finer-grained control for ergonomic model behavior. Three known holes,
+each with a documented mitigation:
+
+1. **System-install commands are allowed.** `cargo install foo`, `pip
+   install foo`, `npm install -g foo` fall under the implicit-cwd rule
+   even though they write to `~/.cargo/`, site-packages, or global
+   node_modules. The guard cannot detect this without parsing the
+   tool's behavior. **Mitigation:** call
+   `ScopeGuard::without_implicit_cwd_verb("cargo")` (or `pip` / `npm`)
+   to disable the verb in stricter environments.
+
+2. **Build-tool detection is by first token only.** A shell alias
+   named `cargo` that writes to `/etc/` would pass the verb check.
+   `DangerousCommandDeny` catches destructive payloads; the scope
+   check catches explicit out-of-scope paths. Neither catches a clever
+   alias. **Mitigation:** trust the model accordingly; layer additional
+   policy if the environment is hostile.
+
+3. **`cargo run`, `cargo test`, `cargo bench` are allowed.** They
+   execute arbitrary code. The deny-list does not catch them. **Mitigation:**
+   `ScopeGuard::without_implicit_cwd_verb("cargo")` to disable all
+   cargo invocations, or layer a custom `Policy` that catches `cargo
+   test` / `cargo run` by substring match.
+
+These are honest v1.1 limitations; closing the holes is in v1.2
+scope (per-subcommand exclusion list, precise "this writes to
+`<subdir>`" detection). See `README.md` §Build tool caveats for the
+user-facing disclosure.
 
 ### No streaming output
 

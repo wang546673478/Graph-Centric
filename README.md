@@ -245,6 +245,15 @@ Live model tests are gated behind `LIVE_MODEL_TEST=1`:
 LIVE_MODEL_TEST=1 cargo test --lib model::openai_compat
 ```
 
+## Documentation
+
+- **[English](README.md)** (this file) — quick start, what it does, honest scope
+- **[简体中文](README.zh-CN.md)** — 中文版
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** — design rationale, rejected alternatives, trade-offs
+- **[ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md)** — 中文版架构文档
+- `docs/superpowers/specs/` — design specs (English) for the two completed tool-system features
+- `docs/superpowers/plans/` — implementation plans (English) for the same
+
 ## Repository layout
 
 ```
