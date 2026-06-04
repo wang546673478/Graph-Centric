@@ -6,6 +6,16 @@
 **每一个 agent 任务，本质上都是对关系图（relationship graph）的操作。**
 领域知识——代码、基础设施、研究、规划——通过同一个接缝注入；编排器本身保持通用。
 
+## 核心思想
+
+图**不是**被动数据存储,也不是事件流水。**图是 orchestrator 的计划**:大模型(作为主 agent)把图当成工作记忆来维护,整套循环是:
+
+1. **规划(Plan)。** 主 agent 读图,然后 (a) 当任务范围清晰时,直接给图加子节点(Mode A —— 明确方案);或 (b) 当任务不清晰时,先发 `ask_user` 跟用户对齐方向(Mode B —— 探索形式),再去画节点。
+2. **派发(Dispatch)。** 子 agent 各自负责一个子节点,以图为上下文执行。**子 agent 不直接改图**,只回报"成功"或"失败 + 证据"。
+3. **复核(Review)。** 对每个子节点按 orchestrator 的规格做 per-node 复核。通过 → 节点标 done;不通过 → orchestrator 写一个**局部** `GraphPatch`(只动那一个子节点的规格,不是整张图),循环重派那一个子 agent。
+
+"graph-centric" 在代码层面的含义:**每一次状态变更都是一个有明确 scope 的 `GraphPatch`**。LocalRepairer(处理 verifier 发现的问题)和 per-sub-agent-failure 重派,走的是**同一套机制**——只是触发源不同。
+
 ```
                   task description
                          |
@@ -90,11 +100,12 @@ cargo run --bin agent_a -- "你的任务"
 
 参数也可以省略，会被提示输入。agent 会：
 
-1. 通过对话构建关系图（需要时主动问澄清问题）
-2. 根据图把任务拆成子任务
-3. 并发派发子 agent（每个带 `bash` 工具访问，受危险命令黑名单保护）
-4. 跑 `cargo check` 作为执行后校验器（可配置）
-5. 用确定性检查 + LLM-as-judge 做最终验收
+1. **入口（Intake）。** 任务不清楚时，主 agent 先发 `ask_user` 跟用户对齐方向，再画图节点；任务清晰时直接进入规划（对应上面核心思想里的 Mode A vs Mode B）。
+2. 通过对话构建关系图（需要时主动问澄清问题）
+3. 根据图把任务拆成子任务
+4. 并发派发子 agent（每个带 `bash` 工具访问，受危险命令黑名单保护）
+5. 跑 `cargo check` 作为执行后校验器（可配置）
+6. 用确定性检查 + LLM-as-judge 做最终验收
 
 输出落在 `./demo_output/`：
 

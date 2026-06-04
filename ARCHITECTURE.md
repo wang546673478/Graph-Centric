@@ -56,6 +56,51 @@ counteracts all three failure modes. The graph is the world model that
 every component reads and writes; the conversation becomes commentary, not
 state.
 
+## 1a. Core idea: the graph is the orchestrator's plan
+
+The graph is **not** a passive data store and **not** a transcript of past
+events. It is the **orchestrator's plan**: the model (acting as main agent)
+maintains the graph as its working memory, and the loop is:
+
+1. **Plan.** Main agent reads the graph and either
+   - **Mode A (clear plan)** — extends the graph with sub-nodes for a
+     well-scoped task, **or**
+   - **Mode B (exploratory)** — emits `ask_user` to clarify scope with the
+     user before drawing any nodes.
+
+   In both modes the main agent never "does the work itself" in this
+   phase — it only writes nodes/edges. Anything that requires
+   investigating a sub-domain is a sub-agent's job in the Task phase.
+2. **Dispatch.** Sub-agents execute one sub-node each, using the graph
+   (plus the sub-node's spec / evidence) as their context. Sub-agents do
+   **not** edit the graph — they report `success` or
+   `report_graph_error` with evidence.
+3. **Review.** Per-node review against the orchestrator's spec. Pass → the
+   sub-node is marked done. Fail → the orchestrator writes a **local**
+   `GraphPatch` (one sub-node's spec, never the whole graph) and the loop
+   re-dispatches that one sub-agent.
+
+This is what "graph-centric" means in code: **every state mutation is a
+`GraphPatch` of a specific scope, and there is one mechanism (the patch)
+regardless of what triggered the change.** The `LocalRepairer` used for
+verifier findings and the per-sub-agent-failure re-dispatch are the same
+mechanism — different triggers, same shape of patch.
+
+Mode B is not optional. If the model is allowed to draw a graph from a
+vague task, it will pick an interpretation, and that interpretation is
+the only thing the rest of the loop sees. There is no recovery from a
+"wrong first guess" inside a 24-round Graph phase — the verifier and the
+sub-agents will all be working off a misframed plan. Mode B forces the
+clarification step **before** any planning.
+
+Concretely, Mode B is enforced by the proposer's system prompt (the
+"intake" rule): the first `ProposerStep` from a fresh conversation is
+expected to be `AskUser` whenever the task lacks a concrete success
+criterion, references external context the model doesn't have, or is
+otherwise open to multiple readings. The harness does not gate on this
+in code — it relies on the model. (A future change could add a
+deterministic "did you ask?" check on the first round.)
+
 ---
 
 ## 2. The three-layer graph (L0 / L1 / L2)
@@ -149,6 +194,13 @@ determinism on the spine.
 These aren't sub-phases; each is a distinct beat of `step()`. The
 caller-visible `LoopState` reflects this — `Running` ticks while the
 machine is mid-phase, named states when something needs the caller.
+
+**Intake happens inside the Graph phase, before any node is drawn.** The
+first `ProposerStep` in a fresh conversation is expected to be `AskUser`
+when the task is open to multiple readings (Mode B from §1a). A clear,
+well-scoped task proceeds directly to `ProposePatch` (Mode A). The
+intake distinction is a **prompt convention, not a code gate** — see
+§1a for why this matters and the trade-off we accepted.
 
 ### Why `step()` is reentrant
 
@@ -362,6 +414,22 @@ We chose per-issue anyway:
 
 The time-for-space principle (#2 in the design principles) is the
 generalization: prefer many small corrections over fewer bulk ones.
+
+### One mechanism, two triggers: `LocalRepairer` and sub-agent re-dispatch
+
+`LocalRepairer` is the canonical "per-issue, scoped" patcher. It is
+triggered today by `Verifier` findings (high-severity issues during the
+Graph phase). The same mechanism — same patch shape, same scope rules,
+same single-issue-per-call discipline — applies to a second trigger that
+the rest of the architecture assumes: **a sub-agent reporting failure
+during the Task phase.** When a sub-agent returns `success=false` with
+`report_graph_error`, the orchestrator's response is a `GraphPatch`
+scoped to that one sub-node's spec (its `Node.metadata["spec"]` or
+equivalent), applied to the graph, and the loop re-dispatches **that one
+sub-agent** — not the whole task graph. Per the §1a "core idea": a
+sub-agent failure is no different in shape from a verifier finding;
+both produce a per-node `GraphPatch` and trigger a re-run of one
+component.
 
 ### Scope enforcement
 

@@ -5,6 +5,29 @@ thesis: **every agent task is fundamentally an operation on a relationship
 graph.** Domain knowledge — code, infrastructure, research, planning — enters
 through a single seam; the orchestrator stays generic.
 
+## Core idea
+
+The graph is **not** a passive data store or a transcript of what happened.
+It is the **orchestrator's plan**: the LLM (acting as main agent) maintains
+the graph as its working memory, and the loop is:
+
+1. **Plan.** Main agent reads the graph and either (a) extends it with new
+   sub-nodes for a clearly-scoped task (Mode A — clear plan) or (b) emits
+   `ask_user` to clarify scope with the user before drawing nodes
+   (Mode B — exploratory).
+2. **Dispatch.** Sub-agents execute one sub-node each, using the graph as
+   context. They do **not** edit the graph — only report success/failure
+   with evidence.
+3. **Review.** Per-node review against the orchestrator's spec. Pass → node
+   is marked done. Fail → orchestrator writes a **local** `GraphPatch`
+   (one sub-node's spec, not the whole graph) and the loop re-dispatches
+   that one sub-agent.
+
+This is what "graph-centric" means in code: every state mutation is a
+`GraphPatch` of a specific scope. The LocalRepairer used for verifier
+findings and the per-sub-agent-failure re-dispatch are the same mechanism —
+just different triggers.
+
 ```
                   task description
                          |
@@ -89,13 +112,17 @@ cargo run --bin agent_a -- "your task here"
 
 Or omit the argument to be prompted. The agent:
 
-1. Builds a relationship graph through conversation (asks you clarifying
+1. **Intake.** If the task is vague, the main agent emits `ask_user` first
+   to clarify scope before drawing any graph nodes. If the task is clear,
+   it proceeds directly to planning (Mode A vs Mode B in the Core Idea
+   section above).
+2. Builds a relationship graph through conversation (asks you clarifying
    questions when needed).
-2. Decomposes the task into sub-tasks based on the graph.
-3. Dispatches sub-agents concurrently (each with `bash` tool access under a
+3. Decomposes the task into sub-tasks based on the graph.
+4. Dispatches sub-agents concurrently (each with `bash` tool access under a
    read-only policy).
-4. Runs `cargo check` as a post-execution validator (configurable).
-5. Reviews the result with deterministic checks + LLM-as-judge.
+5. Runs `cargo check` as a post-execution validator (configurable).
+6. Reviews the result with deterministic checks + LLM-as-judge.
 
 Outputs land in `./demo_output/`:
 

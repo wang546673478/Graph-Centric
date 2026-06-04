@@ -46,6 +46,42 @@
 我们的赌注是：**关系图作为共享基底**能反向治这三个失败模式。图是每
 个组件读写共用的世界模型；对话变成注解，不再是状态。
 
+## 1a. 核心思想：图是 orchestrator 的计划
+
+图**不是**被动数据存储,**也不是**事件流水。**图是 orchestrator 的
+计划**:大模型(作为主 agent)把图当成工作记忆来维护,整套循环是:
+
+1. **规划(Plan)。** 主 agent 读图,然后
+   - **Mode A(明确方案)** — 给范围清晰的任务加子节点;**或者**
+   - **Mode B(探索形式)** — 在画任何节点之前,先发 `ask_user` 跟用
+     户对齐方向。
+
+   两种模式里,主 agent 在这一阶段都**不亲自干活** — 只写节点/边。
+   任何需要子领域调研的活,是 Task 阶段子 agent 的事。
+2. **派发(Dispatch)。** 子 agent 各自负责一个子节点,以图(加上子节点
+   的 spec / 证据)做上下文执行。子 agent **不直接改图** — 只回报
+   `success` 或者 `report_graph_error` + 证据。
+3. **复核(Review)。** 对每个子节点按 orchestrator 的 spec 做 per-node
+   复核。通过 → 子节点标 done;不通过 → orchestrator 写一个**局部**
+   `GraphPatch`(只动那一个子节点的 spec,不是整张图),循环重派那一
+   个子 agent。
+
+"graph-centric" 在代码里的含义:**每一次状态变更都是一个有明确 scope
+的 `GraphPatch`,无论触发源是什么,都走同一个机制**。`LocalRepairer`
+(处理 verifier 发现) 和 per-sub-agent-failure 重派,走的是**同一套机
+制** — 触发源不同,patch 的形状一样。
+
+Mode B 不可省。如果模型可以从一个模糊任务里直接画图,它会**挑一个
+解读**,而这个解读就是后面整段循环唯一能看见的东西。24 轮 Graph phase
+里没有"猜错第一步"的恢复路径 — verifier 和 sub-agents 都会基于一个
+框错的计划工作。Mode B 在任何规划**之前**强制做一次澄清。
+
+具体落地上,Mode B 由 proposer 的 system prompt("intake" 规则)强制:
+一个新对话里的第一个 `ProposerStep`,在任务缺乏具体成功标准、引用
+模型没有的外部上下文、或者允许多种解读时,应该是 `AskUser`。harness
+在代码层**不**做这道闸(目前依赖模型),这是我们接受的 trade-off —
+后续可以加一个"第一轮是否 ask?"的确定性 check。
+
 ---
 
 ## 2. 三层图（L0 / L1 / L2）
@@ -127,6 +163,12 @@ Claude Code 用 **动态工作流**——模型写 Python 一样的控制流，h
 这些不是子阶段；每个都是 `step()` 的一个独立节拍。调用方可见的
 `LoopState` 反映这一点——`Running` 在 machine 处于阶段中时持续 tick，
 状态机要调用方做某事时用命名状态返回。
+
+**入口（intake）发生在 Graph 阶段内部,任何节点被画之前。** 一个新对话
+里的第一个 `ProposerStep`,在任务开放到多种解读时(对应 §1a 里的
+Mode B)应该是 `AskUser`。清晰、范围明确的任务直接进入 `ProposePatch`
+(Mode A)。Intake 这一区分是 **prompt 约定,不是代码闸** — 详见
+§1a 为什么这重要以及我们接受的 trade-off。
 
 ### 为什么 `step()` 是可重入的
 
@@ -316,6 +358,19 @@ DeepSeek（以及 OpenAI、Anthropic 等）都支持原生的 function-calling
 
 设计原则 #2（time-for-space）是这个一般化：宁可多修小处，不修一
 次大处。
+
+### 一套机制,两种触发:`LocalRepairer` 与子 agent 重派
+
+`LocalRepairer` 是"逐 issue、scoped"patch 的标准实现。今天它由
+`Verifier` 在 Graph 阶段触发(高严重度 issue)。同一套机制 — 同样的
+patch 形状、同样的 scope 规则、同样的"一次一个 issue"纪律 — 也适用
+于第二个触发源,整个架构默认这件事:**Task 阶段子 agent 报告失败**。
+子 agent 返回 `success=false` 加 `report_graph_error` 时,orchestrator
+的响应是一个 `GraphPatch`,scope 锁在那一个子节点的 spec(对应节点的
+`Node.metadata["spec"]` 或等价物),apply 之后循环**只重派那一个子
+agent** — 不是整个 task graph。按 §1a 的"核心思想":子 agent 失败
+和 verifier 发现,在形状上没有区别 — 都产生一个 per-node
+`GraphPatch`,触发一个组件的重跑。
 
 ### Scope 强制
 
