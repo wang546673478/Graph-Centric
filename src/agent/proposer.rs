@@ -309,10 +309,49 @@ fn render_graph_for_prompt(g: &Graph) -> String {
 // JSON extraction + parsing
 // ---------------------------------------------------------------------------
 
+/// Strip `<think>...</think>` blocks from a model response.
+/// Modern reasoning models (DeepSeek-v3, MiniMax-M3, Claude with
+/// extended thinking) emit a chain-of-thought block BEFORE the
+/// actual answer; if we don't strip it, our `find('{')` lands
+/// inside the think text and the JSON parse blows up on the first
+/// `}` that closes the think reasoning rather than a real JSON
+/// value. Strip the think first, then look for the JSON.
+fn strip_think_blocks(text: &str) -> String {
+    // Match `<think>...</think>` (case-insensitive, lazy match, dot-matches-newline).
+    // `regex` 1.x has no backreferences, so we have to do `<think>`
+    // and `</think>` as separate passes. Each pass strips both the
+    // opening and the closing tag if they're paired.
+    static OPEN: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?is)<\s*think\s*>").expect("think-open regex")
+    });
+    static CLOSE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?is)</\s*think\s*>").expect("think-close regex")
+    });
+    // Walk: find the first `<think...>`, find the matching
+    // `</think...>`, drop the slice. Repeat for nested/multi-pass
+    // cases. This is O(n*passes) but pass count is bounded.
+    let mut s = text.to_string();
+    loop {
+        let open = match OPEN.find(&s) {
+            Some(m) => m.start()..m.end(),
+            None => break,
+        };
+        // After the open tag, find the next close.
+        let close_start = match CLOSE.find(&s[open.end..]) {
+            Some(m) => open.end + m.start(),
+            None => break, // unterminated — leave the rest alone
+        };
+        let close_end = close_start + CLOSE.find(&s[close_start..]).unwrap().len();
+        s = format!("{}{}", &s[..open.start], &s[close_end..]);
+    }
+    s
+}
+
 /// Pull the first balanced JSON object out of a (possibly markdown-wrapped)
-/// model response. Tolerant of leading prose and code-fence variants.
+/// model response. Tolerant of leading prose, code-fence variants, and
+/// `<think>...</think>` reasoning blocks emitted by reasoning models.
 pub fn extract_json_block(text: &str) -> Result<String> {
-    let trimmed = text.trim();
+    let trimmed = strip_think_blocks(text).trim().to_string();
     // Strip ```json ... ``` or ``` ... ``` fences.
     let inner: &str = if let Some(rest) = trimmed.strip_prefix("```json") {
         rest.trim_start_matches('\n')
@@ -325,7 +364,7 @@ pub fn extract_json_block(text: &str) -> Result<String> {
             .map(|(a, _)| a)
             .unwrap_or(rest)
     } else {
-        trimmed
+        &trimmed
     };
 
     // Find the first '{' and walk to its balanced close, respecting strings.
@@ -746,6 +785,54 @@ mod tests {
         let s = r#"{"step":"ask_user","question":"is this {weird}?"}"#;
         let out = extract_json_block(s).unwrap();
         assert_eq!(out, s);
+    }
+
+    #[test]
+    fn strip_think_strips_leading_block() {
+        // The think block contains text that LOOKS like JSON-shaped
+        // content (braces) — make sure we strip it before the
+        // extractor even sees it. The helper does NOT trim
+        // surrounding whitespace; `extract_json_block` does that
+        // downstream.
+        let s = "<think>{ some reason with } braces {{{\n</think>\n{\"step\":\"ready_for_verify\",\"rationale\":\"ok\"}";
+        let out = strip_think_blocks(s);
+        assert_eq!(out, "\n{\"step\":\"ready_for_verify\",\"rationale\":\"ok\"}");
+    }
+
+    #[test]
+    fn strip_think_strips_multiple_blocks() {
+        let s = "<think>first {reason}</think>middle<think>second {more}</think>{\"step\":\"ready_for_verify\"}";
+        let out = strip_think_blocks(s);
+        assert_eq!(out, "middle{\"step\":\"ready_for_verify\"}");
+    }
+
+    #[test]
+    fn strip_think_handles_unterminated() {
+        // No closing tag — leave the text alone rather than
+        // deleting the user's actual answer.
+        let s = "<think>never finished\n{\"step\":\"ready_for_verify\"}";
+        let out = strip_think_blocks(s);
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn strip_think_passthrough_when_absent() {
+        let s = "{\"step\":\"ready_for_verify\"}";
+        assert_eq!(strip_think_blocks(s), s);
+    }
+
+    #[test]
+    fn extract_json_strips_think_block() {
+        // End-to-end: think block + JSON should yield the same
+        // result as the raw JSON.
+        let raw = r#"{"step":"ready_for_verify","rationale":"ok"}"#;
+        // The think block deliberately contains `}` and `{` chars
+        // that a naive balance-walker would trip on.
+        let wrapped = format!(
+            "<think>Let me think... some text with }} and {{{{ in it\n</think>\n{raw}"
+        );
+        let out = extract_json_block(&wrapped).unwrap();
+        assert_eq!(out, raw);
     }
 
     #[test]
