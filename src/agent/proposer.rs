@@ -148,7 +148,7 @@ impl GraphProposer {
         }
 
         let mut prompt = format!(
-            "{PROMPT_PREAMBLE}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{PROMPT_RULES}"
+            "{PROMPT_PREAMBLE}\n\n{PROMPT_INTAKE}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{PROMPT_RULES}"
         );
 
         // Append the skills section if a storage is attached.
@@ -616,18 +616,59 @@ the patch, or transitioning to verification) and then asks you for the next \
 step. Many small steps are better than few large ones — each step is also \
 an opportunity to catch and reverse a mistake.";
 
+/// Intake rule — Mode A vs Mode B. The model's FIRST step in a fresh
+/// conversation is an intake decision: clear task → propose_patch,
+/// vague task → ask_user. Vague tasks are dangerous because the rest
+/// of the loop (verifier, sub-agents) all see the first graph; a wrong
+/// first interpretation has no recovery path inside a 24-round Graph
+/// phase, so the cost of asking one targeted question is much lower
+/// than the cost of guessing wrong.
+const PROMPT_INTAKE: &str = "## Intake (Mode A vs Mode B)\n\
+\n\
+Your FIRST step in a fresh conversation is intake. Pick one of two \
+modes based on the task:\n\
+\n\
+- **Mode A — task is clear, start the graph.** The task names a concrete \
+deliverable, a specific target, or enough context to start (e.g. \
+\"summarize /path/to/repo\", \"fix the bug in src/foo.rs:42\", \
+\"refactor Foo::bar\"). Emit a small starting `propose_patch` (one or \
+two nodes/edges) and continue.\n\
+\n\
+- **Mode B — task is vague, ask_user first.** The task is open to \
+multiple readings, references context you don't have, or has no clear \
+success criterion. Emit `ask_user` with ONE specific clarifying question \
+BEFORE drawing any graph nodes. A wrong first interpretation in a \
+24-round Graph phase has no recovery path — the cost of asking is much \
+lower than the cost of guessing wrong.\n\
+\n\
+Telltale signs of Mode B (vague):\n\
+- One-sentence task with no target or success criterion (\"improve the \
+project\", \"what can we learn from this codebase\", \"看看这个源码\")\n\
+- Task references a domain or artifact you have no internal model of\n\
+- Multiple reasonable interpretations lead to different graphs\n\
+- The user has not committed to a scope or deadline\n\
+\n\
+Telltale signs of Mode A (clear):\n\
+- A specific file, function, line, or output is named\n\
+- \"Add / fix / refactor / summarize / migrate X\" where X is concrete\n\
+- The task continues prior context the user already established\n\
+\n\
+Greetings, \"what can you do\", or simple acknowledgments are NOT \
+Mode B triggers — emit a small `propose_patch` (a single Task node \
+capturing the conversation) and proceed.";
+
 const PROMPT_RULES: &str = r#"## Step schemas
 
 Always emit exactly one of these JSON objects, with no surrounding prose,
 no markdown code fences, nothing else:
 
-1. ASK USER — only when you truly cannot proceed without a specific
-   fact the user hasn't told you and no tool can find. Vague greetings
-   ("hi", "你好", "what's up") do NOT warrant ask_user — instead
-   propose a small initial patch to start the graph (e.g. one
-   Task node capturing the conversation) and ask your next turn's
-   ready_for_verify after that. Reserve ask_user for blocking
-   ambiguities, not for kickoff chit-chat.
+1. ASK USER — when the task is vague enough that drawing a graph
+   now would commit you to a wrong interpretation (see the Intake
+   rule below). Ask ONE specific question, not a list. Vague
+   greetings ("hi", "你好", "what's up") on their own do NOT
+   warrant ask_user — in those cases, propose a small initial
+   patch (e.g. one Task node capturing the conversation) and let
+   later rounds handle scope.
    {"step":"ask_user","question":"<one clear question>","rationale":"<why this question now>"}
 
 2. CALL TOOL — when running a tool can answer your own question.
@@ -667,10 +708,10 @@ RelationType: Contains | BelongsTo | Imports | Exports | DependsOn |
 
 - Output EXACTLY one JSON object. Nothing before, nothing after.
 - Be conservative. Ask the user when truly blocked — never fabricate edges.
-  But default toward action: when the user's input is open-ended or
-  a simple greeting, propose a small starting patch rather than
-  stalling with a clarifying question. The graph grows through many
-  small steps; one tiny ask_user is fine, repeated ask_user is not.
+  But respect the Intake rule (Mode A vs Mode B): if the task is vague,
+  one targeted `ask_user` is much cheaper than guessing wrong. When
+  the verifier or sub-agents surface a problem, fix the local node —
+  don't rewrite the graph. The graph grows through many small steps.
 - The `rationale` field is your **voice to the user** — not a label.
   It is rendered in the chat transcript as the assistant's message,
   so write it as a natural-language reply: if the user asked a
@@ -1051,6 +1092,49 @@ mod tests {
         assert!(
             prompt.contains("L1Enricher") || prompt.contains("automatically"),
             "missing instruction about L1 enrichment"
+        );
+    }
+
+    #[test]
+    fn proposer_system_prompt_codifies_mode_b_intake() {
+        // Regression guard for the "Core idea" / Mode B rule (ARCHITECTURE
+        // §1a). The system prompt must explicitly teach the model to
+        // recognize vague tasks and prefer `ask_user` BEFORE drawing any
+        // graph nodes. If a future refactor drops this rule, the model
+        // will fall back to guessing — and a wrong first interpretation
+        // has no recovery path inside a 24-round Graph phase.
+        let p = proposer_with(vec![r#"{"step":"ready_for_verify"}"#]);
+        let prompt = p.build_system_prompt("any task");
+
+        // The Intake section must exist and be named.
+        assert!(
+            prompt.contains("Intake") || prompt.contains("intake"),
+            "system prompt missing the Intake section header"
+        );
+        // Both modes must be named, with a clear signal that Mode B
+        // is the one to pick for vague tasks.
+        assert!(prompt.contains("Mode A"), "system prompt missing Mode A label");
+        assert!(prompt.contains("Mode B"), "system prompt missing Mode B label");
+        // The "vague task → ask_user FIRST" connection has to be there.
+        assert!(
+            prompt.contains("ask_user") && prompt.contains("BEFORE"),
+            "system prompt must teach the model to ask_user BEFORE drawing nodes for vague tasks"
+        );
+        // The "vague task has no recovery path" framing is the key
+        // motivation — without it the rule reads as a soft preference.
+        assert!(
+            prompt.contains("24-round") || prompt.contains("no recovery"),
+            "system prompt must include the 'no recovery' justification for Mode B"
+        );
+        // Anti-pattern guard: the old "default toward action; ask_user
+        // is stalling" framing contradicts Mode B. It must be gone.
+        assert!(
+            !prompt.contains("stalling with a clarifying question"),
+            "system prompt still contains the old 'ask_user is stalling' anti-pattern; Mode B is contradicted"
+        );
+        assert!(
+            !prompt.contains("one tiny ask_user is fine, repeated ask_user is not"),
+            "system prompt still contains the old 'one ask_user is fine' rule that conflicts with Mode B"
         );
     }
 
