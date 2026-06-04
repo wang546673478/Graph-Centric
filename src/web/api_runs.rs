@@ -22,7 +22,7 @@ use crate::agent::validator::{BashCheckValidator, PostExecutionValidator};
 use crate::agent::verifier::Verifier;
 use crate::graph::Graph;
 use crate::model::ModelConfig;
-use crate::tools::{BashTool, DangerousCommandDeny, ToolContext, ToolRegistry};
+use crate::tools::{BashTool, DangerousCommandDeny, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool};
 use axum::{
     extract::{Path, State},
     response::{
@@ -243,6 +243,8 @@ async fn drive_run(
     let tool_registry = Arc::new({
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(BashTool::new()));
+        reg.register(Arc::new(WebSearchTool::new()));
+        reg.register(Arc::new(WebFetchTool::new()));
         reg
     });
     // A tiny ToolContext just to keep `tool_cwd` canonical; the loop
@@ -350,6 +352,24 @@ async fn drive_run(
 
         let state_clone = gl.step().await;
         session.emit_graph_snapshot(&gl.graph).await;
+        // Status update — fires after every step so the UI can show
+        // cumulative token cost + current phase. Cheap (one small
+        // event) and the frontend throttles render anyway.
+        let (status_phase, status_msg) = match &state_clone {
+            crate::agent::graph_loop::LoopState::Running => ("graph", "thinking...".into()),
+            crate::agent::graph_loop::LoopState::Paused { .. } => ("paused", "waiting for user".into()),
+            crate::agent::graph_loop::LoopState::GraphInvalid { .. } => {
+                ("graph_invalid", "graph has issues, repairing".into())
+            }
+            crate::agent::graph_loop::LoopState::Done(_) => ("done", "complete".into()),
+            crate::agent::graph_loop::LoopState::Error(_) => ("error", "loop error".into()),
+            crate::agent::graph_loop::LoopState::TaskFailed { .. } => ("task_failed", "sub-task failed".into()),
+        };
+        session.emit(RunEvent::Status {
+            phase: status_phase.into(),
+            message: status_msg,
+            tokens_used: gl.tokens_used,
+        });
         let kind = state_kind(&state_clone);
         session.emit(RunEvent::LoopState {
             kind: kind.to_string(),
@@ -363,6 +383,17 @@ async fn drive_run(
             for (role, content) in step_transcripts(&step) {
                 session.emit(RunEvent::Transcript { role, content });
             }
+        }
+        // If the step was a call_tool, also emit the tool's result
+        // (truncated) so the chat shows what the tool actually
+        // returned. Sub-agent tool calls aren't visible here — they
+        // route through `SubAgent::execute` — but the main agent's
+        // tool calls are.
+        if let Some((tool, summary)) = gl.last_tool_result.take() {
+            session.emit(RunEvent::Transcript {
+                role: "tool_result".into(),
+                content: format!("📥 {tool} → {summary}"),
+            });
         }
 
         match state_clone {

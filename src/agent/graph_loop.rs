@@ -405,6 +405,18 @@ pub struct GraphLoop {
     /// step as a transcript event for the UI without modifying the
     /// step pipeline itself.
     pub last_step: Option<ProposerStep>,
+    /// Most recent tool call result (main agent only — sub-agents
+    /// route their tool calls through `SubAgent::execute`, not here).
+    /// Set when the Proposer took a `CallTool` step and the tool
+    /// returned (success or error). Cleared (or overwritten) on
+    /// the next step. Lets callers emit a `tool_result` transcript
+    /// event alongside the matching `tool_use` line.
+    pub last_tool_result: Option<(String, String)>,
+    /// Cumulative tokens used by every model call so far. The
+    /// Proposer/Reviewer/Validator all sum into this so the caller
+    /// can surface it on a `Status` event for cost / progress
+    /// visibility.
+    pub tokens_used: u64,
 
     phase: Phase,
     pending: Pending,
@@ -441,6 +453,8 @@ impl GraphLoop {
             task_outcome: None,
             review_result: None,
             last_step: None,
+            last_tool_result: None,
+            tokens_used: 0,
             phase: Phase::Graph,
             pending: Pending::None,
         }
@@ -604,7 +618,12 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
 
     async fn step_graph(&mut self) -> Result<LoopState> {
-        let step = self.proposer.next_step(&self.conversation, &self.graph).await?;
+        let (step, tokens) = self
+            .proposer
+            .next_step_with_retry(&self.conversation, &self.graph)
+            .await?;
+        // Accumulate tokens used by this Proposer call.
+        self.tokens_used = self.tokens_used.saturating_add(tokens);
         // Persist what the model "said" so the next turn keeps history.
         let assistant_msg = render_step_as_json(&step);
         self.conversation.add_assistant(assistant_msg);
@@ -629,6 +648,23 @@ impl GraphLoop {
                     .with_max_output(self.config.tool_output_cap);
                 match self.tools.invoke(&tool, args, &ctx).await {
                     Ok(out) => {
+                        // Snapshot the result for the caller to surface as
+                        // a `tool_result` transcript event. Truncate the
+                        // body so a 4MB log dump doesn't flood the UI.
+                        let preview: String = out
+                            .content
+                            .chars()
+                            .take(800)
+                            .collect::<String>()
+                            .trim_end()
+                            .to_string();
+                        let summary = if preview.chars().count() < out.content.chars().count() {
+                            format!("{preview}…")
+                        } else {
+                            preview
+                        };
+                        self.last_tool_result =
+                            Some((tool.clone(), format!("exit={:?} · {}", out.exit_code, summary)));
                         let body = format!(
                             "tool `{tool}` (exit={:?}, interrupted={}, dur_ms={}):\n{}",
                             out.exit_code, out.interrupted, out.duration_ms, out.content
@@ -636,6 +672,7 @@ impl GraphLoop {
                         self.conversation.add_user(body);
                     }
                     Err(e) => {
+                        self.last_tool_result = Some((tool.clone(), format!("error: {e}")));
                         self.conversation.add_user(format!(
                             "tool `{tool}` errored: {e}. Adjust and try a different step."
                         ));

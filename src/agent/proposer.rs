@@ -26,6 +26,7 @@ use crate::error::{HarnessError, Result};
 use crate::graph::{Edge, Graph, GraphPatch, Node, NodeId, NodeKind, RelationType};
 use crate::model::{Model, Role};
 use crate::tools::ToolRegistry;
+use tracing::warn;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -172,11 +173,14 @@ impl GraphProposer {
     }
 
     /// One step: ask the model what to do next, parse the structured reply.
+    /// One step: ask the model what to do next, parse the structured
+    /// reply. Returns the parsed step + the token usage for this call
+    /// (so the caller can accumulate + surface cost).
     pub async fn next_step(
         &self,
         conv: &Conversation,
         graph: &Graph,
-    ) -> Result<ProposerStep> {
+    ) -> Result<(ProposerStep, u64)> {
         let snapshot = render_graph_for_prompt(graph);
         let mut req = conv.to_request(&snapshot, self.temperature, self.max_tokens);
         // Make sure the system prompt is consistent with this proposer's task
@@ -195,12 +199,58 @@ impl GraphProposer {
         }
 
         let resp = self.model.complete(req).await?;
+        let tokens = resp.usage.total_tokens as u64;
         debug!(
             content_len = resp.content.len(),
-            tokens = resp.usage.total_tokens,
+            tokens,
             "proposer received model response"
         );
-        parse_step(&resp.content)
+        parse_step(&resp.content).map(|s| (s, tokens))
+    }
+
+    /// Same as [`Self::next_step`] but retries the model call once if
+    /// the first response is malformed (no `{`, unterminated JSON,
+    /// invalid JSON, or unknown step kind). The retry message tells
+    /// the model that its previous output was broken and to reply
+    /// with valid JSON only.
+    ///
+    /// Returns the first error if both attempts fail (or if the
+    /// model itself errored on both calls). Caller can distinguish
+    /// model failure from parse failure via the error message.
+    pub async fn next_step_with_retry(
+        &self,
+        conv: &Conversation,
+        graph: &Graph,
+    ) -> Result<(ProposerStep, u64)> {
+        let first = self.next_step(conv, graph).await;
+        match first {
+            Ok((step, tokens)) => return Ok((step, tokens)),
+            Err(e) => {
+                // Fall through to retry.
+                let first_err = e;
+                warn!(
+                    error = %first_err,
+                    "proposer first response was malformed; retrying once with a fix-it prompt"
+                );
+                let mut patched_conv = conv.clone();
+                patched_conv.messages.push(crate::model::Message {
+                    role: Role::User,
+                    content: format!(
+                        "Your previous response was malformed (parser said: {first_err}). \
+                         Reply with EXACTLY one valid JSON object matching one of the step \
+                         schemas above. No markdown fences, no prose around it. If the \
+                         user just asked a question or a greeting, an `ask_user` step with \
+                         the answer in `question` is appropriate. If no graph change is \
+                         needed, `propose_patch` with no add/remove and a `rationale` that \
+                         answers the user is also acceptable."
+                    ),
+                });
+                match self.next_step(&patched_conv, graph).await {
+                    Ok((step, tokens)) => Ok((step, tokens)),
+                    Err(_) => Err(first_err),
+                }
+            }
+        }
     }
 }
 
@@ -825,11 +875,58 @@ mod tests {
         let p = proposer_with(vec![r#"{"step":"ready_for_verify","rationale":"trivial"}"#]);
         let conv = p.make_conversation("test task");
         let graph = Graph::new();
-        let step = p.next_step(&conv, &graph).await.unwrap();
+        let (step, tokens) = p.next_step(&conv, &graph).await.unwrap();
         match step {
             ProposerStep::ReadyForVerify { rationale } => assert_eq!(rationale, "trivial"),
             other => panic!("expected ReadyForVerify, got {other:?}"),
         }
+        // Mock model returns Usage::default() → total_tokens = 0
+        assert_eq!(tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn next_step_with_retry_succeeds_when_second_attempt_is_valid() {
+        // First response is plain text with no JSON; second is valid.
+        // The retry should call the model twice and return the second
+        // step.
+        let p = proposer_with(vec![
+            r#"{"step":"ask_user","question":"what now?","rationale":"after retry"}"#,
+            "I don't know what to put in JSON, sorry",
+        ]);
+        let conv = p.make_conversation("test task");
+        let graph = Graph::new();
+        let (step, _tokens) = p.next_step_with_retry(&conv, &graph).await.unwrap();
+        match step {
+            ProposerStep::AskUser { question, rationale } => {
+                assert_eq!(question, "what now?");
+                assert_eq!(rationale, "after retry");
+            }
+            other => panic!("expected AskUser, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn next_step_with_retry_returns_first_error_when_both_attempts_fail() {
+        // Both responses are malformed; the retry surfaces the FIRST
+        // error (not the retry's), so the caller sees the original
+        // failure context.
+        let p = proposer_with(vec![
+            "still bad on second try",
+            "still bad on second try",
+        ]);
+        let conv = p.make_conversation("test task");
+        let graph = Graph::new();
+        let err = p
+            .next_step_with_retry(&conv, &graph)
+            .await
+            .expect_err("both attempts should fail");
+        // The error message is from extract_json_block, which is the
+        // first-attempt failure (since second also fails and the
+        // function falls back to `first_err`).
+        assert!(
+            format!("{err}").contains("'{'"),
+            "expected the parse error to mention missing '{{', got: {err}"
+        );
     }
 
     #[tokio::test]

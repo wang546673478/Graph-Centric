@@ -21,6 +21,15 @@ pub enum RunEvent {
     Review { verdict: String, root_cause: Option<String> },
     /// A skill was captured from a successful run.
     SkillCaptured { slug: String, trigger: String },
+    /// Status update — phase transitions, model progress, token
+    /// counts. Lightweight; the UI can show "verifying..." or
+    /// "running task phase (12k tokens)" without subscribing to the
+    /// more verbose loop_state stream.
+    Status {
+        phase: String,
+        message: String,
+        tokens_used: u64,
+    },
     /// Terminal Done state.
     Done { final_result: serde_json::Value },
     /// An error occurred.
@@ -37,6 +46,7 @@ impl RunEvent {
             Self::LoopState { .. } => "loop_state",
             Self::Review { .. } => "review",
             Self::SkillCaptured { .. } => "skill_captured",
+            Self::Status { .. } => "status",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
         }

@@ -16,6 +16,9 @@ let activeRun = {
   durationTimer: null,
   durationSec: 0,
   activeTab: 'graph',
+  statusPhase: '',
+  statusMessage: '',
+  tokensUsed: 0,
   changedFiles: [],
   selectedFile: null,
   fileDiffText: '',
@@ -309,6 +312,12 @@ function attachSse(runId) {
       });
       renderTranscript();
     },
+    status: data => {
+      activeRun.statusPhase = data.phase || '';
+      activeRun.statusMessage = data.message || '';
+      activeRun.tokensUsed = data.tokens_used || 0;
+      renderRunMeta();
+    },
     done: data => {
       finishRun('Done');
     },
@@ -317,7 +326,7 @@ function attachSse(runId) {
       finishRun('Error');
     },
   };
-  ['transcript', 'graph', 'loop_state', 'review', 'skill_captured', 'done', 'error']
+  ['transcript', 'graph', 'loop_state', 'review', 'skill_captured', 'status', 'done', 'error']
     .forEach(type => {
       es.addEventListener(type, e => {
         try { handlers[type]?.(JSON.parse(e.data)); } catch (err) { /* ignore */ }
@@ -347,8 +356,14 @@ function renderRunMeta() {
   if (!el) return;
   const nodeCount = activeRun.nodes.length;
   const edgeCount = activeRun.edges.length;
+  const tokens = activeRun.tokensUsed > 0
+    ? ` · ${activeRun.tokensUsed.toLocaleString()} tokens`
+    : '';
+  const phase = activeRun.statusPhase
+    ? ` · <span class="muted">${escapeHtml(activeRun.statusPhase)}</span>`
+    : '';
   el.innerHTML = activeRun.runId || activeRun.transcript.length
-    ? `${activeRun.durationSec}s · graph: ${nodeCount} nodes / ${edgeCount} edges · <span class="status-pill ${escapeAttr(activeRun.status)}">${escapeHtml(activeRun.status)}</span>`
+    ? `${activeRun.durationSec}s · graph: ${nodeCount} nodes / ${edgeCount} edges · <span class="status-pill ${escapeAttr(activeRun.status)}">${escapeHtml(activeRun.status)}</span>${phase}${tokens}`
     : '<span class="muted">Send a message to start building the relationship graph.</span>';
 }
 

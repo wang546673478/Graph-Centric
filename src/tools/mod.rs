@@ -33,10 +33,12 @@
 pub mod bash;
 pub mod deny_list;
 pub mod scope_guard;
+pub mod web;
 
 pub use bash::BashTool;
 pub use deny_list::{default_dangerous_patterns, match_denial, DenialMatcher, DenialPattern};
 pub use scope_guard::{ScopeGuard, ScopeViolation};
+pub use web::{WebFetchTool, WebSearchTool};
 
 use crate::error::{HarnessError, Result};
 use async_trait::async_trait;
