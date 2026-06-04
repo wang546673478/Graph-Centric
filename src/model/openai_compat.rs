@@ -17,6 +17,7 @@ use crate::error::{HarnessError, Result};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::error::Error as _;
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,16 @@ pub struct OpenAICompatModel {
     pub model_name: String,
     pub api_key: Option<String>,
     client: Client,
+    /// Maximum number of attempts for a single model call (initial +
+    /// retries). Transient HTTP errors (timeout, connect) trigger
+    /// retries with exponential backoff up to this many attempts.
+    pub retry_max_attempts: usize,
+    /// Base delay before the first retry. Subsequent retries double
+    /// this up to `retry_max_delay`.
+    pub retry_base_delay: Duration,
+    /// Cap on the exponential backoff so a long-running run doesn't
+    /// sit on a single call indefinitely.
+    pub retry_max_delay: Duration,
 }
 
 impl OpenAICompatModel {
@@ -38,11 +49,28 @@ impl OpenAICompatModel {
             model_name: model_name.into(),
             api_key: None,
             client,
+            retry_max_attempts: 3,
+            retry_base_delay: Duration::from_secs(1),
+            retry_max_delay: Duration::from_secs(30),
         }
     }
 
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
+        self
+    }
+
+    /// Override the retry policy. Use this from tests that want a
+    /// tight loop, or from callers that want a different budget.
+    pub fn with_retry(
+        mut self,
+        max_attempts: usize,
+        base_delay: Duration,
+        max_delay: Duration,
+    ) -> Self {
+        self.retry_max_attempts = max_attempts;
+        self.retry_base_delay = base_delay;
+        self.retry_max_delay = max_delay;
         self
     }
 
@@ -71,7 +99,7 @@ impl OpenAICompatModel {
 // Wire types — kept private; the public API is the `Model` trait
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OpenAIChatRequest {
     model: String,
     messages: Vec<OpenAIMessage>,
@@ -85,7 +113,7 @@ struct OpenAIChatRequest {
     tools: Vec<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct OpenAIMessage {
     role: String,
     content: String,
@@ -166,21 +194,46 @@ impl Model for OpenAICompatModel {
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut req = self.client.post(&url).json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
+        let url_for_error = url.clone();
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| HarnessError::model(format!("HTTP request failed: {e}")))?;
+        // The send closure rebuilds the request on each retry so a
+        // transient failure (e.g. TCP handshake hang, request timeout)
+        // gets a fresh attempt. We do NOT retry on HTTP 4xx/5xx
+        // responses — those are surfaced below with the response body
+        // for diagnosis. We only retry on `is_transient_http_error`,
+        // i.e. errors that come back before we have a response at all.
+        let max_attempts = self.retry_max_attempts;
+        let base_delay = self.retry_base_delay;
+        let max_delay = self.retry_max_delay;
+        let resp = send_with_retry(
+            move || {
+                let client = client.clone();
+                let api_key = api_key.clone();
+                let body = body.clone();
+                let url = url.clone();
+                async move {
+                    let mut req = client.post(&url).json(&body);
+                    if let Some(key) = &api_key {
+                        req = req.bearer_auth(key);
+                    }
+                    req.send().await
+                }
+            },
+            is_transient_http_error,
+            max_attempts,
+            base_delay,
+            max_delay,
+        )
+        .await
+        .map_err(|e| HarnessError::model(format_http_error("HTTP request failed", &e)))?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(HarnessError::model(format!(
-                "HTTP {status} from {url}: {body}"
+                "HTTP {status} from {url_for_error}: {body}"
             )));
         }
 
@@ -245,6 +298,87 @@ fn role_to_str(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry + error formatting
+// ---------------------------------------------------------------------------
+
+/// Classify a `reqwest::Error` as transient (worth retrying) or terminal.
+///
+/// Transient: timeouts and connection failures. The request never got a
+/// response, so the network may have recovered by the next attempt.
+///
+/// Non-transient: body / decode / redirect errors. The request shape is
+/// wrong, the response couldn't be parsed, or the server redirected —
+/// none of those get better by retrying.
+fn is_transient_http_error(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// Render a `reqwest::Error` with its full `std::error::Error` source
+/// chain, so a single line of log surface DNS/TCP/TLS/IO causes
+/// instead of just the reqwest-level summary. The default `Display`
+/// impl stops at the top frame, which is why a 5-minute hang shows
+/// up as the unhelpful "error sending request for url".
+fn format_http_error(prefix: &str, e: &reqwest::Error) -> String {
+    let mut s = format!(
+        "{prefix}: {e} (timeout={} connect={} request={} body={} decode={})",
+        e.is_timeout(),
+        e.is_connect(),
+        e.is_request(),
+        e.is_body(),
+        e.is_decode(),
+    );
+    let mut src: Option<&(dyn std::error::Error + 'static)> = e.source();
+    let mut depth = 0;
+    while let Some(cause) = src {
+        if depth >= 5 {
+            break;
+        }
+        s.push_str(&format!(" -> {cause}"));
+        src = cause.source();
+        depth += 1;
+    }
+    s
+}
+
+/// Generic retry helper.
+///
+/// Calls `send` until it returns `Ok`, the error is classified as
+/// non-transient by `classify`, or `max_attempts` is reached. Between
+/// attempts, sleeps for `base_delay` and doubles up to `max_delay`.
+///
+/// The error type `E` is arbitrary — `classify(&E) -> bool` decides
+/// retry-worthiness. This keeps the helper testable with a mock error
+/// type without needing to construct a real `reqwest::Error`.
+async fn send_with_retry<T, E, F, Fut>(
+    mut send: F,
+    classify: impl Fn(&E) -> bool,
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+) -> std::result::Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    assert!(max_attempts >= 1, "max_attempts must be >= 1");
+    let mut attempt = 0usize;
+    let mut delay = base_delay;
+    loop {
+        attempt += 1;
+        match send().await {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                if attempt >= max_attempts || !classify(&e) {
+                    return Err(e);
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(max_delay);
+            }
+        }
     }
 }
 
@@ -322,5 +456,180 @@ mod tests {
             .await
             .expect("model call");
         assert!(!resp.content.trim().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Retry helper — exercised with a mock error type so the unit test
+    // does not need a real `reqwest::Error` (which has no public ctor).
+    // -----------------------------------------------------------------------
+
+    /// Stand-in for `reqwest::Error` that the retry helper can classify.
+    /// `transient: true` mimics timeout/connect failures; `transient: false`
+    /// mimics body/decode/redirect failures.
+    #[derive(Debug, PartialEq)]
+    struct MockHttpError {
+        transient: bool,
+        label: &'static str,
+    }
+
+    fn classify_mock(e: &MockHttpError) -> bool {
+        e.transient
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_succeeds_on_first_try() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: std::result::Result<&'static str, MockHttpError> = send_with_retry(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok("ok") }
+            },
+            classify_mock,
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_recovers_after_transient_failures() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: std::result::Result<&'static str, MockHttpError> = send_with_retry(
+            || {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err(MockHttpError {
+                            transient: true,
+                            label: "timeout",
+                        })
+                    } else {
+                        Ok("ok")
+                    }
+                }
+            },
+            classify_mock,
+            5,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result.unwrap(), "ok");
+        // Two failures, then success → three total attempts.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_gives_up_on_non_transient() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: std::result::Result<&'static str, MockHttpError> = send_with_retry(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(MockHttpError {
+                        transient: false,
+                        label: "body",
+                    })
+                }
+            },
+            classify_mock,
+            5,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        // Non-transient → no retry, first error returned verbatim.
+        assert_eq!(
+            result.unwrap_err(),
+            MockHttpError {
+                transient: false,
+                label: "body"
+            }
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_exhausts_max_attempts() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result: std::result::Result<&'static str, MockHttpError> = send_with_retry(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(MockHttpError {
+                        transient: true,
+                        label: "always-times-out",
+                    })
+                }
+            },
+            classify_mock,
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().label, "always-times-out");
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_applies_backoff_between_attempts() {
+        // 3 transient failures, max_attempts=4 → 3 sleeps total. We use
+        // generous base/max delays so the test is robust to CI jitter
+        // but the *lower bound* still proves the sleep actually ran.
+        let start = std::time::Instant::now();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let _ = send_with_retry::<(), MockHttpError, _, _>(
+            || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async {
+                    Err(MockHttpError {
+                        transient: true,
+                        label: "slow",
+                    })
+                }
+            },
+            classify_mock,
+            4,
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        // Three sleeps: 20ms + 40ms + 80ms = 140ms minimum. Allow some
+        // slack but assert we spent at least that long sleeping.
+        assert!(
+            elapsed >= Duration::from_millis(120),
+            "elapsed {elapsed:?} is shorter than the sum of the three backoff sleeps"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_caps_backoff_at_max_delay() {
+        // base=20ms, doubled three times: 20, 40, 80, 160 → capped at 50ms.
+        // Three sleeps then → 20 + 40 + 50 = 110ms minimum.
+        let start = std::time::Instant::now();
+        let _ = send_with_retry::<(), MockHttpError, _, _>(
+            || async {
+                Err(MockHttpError {
+                    transient: true,
+                    label: "slow",
+                })
+            },
+            classify_mock,
+            4,
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(90),
+            "elapsed {elapsed:?} should reflect the capped backoff schedule"
+        );
     }
 }
