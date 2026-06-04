@@ -3,7 +3,7 @@
 
 use super::slug::generate_slug;
 use super::storage::{LocalSkillStorage, SkillStorage};
-use super::types::{Result, Skill, SkillError, SkillMeta};
+use super::types::{Result, Skill, SkillError, SkillMeta, SkillRef};
 use crate::graph::Graph;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -14,14 +14,17 @@ use crate::model::Model;
 /// The function the caller (e.g., `bin/agent_a.rs`) invokes when a run
 /// completes with `Reviewer` verdict `Pass`.
 ///
-/// Returns a `JoinHandle<()>` immediately. The caller typically just
-/// discards it. The spawned task runs:
+/// Returns a `JoinHandle<Result<SkillRef>>` immediately. The caller can
+/// either discard the handle (fire-and-forget) or `await` it to learn
+/// the resulting slug + trigger (e.g., the web gateway awaits so it
+/// can emit a `SkillCaptured` SSE event). The spawned task runs:
 /// 1. Generate slug (fast LLM call, ~1s)
 /// 2. Generate trigger (fast LLM call, ~1-2s)
 /// 3. Save to local skill storage
 ///
-/// If any step fails, the skill is NOT saved; an error is logged at
-/// `warn!` level. No partial-save mode in v1.
+/// If any step fails, the skill is NOT saved; the `JoinHandle` resolves
+/// to `Err(SkillError)` and a `warn!` is logged. No partial-save mode
+/// in v1.
 pub fn capture_skill(
     graph: Graph,
     review: serde_json::Value,
@@ -29,11 +32,9 @@ pub fn capture_skill(
     task_id: Option<crate::graph::NodeId>,
     model: Arc<dyn Model>,
     storage: Arc<LocalSkillStorage>,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<SkillRef>> {
     tokio::spawn(async move {
-        if let Err(e) = capture_inner(graph, review, task, task_id, model, storage).await {
-            tracing::warn!("skill capture failed: {e}");
-        }
+        capture_inner(graph, review, task, task_id, model, storage).await
     })
 }
 
@@ -44,7 +45,7 @@ async fn capture_inner(
     task_id: Option<crate::graph::NodeId>,
     model: Arc<dyn Model>,
     storage: Arc<LocalSkillStorage>,
-) -> Result<()> {
+) -> Result<SkillRef> {
     let started = SystemTime::now();
 
     // 1. Slug
@@ -82,7 +83,7 @@ async fn capture_inner(
         elapsed_s = elapsed,
         "skill captured"
     );
-    Ok(())
+    Ok(SkillRef { slug, trigger })
 }
 
 async fn generate_trigger(
@@ -216,6 +217,31 @@ mod tests {
             crate::graph::L1Description::new("x", "y", "z", "w").with_confidence(0.8),
         );
         g
+    }
+
+    #[tokio::test]
+    async fn capture_skill_resolves_with_skillref() {
+        // The web gateway awaits the JoinHandle to emit a SkillCaptured
+        // SSE event. Verify the resolved value actually contains the
+        // model-generated slug + trigger.
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalSkillStorage::new(dir.path().to_path_buf()));
+        let m: Arc<dyn Model> = Arc::new(MockModel::new(vec![
+            "happy-skill",
+            "applies when user is happy",
+        ]));
+
+        let handle = capture_skill(
+            sample_graph_with_l1(),
+            serde_json::json!({}),
+            "task".to_string(),
+            None,
+            m,
+            storage,
+        );
+        let skill_ref = handle.await.unwrap().expect("capture should succeed");
+        assert_eq!(skill_ref.slug, "happy-skill");
+        assert_eq!(skill_ref.trigger, "applies when user is happy");
     }
 
     #[tokio::test]

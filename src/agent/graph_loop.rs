@@ -399,6 +399,12 @@ pub struct GraphLoop {
     pub last_verification: Option<VerificationResult>,
     pub task_outcome: Option<DispatchOutcome>,
     pub review_result: Option<ReviewResult>,
+    /// The most recent Proposer step. Set inside `step_graph` before
+    /// the per-step match; cleared (or overwritten) on the next step.
+    /// Lets callers (e.g. the web gateway's run driver) surface each
+    /// step as a transcript event for the UI without modifying the
+    /// step pipeline itself.
+    pub last_step: Option<ProposerStep>,
 
     phase: Phase,
     pending: Pending,
@@ -434,6 +440,7 @@ impl GraphLoop {
             last_verification: None,
             task_outcome: None,
             review_result: None,
+            last_step: None,
             phase: Phase::Graph,
             pending: Pending::None,
         }
@@ -444,6 +451,26 @@ impl GraphLoop {
     /// still missing L1 in the replaced graph.
     pub fn with_l1_enricher(mut self, enricher: L1Enricher) -> Self {
         self.enricher = Some(enricher);
+        self
+    }
+
+    /// Seed the loop with an existing graph (e.g., the graph captured
+    /// at the end of a prior conversation turn). The loop will continue
+    /// to extend / verify / repair this graph instead of starting empty.
+    pub fn with_initial_graph(mut self, graph: Graph) -> Self {
+        self.graph = graph;
+        self
+    }
+
+    /// Seed the loop with a pre-built [`Conversation`] (system prompt +
+    /// prior messages). Used by the web gateway's multi-turn chat: the
+    /// new turn inherits the prior transcript so the Proposer/SubAgent
+    /// see the conversation history, not just a fresh `Task: ...` line.
+    ///
+    /// The caller is responsible for setting `conversation.task_description`
+    /// to the new task. `round` is preserved as-is.
+    pub fn with_initial_conversation(mut self, conversation: Conversation) -> Self {
+        self.conversation = conversation;
         self
     }
 
@@ -582,6 +609,10 @@ impl GraphLoop {
         let assistant_msg = render_step_as_json(&step);
         self.conversation.add_assistant(assistant_msg);
         info!(round = self.round, kind = step.kind(), "graph-phase step");
+        // Expose the step to the caller (e.g. web run driver emits a
+        // transcript event for the UI). Stored in a public field so
+        // we don't have to plumb a callback through the type.
+        self.last_step = Some(step.clone());
 
         match step {
             ProposerStep::AskUser { question, rationale } => {
@@ -1179,6 +1210,63 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn with_initial_graph_seeds_the_loop() {
+        // Build a loop, then seed it with a pre-existing graph. The
+        // first step() should run against the seeded graph, not empty.
+        let mut gl = build_loop_with(vec![
+            r#"{"step":"ready_for_verify","rationale":"graph already covers it"}"#,
+        ]);
+        let mut seed = Graph::new();
+        seed.add_node(crate::graph::Node::file("alpha.rs", "alpha"));
+        seed.add_node(crate::graph::Node::file("beta.rs", "beta"));
+        seed.add_edge(Edge::new("alpha.rs", "beta.rs", RelationType::Imports, 0.9, ""))
+            .unwrap();
+        gl = gl.with_initial_graph(seed);
+        assert_eq!(gl.graph.node_count(), 2);
+        assert_eq!(gl.graph.edge_count(), 1);
+        // The seeded graph must be returned in the final result.
+        match drive_to_terminal(&mut gl).await {
+            LoopState::Done(r) => {
+                assert_eq!(r.graph.node_count(), 2, "seeded nodes should be preserved");
+                assert_eq!(r.graph.edge_count(), 1);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_initial_conversation_seeds_messages() {
+        // The web gateway's multi-turn chat uses this to hand the agent
+        // the previous turn's transcript. Verify the seeded messages
+        // land at the front of `conversation.messages`, ahead of the
+        // auto-appended `Task: ...` line.
+        let mut gl = build_loop_with(vec![
+            r#"{"step":"ready_for_verify","rationale":"got it"}"#,
+        ]);
+        let mut conv = gl.proposer.make_conversation("next turn task");
+        use crate::model::{Message, Role};
+        conv.messages.clear();
+        conv.messages.push(Message {
+            role: Role::User,
+            content: "first turn said hi".into(),
+        });
+        conv.messages.push(Message {
+            role: Role::Assistant,
+            content: "first turn got: ask_user".into(),
+        });
+        // drive_run appends a fresh "Task: ..." line so the loop
+        // sees the new task; mirror that here.
+        conv.messages
+            .push(Message::user(format!("Task: {}", conv.task_description)));
+        gl = gl.with_initial_conversation(conv);
+        // First = seeded user line; last = the new task.
+        let msgs = &gl.conversation.messages;
+        assert_eq!(msgs[0].role, Role::User);
+        assert!(msgs[0].content.contains("first turn said hi"));
+        assert!(msgs.last().unwrap().content.contains("next turn task"));
     }
 
     #[tokio::test]

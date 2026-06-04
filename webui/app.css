@@ -100,6 +100,9 @@ main {
 
 .transcript .msg.user { background: rgba(59, 130, 246, 0.2); }
 .transcript .msg.ask_user { background: rgba(245, 158, 11, 0.2); }
+.transcript .msg.assistant { background: rgba(148, 163, 184, 0.15); }
+.transcript .msg.tool { background: rgba(168, 85, 247, 0.18); font-family: 'Courier New', monospace; font-size: 0.82rem; }
+.transcript .msg.skill_captured { background: rgba(34, 197, 94, 0.15); border-left: 3px solid var(--green); }
 .transcript .msg.error { background: rgba(220, 38, 38, 0.2); }
 .transcript .role {
   font-size: 0.7rem;

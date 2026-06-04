@@ -532,7 +532,13 @@ const PROMPT_RULES: &str = r#"## Step schemas
 Always emit exactly one of these JSON objects, with no surrounding prose,
 no markdown code fences, nothing else:
 
-1. ASK USER — when you need information only the user can provide.
+1. ASK USER — only when you truly cannot proceed without a specific
+   fact the user hasn't told you and no tool can find. Vague greetings
+   ("hi", "你好", "what's up") do NOT warrant ask_user — instead
+   propose a small initial patch to start the graph (e.g. one
+   Task node capturing the conversation) and ask your next turn's
+   ready_for_verify after that. Reserve ask_user for blocking
+   ambiguities, not for kickoff chit-chat.
    {"step":"ask_user","question":"<one clear question>","rationale":"<why this question now>"}
 
 2. CALL TOOL — when running a tool can answer your own question.
@@ -571,7 +577,11 @@ RelationType: Contains | BelongsTo | Imports | Exports | DependsOn |
 ## Discipline
 
 - Output EXACTLY one JSON object. Nothing before, nothing after.
-- Be conservative. Ask the user when unsure — never fabricate edges.
+- Be conservative. Ask the user when truly blocked — never fabricate edges.
+  But default toward action: when the user's input is open-ended or
+  a simple greeting, propose a small starting patch rather than
+  stalling with a clarifying question. The graph grows through many
+  small steps; one tiny ask_user is fine, repeated ask_user is not.
 - All edge endpoints must exist (already present, or being added in the
   same patch's add_nodes). The runtime rejects edges with missing endpoints.
 - Confidence guidance: 0.9+ for evidence you directly observed (tool

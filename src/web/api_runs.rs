@@ -64,6 +64,25 @@ pub async fn list_runs(State(state): AppState) -> Result<Json<Vec<RunMetadata>>,
 #[derive(Deserialize)]
 pub struct CreateRunBody {
     pub task: String,
+    /// Optional graph (L0 skeleton) to seed the run with. Used by the
+    /// multi-turn chat flow so each new user message extends the
+    /// previous run's graph instead of starting fresh.
+    #[serde(default)]
+    pub initial_graph: Option<super::events::InitialGraphDto>,
+    /// Optional prior conversation transcript. Each entry is one
+    /// message as the Proposer/SubAgent saw it. When present, the new
+    /// turn's `Conversation` is seeded with these messages followed by
+    /// a fresh `Task: ...` line — the agent remembers the chat.
+    #[serde(default)]
+    pub initial_transcript: Option<Vec<InitialMessage>>,
+}
+
+/// One entry in the prior conversation transcript. Mirrors the wire
+/// shape of `RunEvent::Transcript` payloads from a previous turn.
+#[derive(Deserialize)]
+pub struct InitialMessage {
+    pub role: String,
+    pub content: String,
 }
 
 pub async fn create_run(
@@ -77,8 +96,10 @@ pub async fn create_run(
     // Spawn the run driver.
     let state_clone = state.clone();
     let id_clone = id.clone();
+    let initial_graph = body.initial_graph;
+    let initial_transcript = body.initial_transcript;
     tokio::spawn(async move {
-        drive_run(state_clone, id_clone).await;
+        drive_run(state_clone, id_clone, initial_graph, initial_transcript).await;
     });
 
     Ok(Json(serde_json::json!({"id": id})))
@@ -127,7 +148,11 @@ pub async fn run_events(
         .map(|event: RunEvent| {
             let sse_event = Event::default()
                 .event(event.event_name())
-                .json_data(event)
+                .json_data(
+                    event
+                        .inner_json()
+                        .unwrap_or(serde_json::Value::Null),
+                )
                 .unwrap_or_else(|_| Event::default().comment("serialization error"));
             Ok::<_, Infallible>(sse_event)
         });
@@ -186,7 +211,12 @@ pub async fn post_repair(
 /// each `LoopState` to events and broadcasts them on the session's
 /// channel. Resolves `Paused` and `GraphInvalid` via the session's
 /// `Notify` machinery.
-async fn drive_run(state: Arc<WebState>, id: RunId) {
+async fn drive_run(
+    state: Arc<WebState>,
+    id: RunId,
+    initial_graph: Option<super::events::InitialGraphDto>,
+    initial_transcript: Option<Vec<InitialMessage>>,
+) {
     let session = {
         let runs = state.runs.read().await;
         match runs.get(&id) {
@@ -260,7 +290,7 @@ async fn drive_run(state: Arc<WebState>, id: RunId) {
 
     let mut gl = GraphLoop::new(
         session.task.clone(),
-        proposer,
+        proposer.clone(),
         verifier,
         Some(repairer),
         tool_registry.clone(),
@@ -272,6 +302,41 @@ async fn drive_run(state: Arc<WebState>, id: RunId) {
     .with_subagent_loader(loader)
     .with_reviewer(reviewer)
     .with_validator(validator);
+
+    if let Some(dto) = initial_graph {
+        let g = dto.into_graph();
+        *session.last_graph.write().await = Arc::new(g.clone());
+        gl = gl.with_initial_graph(g);
+    }
+
+    // When continuing from a prior chat turn, seed the new
+    // Conversation with the previous transcript. The system prompt is
+    // rebuilt from the proposer (it depends on tools + skills, not on
+    // prior messages), and the new "Task: ..." line is appended so
+    // the very first Proposer turn sees both the history and the new
+    // task. `ask_user` and other Proposer replies show up in their
+    // proper roles.
+    if let Some(prior) = initial_transcript.as_ref().filter(|t| !t.is_empty()) {
+        let mut conv = proposer.make_conversation(&session.task);
+        // Drop the auto-pinned "Task: <task>" first message — we'll
+        // re-append the prior transcript first so the new task line
+        // comes last and is the freshest signal.
+        conv.messages.clear();
+        use crate::model::{Message, Role};
+        for m in prior {
+            let role = match m.role.as_str() {
+                "user" | "ask_user" => Role::User,
+                "assistant" | "tool" => Role::Assistant,
+                _ => Role::User,
+            };
+            conv.messages.push(Message {
+                role,
+                content: m.content.clone(),
+            });
+        }
+        conv.messages.push(Message::user(format!("Task: {}", session.task)));
+        gl = gl.with_initial_conversation(conv);
+    }
 
     // Main loop.
     loop {
@@ -290,6 +355,15 @@ async fn drive_run(state: Arc<WebState>, id: RunId) {
             kind: kind.to_string(),
             payload: loop_state_payload(&state_clone),
         });
+
+        // Surface each Proposer step as a transcript event so the UI
+        // shows what the agent is "saying" / "doing" between graph
+        // updates — turns the chat from a black box into a real feed.
+        if let Some(step) = gl.last_step.take() {
+            if let Some((role, content)) = step_transcript(&step) {
+                session.emit(RunEvent::Transcript { role, content });
+            }
+        }
 
         match state_clone {
             LoopState::Paused { question, .. } => {
@@ -323,12 +397,65 @@ async fn drive_run(state: Arc<WebState>, id: RunId) {
             }
             LoopState::Done(final_result) => {
                 *session.status.write().await = RunStatus::Done;
-                if let Some(skill) = final_skill_ref(&final_result.graph) {
-                    *session.captured_skill.write().await = Some(skill);
-                }
                 session.emit(RunEvent::Done {
                     final_result: serde_json::to_value(&final_result).unwrap_or(serde_json::Value::Null),
                 });
+
+                // Fire `capture_skill` when the Reviewer said Pass.
+                // The web gateway awaits the JoinHandle (unlike the CLI
+                // which discards it) so we can emit a SkillCaptured
+                // event with the actual slug + trigger for the UI.
+                let review_passed = final_result
+                    .review_result
+                    .as_ref()
+                    .map(|r| r.passed)
+                    .unwrap_or(false);
+                if review_passed && !final_result.graph.nodes.is_empty() {
+                    let proposer_model = gl.proposer.model.clone();
+                    let review_json = serde_json::to_value(&final_result.review_result)
+                        .unwrap_or(serde_json::Value::Null);
+                    let task_str = session.task.clone();
+                    let graph_clone = final_result.graph.clone();
+                    let local_storage = state
+                        .skills
+                        .local_root()
+                        .map(|p| {
+                            std::sync::Arc::new(crate::skills::storage::LocalSkillStorage::new(p))
+                        });
+                    if let Some(storage) = local_storage {
+                        let handle = crate::skills::capture::capture_skill(
+                            graph_clone,
+                            review_json,
+                            task_str,
+                            None,
+                            proposer_model,
+                            storage,
+                        );
+                        let session_clone = session.clone();
+                        tokio::spawn(async move {
+                            match handle.await {
+                                Ok(Ok(skill_ref)) => {
+                                    *session_clone.captured_skill.write().await =
+                                        Some(skill_ref.clone());
+                                    session_clone.emit(RunEvent::SkillCaptured {
+                                        slug: skill_ref.slug,
+                                        trigger: skill_ref.trigger,
+                                    });
+                                }
+                                Ok(Err(e)) => {
+                                    tracing::warn!("skill capture failed: {e}");
+                                    session_clone.emit(RunEvent::Transcript {
+                                        role: "assistant".into(),
+                                        content: format!("(skill capture failed: {e})"),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::warn!("skill capture join failed: {e}");
+                                }
+                            }
+                        });
+                    }
+                }
                 return;
             }
             LoopState::Error(msg) => {
@@ -362,6 +489,161 @@ fn state_kind(s: &LoopState) -> &'static str {
     }
 }
 
+/// Translate a Proposer step into a short, human-readable transcript
+/// line. Returns `None` for steps we don't want to surface (currently
+/// only the empty-rationale ask_user is suppressed to avoid spam).
+fn step_transcript(step: &crate::agent::proposer::ProposerStep) -> Option<(String, String)> {
+    use crate::agent::proposer::ProposerStep;
+    match step {
+        ProposerStep::AskUser { question, .. } => {
+            if question.trim().is_empty() {
+                None
+            } else {
+                Some(("assistant".into(), format!("🤔 {question}")))
+            }
+        }
+        ProposerStep::ProposePatch { patch, .. } => {
+            let n = patch.add_nodes.len();
+            let e = patch.add_edges.len();
+            let r = patch.remove_node_ids.len();
+            let x = patch.remove_edge_indices.len();
+            let l = patch.set_l1.len();
+            let mut parts: Vec<String> = Vec::new();
+            if n > 0 { parts.push(format!("+{n} node{}", if n == 1 { "" } else { "s" })); }
+            if e > 0 { parts.push(format!("+{e} edge{}", if e == 1 { "" } else { "s" })); }
+            if r > 0 { parts.push(format!("-{r} node id{}", if r == 1 { "" } else { "s" })); }
+            if x > 0 { parts.push(format!("-{x} edge index{}", if x == 1 { "" } else { "es" })); }
+            if l > 0 { parts.push(format!("{l} L1 update{}", if l == 1 { "" } else { "s" })); }
+            if parts.is_empty() {
+                Some(("assistant".into(), "📝 proposing empty patch (no-op)".into()))
+            } else {
+                let body = parts.join(", ");
+                let reason_text = patch.reason.trim().to_string();
+                let reason = if reason_text.is_empty() {
+                    body.clone()
+                } else {
+                    format!("{body} — {reason_text}")
+                };
+                Some(("assistant".into(), format!("📝 {reason}")))
+            }
+        }
+        ProposerStep::CallTool { tool, args, .. } => {
+            // Compact arg view: key=value pairs truncated.
+            let arg_summary = args.as_object().map(|obj| {
+                obj.iter()
+                    .take(3)
+                    .map(|(k, v)| {
+                        let v = match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        let one_line: String = v.chars().take(40).collect();
+                        format!("{k}={one_line}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            let suffix = arg_summary
+                .map(|a| if a.is_empty() { String::new() } else { format!(" {a}") })
+                .unwrap_or_default();
+            Some(("tool".into(), format!("🔧 {tool}{suffix}")))
+        }
+        ProposerStep::ReadyForVerify { .. } => {
+            Some(("assistant".into(), "✅ ready for verification".into()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod step_transcript_tests {
+    use super::step_transcript;
+    use crate::agent::proposer::ProposerStep;
+    use crate::graph::{Graph, GraphPatch, Node};
+
+    #[test]
+    fn ask_user_renders_as_assistant_question() {
+        let step = ProposerStep::AskUser {
+            question: "what's the deadline?".into(),
+            rationale: "matters for planning".into(),
+        };
+        let (role, content) = step_transcript(&step).unwrap();
+        assert_eq!(role, "assistant");
+        assert!(content.contains("what's the deadline?"));
+    }
+
+    #[test]
+    fn ask_user_with_empty_question_is_suppressed() {
+        let step = ProposerStep::AskUser {
+            question: "   ".into(),
+            rationale: "".into(),
+        };
+        assert!(step_transcript(&step).is_none());
+    }
+
+    #[test]
+    fn propose_patch_summarizes_add_remove_and_reason() {
+        let mut patch = GraphPatch::default();
+        patch.add_nodes.push(Node::file("a", "A"));
+        patch.add_nodes.push(Node::file("b", "B"));
+        patch.add_nodes.push(Node::file("c", "C"));
+        patch.add_edges.push(crate::graph::Edge::new(
+            "a", "b", crate::graph::RelationType::Imports, 0.9, "",
+        ));
+        patch.remove_node_ids.push("z".into());
+        patch.reason = "found missing module".into();
+        let step = ProposerStep::ProposePatch {
+            patch,
+            rationale: "".into(),
+        };
+        let (role, content) = step_transcript(&step).unwrap();
+        assert_eq!(role, "assistant");
+        assert!(content.contains("+3 nodes"));
+        assert!(content.contains("+1 edge"));
+        assert!(content.contains("-1 node id"));
+        assert!(content.contains("found missing module"));
+    }
+
+    #[test]
+    fn propose_patch_with_nothing_to_change_renders_noop() {
+        let step = ProposerStep::ProposePatch {
+            patch: GraphPatch::default(),
+            rationale: "thinking aloud".into(),
+        };
+        let (_, content) = step_transcript(&step).unwrap();
+        assert!(content.contains("no-op"));
+    }
+
+    #[test]
+    fn call_tool_renders_with_args_summary() {
+        let step = ProposerStep::CallTool {
+            tool: "bash".into(),
+            args: serde_json::json!({"command": "ls -la", "description": "list files"}),
+            rationale: "see what's there".into(),
+        };
+        let (role, content) = step_transcript(&step).unwrap();
+        assert_eq!(role, "tool");
+        assert!(content.contains("bash"));
+        assert!(content.contains("command=ls -la"));
+        assert!(content.contains("description=list files"));
+    }
+
+    #[test]
+    fn ready_for_verify_renders_as_done() {
+        let step = ProposerStep::ReadyForVerify {
+            rationale: "graph covers it".into(),
+        };
+        let (role, content) = step_transcript(&step).unwrap();
+        assert_eq!(role, "assistant");
+        assert!(content.contains("ready for verification"));
+    }
+
+    #[test]
+    fn graph_compiles_with_patch() {
+        // Sanity: the patch type composes without breaking the test build.
+        let _g = Graph::new();
+    }
+}
+
 fn loop_state_payload(s: &LoopState) -> serde_json::Value {
     match s {
         LoopState::Running => serde_json::json!({}),
@@ -386,20 +668,6 @@ fn loop_state_payload(s: &LoopState) -> serde_json::Value {
         }),
         LoopState::Error(msg) => serde_json::json!({"message": msg}),
     }
-}
-
-fn final_skill_ref(graph: &Graph) -> Option<crate::skills::SkillRef> {
-    if graph.node_count() == 0 {
-        return None;
-    }
-    // Synthesize a SkillRef just from the final graph — a real capture
-    // would call `capture_skill` which needs a model for slug + trigger.
-    // For v1 we hand the UI a stable reference the user can promote
-    // to a real skill.
-    Some(crate::skills::SkillRef {
-        slug: format!("run-{}", &uuid::Uuid::new_v4().to_string()[..8]),
-        trigger: format!("auto-captured from run with {} nodes", graph.node_count()),
-    })
 }
 
 #[cfg(test)]
@@ -432,6 +700,8 @@ mod tests {
             State(state.clone()),
             Json(CreateRunBody {
                 task: "test".into(),
+                initial_graph: None,
+                initial_transcript: None,
             }),
         )
         .await

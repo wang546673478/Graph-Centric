@@ -26,10 +26,19 @@ let activeRun = {
 const api = {
   health: () => fetch('/api/health').then(r => r.json()),
   listRuns: () => fetch('/api/runs').then(r => r.json()),
-  createRun: (task) => fetch('/api/runs', {
-    method: 'POST', headers: {'content-type': 'application/json'},
-    body: JSON.stringify({ task }),
-  }).then(r => r.json()),
+  createRun: (task, initialGraph, initialTranscript) => {
+    const body = { task };
+    if (initialGraph && (initialGraph.nodes?.length || initialGraph.edges?.length)) {
+      body.initial_graph = initialGraph;
+    }
+    if (initialTranscript && initialTranscript.length) {
+      body.initial_transcript = initialTranscript;
+    }
+    return fetch('/api/runs', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+  },
   getRun: (id) => fetch(`/api/runs/${id}`).then(r => r.json()),
   cancelRun: (id) => fetch(`/api/runs/${id}`, { method: 'DELETE' }).then(r => r.json()),
   listSkills: () => fetch('/api/skills').then(r => r.json()),
@@ -55,8 +64,25 @@ const routes = {
 
 function mount() {
   window.addEventListener('hashchange', dispatch);
+  window.addEventListener('keydown', onGlobalKeydown);
   dispatch();
   highlightNav();
+}
+
+function onGlobalKeydown(e) {
+  // Cmd+K / Ctrl+K → focus the chat input (works on every page).
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    const input = document.getElementById('task-input');
+    if (input) {
+      input.focus();
+    } else {
+      // Not on the run view — navigate to it first; the next render
+      // will create the input and a follow-up call to focus it
+      // would land in the run view. Skip the second hop for now.
+      location.hash = '#/';
+    }
+  }
 }
 
 function dispatch() {
@@ -88,11 +114,12 @@ function renderRun() {
   root.innerHTML = `
     <div class="layout-run">
       <section class="panel">
-        <h2>Chat</h2>
+        <h2>Chat <button id="reset-btn" class="secondary" style="float:right; font-size:0.75rem; padding:0.2rem 0.5rem;">Reset</button></h2>
         <div id="transcript" class="transcript"></div>
+        <div id="thinking" style="display:none; padding:0.5rem; color:var(--muted); font-size:0.85rem;">💭 thinking…</div>
         <div class="composer">
-          <input id="task-input" placeholder="Type a task…" />
-          <button id="run-btn">Run</button>
+          <input id="task-input" placeholder="Type a message…" />
+          <button id="run-btn">Send</button>
         </div>
         <div id="run-meta" class="run-meta"></div>
       </section>
@@ -118,26 +145,42 @@ function renderRun() {
 
   // Composer
   $('#task-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter') submitTask();
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      submitTask();
+    }
   });
   $('#run-btn').addEventListener('click', () => {
-    if (activeRun.status === 'Running' || activeRun.status === 'Paused') {
+    // Only the actively-Running case maps to "Stop". A Paused run is
+    // waiting for the agent to continue, but the user is starting a
+    // new conversation turn — Send should create a fresh run, not
+    // cancel the old one. (Use the × next to the status pill to
+    // actually cancel.)
+    if (activeRun.status === 'Running') {
       stopRun();
     } else {
       submitTask();
     }
   });
+  $('#reset-btn').addEventListener('click', () => {
+    if (activeRun.status === 'Running' || activeRun.status === 'Paused') {
+      if (!confirm('Reset will cancel the current run. Continue?')) return;
+      stopRun();
+    }
+    activeRun.transcript = [];
+    activeRun.nodes = [];
+    activeRun.edges = [];
+    activeRun.status = 'idle';
+    activeRun.errorMsg = null;
+    activeRun.runId = null;
+    activeRun.durationSec = 0;
+    renderTranscript();
+    renderRunMeta();
+    if (activeRun.graph && activeRun.activeTab === 'graph') renderGraph();
+  });
 
-  // Initial state
-  activeRun.transcript = [];
-  activeRun.nodes = [];
-  activeRun.edges = [];
-  activeRun.status = 'idle';
-  activeRun.errorMsg = null;
-  activeRun.durationSec = 0;
   renderRunMeta();
   renderTabContent();
-  // restore any prior run from a previous view? v1: no.
 }
 
 async function submitTask() {
@@ -145,28 +188,52 @@ async function submitTask() {
   const task = input.value.trim();
   if (!task) return;
   input.value = '';
-  activeRun.transcript = [];
-  activeRun.nodes = [];
-  activeRun.edges = [];
+  input.disabled = true;
+  document.getElementById('run-btn').textContent = 'Stop';
+  document.getElementById('run-btn').classList.add('danger');
+
+  // Echo the user message into the chat immediately so they see what
+  // they sent, and so the chat reads as a real conversation even
+  // before the agent responds.
+  activeRun.transcript.push({ role: 'user', content: task });
   activeRun.status = 'Running';
   activeRun.errorMsg = null;
-  activeRun.durationSec = 0;
+  if (!activeRun.durationSec) {
+    activeRun.durationSec = 0;
+  }
   activeRun.durationTimer = setInterval(() => {
     activeRun.durationSec++;
     renderRunMeta();
   }, 1000);
-  renderRunMeta();
+  document.getElementById('thinking').style.display = 'block';
   renderTranscript();
+  renderRunMeta();
+
+  // Build the seed graph from whatever the latest SSE events told us
+  // — the agent will continue from this state instead of starting empty.
+  // Also send the prior transcript so the agent's Conversation starts
+  // with the chat history (matching what the user has seen).
+  const initial_graph = (activeRun.nodes.length || activeRun.edges.length)
+    ? { nodes: activeRun.nodes, edges: activeRun.edges }
+    : null;
+  const initial_transcript = activeRun.transcript.length
+    ? activeRun.transcript.map(m => ({ role: m.role, content: m.content }))
+    : null;
 
   try {
-    const { id } = await api.createRun(task);
+    const { id } = await api.createRun(task, initial_graph, initial_transcript);
     activeRun.runId = id;
     attachSse(id);
   } catch (e) {
     activeRun.errorMsg = String(e);
     activeRun.status = 'Error';
+    document.getElementById('thinking').style.display = 'none';
+    renderTranscript();
     renderRunMeta();
     clearInterval(activeRun.durationTimer);
+    input.disabled = false;
+    document.getElementById('run-btn').textContent = 'Send';
+    document.getElementById('run-btn').classList.remove('danger');
   }
 }
 
@@ -179,36 +246,75 @@ async function stopRun() {
     clearInterval(activeRun.durationTimer);
     activeRun.durationTimer = null;
   }
+  const input = document.getElementById('task-input');
+  if (input) input.disabled = false;
+  const btn = document.getElementById('run-btn');
+  if (btn) { btn.textContent = 'Send'; btn.classList.remove('danger'); }
+  document.getElementById('thinking').style.display = 'none';
   renderRunMeta();
 }
 
 function attachSse(runId) {
   const es = new EventSource(`/api/runs/${runId}/events`);
   activeRun.es = es;
+  const finishRun = (newStatus) => {
+    activeRun.status = newStatus;
+    clearInterval(activeRun.durationTimer);
+    const input = document.getElementById('task-input');
+    if (input) {
+      input.disabled = false;
+      input.focus();
+    }
+    const btn = document.getElementById('run-btn');
+    if (btn) {
+      btn.textContent = 'Send';
+      btn.classList.remove('danger');
+    }
+    document.getElementById('thinking').style.display = 'none';
+    renderRunMeta();
+  };
   const handlers = {
     transcript: data => {
+      document.getElementById('thinking').style.display = 'none';
       activeRun.transcript.push(data);
       renderTranscript();
     },
     graph: data => {
+      document.getElementById('thinking').style.display = 'none';
       activeRun.nodes = data.nodes || [];
       activeRun.edges = data.edges || [];
       renderGraph();
     },
     loop_state: data => {
+      document.getElementById('thinking').style.display = 'none';
       activeRun.status = data.kind;
+      // When the agent pauses to ask the user a question, re-enable
+      // the input + reset the Send button so the next message is
+      // routed to either a follow-up question or a fresh run.
+      if (data.kind === 'Paused' || data.kind === 'GraphInvalid') {
+        const input = document.getElementById('task-input');
+        if (input) input.disabled = false;
+        const btn = document.getElementById('run-btn');
+        if (btn) {
+          btn.textContent = 'Send';
+          btn.classList.remove('danger');
+        }
+      }
       renderRunMeta();
+    },
+    skill_captured: data => {
+      activeRun.transcript.push({
+        role: 'skill_captured',
+        content: `📚 skill captured: ${data.slug} — ${data.trigger}`,
+      });
+      renderTranscript();
     },
     done: data => {
-      activeRun.status = 'Done';
-      clearInterval(activeRun.durationTimer);
-      renderRunMeta();
+      finishRun('Done');
     },
     error: data => {
-      activeRun.status = 'Error';
       activeRun.errorMsg = data.message;
-      clearInterval(activeRun.durationTimer);
-      renderRunMeta();
+      finishRun('Error');
     },
   };
   ['transcript', 'graph', 'loop_state', 'review', 'skill_captured', 'done', 'error']
@@ -220,6 +326,7 @@ function attachSse(runId) {
   es.onerror = () => {
     es.close();
     if (activeRun.es === es) activeRun.es = null;
+    if (activeRun.status === 'Running') finishRun('Cancelled');
   };
 }
 
@@ -238,10 +345,11 @@ function renderTranscript() {
 function renderRunMeta() {
   const el = $('#run-meta');
   if (!el) return;
-  const id = activeRun.runId ? activeRun.runId.slice(0, 8) : '—';
-  el.innerHTML = activeRun.runId
-    ? `Run ${id}… · ${activeRun.durationSec}s · <span class="status-pill ${escapeAttr(activeRun.status)}">${escapeHtml(activeRun.status)}</span>`
-    : '<span class="muted">No active run</span>';
+  const nodeCount = activeRun.nodes.length;
+  const edgeCount = activeRun.edges.length;
+  el.innerHTML = activeRun.runId || activeRun.transcript.length
+    ? `${activeRun.durationSec}s · graph: ${nodeCount} nodes / ${edgeCount} edges · <span class="status-pill ${escapeAttr(activeRun.status)}">${escapeHtml(activeRun.status)}</span>`
+    : '<span class="muted">Send a message to start building the relationship graph.</span>';
 }
 
 function renderTabContent() {
@@ -506,3 +614,6 @@ function escapeAttr(s) {
 
 // Expose for inline boot
 window.mount = mount;
+
+// Auto-mount on script load.
+mount();

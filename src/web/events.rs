@@ -3,7 +3,7 @@
 //! `RunEvent` is the in-process representation; it's serialized to JSON
 //! with a `type` discriminator and forwarded as SSE `event: <type>\ndata: <json>`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// All events that can be emitted by a running agent. Tagged enum: the
 /// outer `type` field identifies the event kind; the inner `data` field
@@ -41,11 +41,25 @@ impl RunEvent {
             Self::Error { .. } => "error",
         }
     }
+
+    /// Serialize as just the inner `data` payload (without the
+    /// `{"type":..., "data":...}` envelope). Used for the SSE `data:`
+    /// field, where the event name is already conveyed by the
+    /// `event:` field — duplicating it in the JSON would force
+    /// consumers to unwrap an extra layer.
+    pub fn inner_json(&self) -> serde_json::Result<serde_json::Value> {
+        let full = serde_json::to_value(self)?;
+        if let serde_json::Value::Object(mut map) = full {
+            Ok(map.remove("data").unwrap_or(serde_json::Value::Null))
+        } else {
+            Ok(full)
+        }
+    }
 }
 
 /// Minimal DTO for a graph node. The full `Node` struct from `crate::graph`
 /// is too heavy for SSE; we send only what the UI needs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDto {
     pub id: String,
     pub kind: String,
@@ -66,7 +80,7 @@ impl NodeDto {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeDto {
     pub source: String,
     pub target: String,
@@ -82,6 +96,49 @@ impl EdgeDto {
             relation: format!("{:?}", edge.relation),
             confidence: edge.confidence,
         }
+    }
+}
+
+/// Compact DTO for "seed the next run with the graph state I already
+/// have in the browser". The frontend only has `NodeDto`/`EdgeDto`
+/// from the last `graph` SSE event, not the full `Graph` (which has
+/// L1 store + indices + metadata). This DTO lets the frontend send
+/// the L0 skeleton and the server reconstruct a minimal `Graph`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InitialGraphDto {
+    #[serde(default)]
+    pub nodes: Vec<NodeDto>,
+    #[serde(default)]
+    pub edges: Vec<EdgeDto>,
+}
+
+impl InitialGraphDto {
+    /// Build a `Graph` from the L0 skeleton. The reconstructed graph
+    /// has no L1 (those are re-derived by the enricher on any new
+    /// patch the Proposer proposes), no metadata, and edge indices
+    /// are rebuilt after insertion.
+    pub fn into_graph(self) -> crate::graph::Graph {
+        use crate::graph::{Node, NodeKind, RelationType};
+        let mut g = crate::graph::Graph::new();
+        for n in self.nodes {
+            let kind = NodeKind::parse_wire(&n.kind);
+            let node = Node::new(n.id.clone(), kind, n.id.clone(), n.summary);
+            g.add_node(node);
+        }
+        for e in self.edges {
+            let relation = RelationType::parse_wire(&e.relation);
+            let edge = crate::graph::Edge::new(
+                e.source,
+                e.target,
+                relation,
+                e.confidence,
+                String::new(),
+            );
+            // Tolerate dangling endpoints from stale snapshots — we
+            // still want to preserve the surviving structure.
+            let _ = g.add_edge(edge);
+        }
+        g
     }
 }
 
@@ -126,5 +183,95 @@ mod tests {
         assert_eq!(dto.target, "b");
         assert!(dto.relation.contains("Imports"));
         assert!((dto.confidence - 0.9).abs() < 1e-9);
+    }
+
+    #[test]
+    fn inner_json_strips_envelope_for_sse() {
+        // SSE consumers see the event type via the `event:` field, so
+        // the `data:` field should be the inner payload only —
+        // otherwise consumers have to unwrap `parsed.data` everywhere.
+        let event = RunEvent::Transcript {
+            role: "assistant".into(),
+            content: "hello".into(),
+        };
+        let v = event.inner_json().unwrap();
+        // No `type` key in the inner payload.
+        assert!(v.get("type").is_none());
+        // Inner fields are at the top level.
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "hello");
+    }
+
+    #[test]
+    fn initial_graph_dto_into_graph_rebuilds_skeleton() {
+        // Simulates a frontend that has tracked two nodes + an edge
+        // through earlier SSE events and is now resending them as
+        // the seed for a new conversation turn.
+        let dto = InitialGraphDto {
+            nodes: vec![
+                NodeDto {
+                    id: "x".into(),
+                    kind: "File".into(),
+                    summary: "module X".into(),
+                    l1: None,
+                    l1_confidence: None,
+                },
+                NodeDto {
+                    id: "y".into(),
+                    kind: "Module".into(),
+                    summary: "module Y".into(),
+                    l1: None,
+                    l1_confidence: None,
+                },
+            ],
+            edges: vec![EdgeDto {
+                source: "x".into(),
+                target: "y".into(),
+                relation: "Imports".into(),
+                confidence: 0.8,
+            }],
+        };
+        let g = dto.into_graph();
+        assert_eq!(g.node_count(), 2);
+        assert_eq!(g.edge_count(), 1);
+        assert!(g.get_node(&crate::graph::NodeId::from("x")).is_some());
+        assert!(g.get_node(&crate::graph::NodeId::from("y")).is_some());
+        // Indices must be rebuilt so subsequent ops (apply_patch,
+        // outgoing/incoming iterators) work.
+        let x = crate::graph::NodeId::from("x");
+        let y = crate::graph::NodeId::from("y");
+        let outs: Vec<&crate::graph::NodeId> = g.neighbors(&x).collect();
+        assert_eq!(outs, vec![&y]);
+    }
+
+    #[test]
+    fn initial_graph_dto_empty_yields_empty_graph() {
+        let g = InitialGraphDto::default().into_graph();
+        assert_eq!(g.node_count(), 0);
+        assert_eq!(g.edge_count(), 0);
+    }
+
+    #[test]
+    fn initial_graph_dto_tolerates_dangling_endpoints() {
+        // Edge with a target that isn't in the DTO's node list. Should
+        // not panic — the graph stays empty for that edge.
+        let dto = InitialGraphDto {
+            nodes: vec![NodeDto {
+                id: "a".into(),
+                kind: "File".into(),
+                summary: "A".into(),
+                l1: None,
+                l1_confidence: None,
+            }],
+            edges: vec![EdgeDto {
+                source: "a".into(),
+                target: "ghost".into(),
+                relation: "Imports".into(),
+                confidence: 0.5,
+            }],
+        };
+        let g = dto.into_graph();
+        assert_eq!(g.node_count(), 1);
+        assert_eq!(g.edge_count(), 0, "dangling edge should be silently dropped");
     }
 }
