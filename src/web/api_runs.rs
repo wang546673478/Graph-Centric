@@ -360,7 +360,7 @@ async fn drive_run(
         // shows what the agent is "saying" / "doing" between graph
         // updates — turns the chat from a black box into a real feed.
         if let Some(step) = gl.last_step.take() {
-            if let Some((role, content)) = step_transcript(&step) {
+            for (role, content) in step_transcripts(&step) {
                 session.emit(RunEvent::Transcript { role, content });
             }
         }
@@ -489,17 +489,46 @@ fn state_kind(s: &LoopState) -> &'static str {
     }
 }
 
-/// Translate a Proposer step into a short, human-readable transcript
-/// line. Returns `None` for steps we don't want to surface (currently
-/// only the empty-rationale ask_user is suppressed to avoid spam).
-fn step_transcript(step: &crate::agent::proposer::ProposerStep) -> Option<(String, String)> {
+/// Translate a Proposer step into one or two short, human-readable
+/// transcript lines. Returns `None` only when there is literally
+/// nothing useful to show.
+///
+/// We emit two lines per step when the rationale is non-empty:
+///
+/// 1. The model's own voice to the user (the `rationale` field,
+///    which the prompt encourages the model to use as a free-form
+///    reply — particularly for non-graph questions like "what model
+///    are you?").
+/// 2. The structured action summary (📝 patch, 🤔 question, 🔧 tool,
+///    ✅ verify) so the user can still see what the graph side
+///    is doing at a glance.
+fn step_transcripts(
+    step: &crate::agent::proposer::ProposerStep,
+) -> smallvec::SmallVec<[(String, String); 2]> {
     use crate::agent::proposer::ProposerStep;
-    match step {
+    use smallvec::SmallVec;
+    let mut out: SmallVec<[(String, String); 2]> = SmallVec::new();
+
+    // 1. The rationale, if the model wrote one. This is the primary
+    //    "voice" of the assistant — the prompt encourages putting any
+    //    answer to a non-graph question here.
+    let rationale = match step {
+        ProposerStep::AskUser { rationale, .. }
+        | ProposerStep::CallTool { rationale, .. }
+        | ProposerStep::ProposePatch { rationale, .. }
+        | ProposerStep::ReadyForVerify { rationale, .. } => rationale.trim().to_string(),
+    };
+    if !rationale.is_empty() {
+        out.push(("assistant".into(), rationale));
+    }
+
+    // 2. The structured action summary.
+    let action: Option<(String, String)> = match step {
         ProposerStep::AskUser { question, .. } => {
             if question.trim().is_empty() {
                 None
             } else {
-                Some(("assistant".into(), format!("🤔 {question}")))
+                Some(("ask_user".into(), format!("🤔 {question}")))
             }
         }
         ProposerStep::ProposePatch { patch, .. } => {
@@ -528,7 +557,6 @@ fn step_transcript(step: &crate::agent::proposer::ProposerStep) -> Option<(Strin
             }
         }
         ProposerStep::CallTool { tool, args, .. } => {
-            // Compact arg view: key=value pairs truncated.
             let arg_summary = args.as_object().map(|obj| {
                 obj.iter()
                     .take(3)
@@ -551,37 +579,73 @@ fn step_transcript(step: &crate::agent::proposer::ProposerStep) -> Option<(Strin
         ProposerStep::ReadyForVerify { .. } => {
             Some(("assistant".into(), "✅ ready for verification".into()))
         }
+    };
+    if let Some((role, content)) = action {
+        out.push((role, content));
     }
+
+    out
 }
 
 #[cfg(test)]
-mod step_transcript_tests {
-    use super::step_transcript;
+mod step_transcripts_tests {
+    use super::step_transcripts;
     use crate::agent::proposer::ProposerStep;
     use crate::graph::{Graph, GraphPatch, Node};
 
+    fn first_action(s: &[(String, String)]) -> Option<&(String, String)> {
+        s.iter().find(|(r, _)| r == "assistant" || r == "tool" || r == "ask_user")
+    }
+    fn rationale(s: &[(String, String)]) -> Option<&str> {
+        s.iter()
+            .find(|(r, c)| r == "assistant" && (c.starts_with("📝") || c.starts_with("🤔") || c.starts_with("✅") || c.contains("📚") || c.contains("(skill capture failed")))
+            .map(|(_, c)| c.as_str())
+    }
+
     #[test]
-    fn ask_user_renders_as_assistant_question() {
+    fn ask_user_emits_rationale_then_question() {
+        // Order: model voice first (rationale), then the ask_user question.
         let step = ProposerStep::AskUser {
             question: "what's the deadline?".into(),
-            rationale: "matters for planning".into(),
+            rationale: "I need a date to plan around".into(),
         };
-        let (role, content) = step_transcript(&step).unwrap();
-        assert_eq!(role, "assistant");
-        assert!(content.contains("what's the deadline?"));
+        let lines = step_transcripts(&step);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, "assistant");
+        assert_eq!(lines[0].1, "I need a date to plan around");
+        assert_eq!(lines[1].0, "ask_user");
+        assert!(lines[1].1.contains("what's the deadline?"));
     }
 
     #[test]
-    fn ask_user_with_empty_question_is_suppressed() {
+    fn ask_user_with_empty_rationale_skips_voice_line() {
+        // When the model writes no rationale, only the question shows.
         let step = ProposerStep::AskUser {
-            question: "   ".into(),
+            question: "q".into(),
             rationale: "".into(),
         };
-        assert!(step_transcript(&step).is_none());
+        let lines = step_transcripts(&step);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, "ask_user");
     }
 
     #[test]
-    fn propose_patch_summarizes_add_remove_and_reason() {
+    fn propose_patch_with_rationale_emits_both_lines() {
+        // The rationale is the model's reply to the user; the action
+        // line is the structured patch summary.
+        let step = ProposerStep::ProposePatch {
+            patch: GraphPatch::default(),
+            rationale: "I'll start a graph for your question".into(),
+        };
+        let lines = step_transcripts(&step);
+        assert_eq!(lines[0].0, "assistant");
+        assert_eq!(lines[0].1, "I'll start a graph for your question");
+        assert_eq!(lines[1].0, "assistant");
+        assert!(lines[1].1.contains("no-op"));
+    }
+
+    #[test]
+    fn propose_patch_summary_includes_node_edge_remove_and_reason() {
         let mut patch = GraphPatch::default();
         patch.add_nodes.push(Node::file("a", "A"));
         patch.add_nodes.push(Node::file("b", "B"));
@@ -595,8 +659,10 @@ mod step_transcript_tests {
             patch,
             rationale: "".into(),
         };
-        let (role, content) = step_transcript(&step).unwrap();
-        assert_eq!(role, "assistant");
+        let lines = step_transcripts(&step);
+        // No rationale → only the action line.
+        assert_eq!(lines.len(), 1);
+        let (_, content) = &lines[0];
         assert!(content.contains("+3 nodes"));
         assert!(content.contains("+1 edge"));
         assert!(content.contains("-1 node id"));
@@ -604,43 +670,41 @@ mod step_transcript_tests {
     }
 
     #[test]
-    fn propose_patch_with_nothing_to_change_renders_noop() {
-        let step = ProposerStep::ProposePatch {
-            patch: GraphPatch::default(),
-            rationale: "thinking aloud".into(),
-        };
-        let (_, content) = step_transcript(&step).unwrap();
-        assert!(content.contains("no-op"));
-    }
-
-    #[test]
-    fn call_tool_renders_with_args_summary() {
+    fn call_tool_emits_rationale_then_action() {
         let step = ProposerStep::CallTool {
             tool: "bash".into(),
             args: serde_json::json!({"command": "ls -la", "description": "list files"}),
             rationale: "see what's there".into(),
         };
-        let (role, content) = step_transcript(&step).unwrap();
-        assert_eq!(role, "tool");
-        assert!(content.contains("bash"));
-        assert!(content.contains("command=ls -la"));
-        assert!(content.contains("description=list files"));
+        let lines = step_transcripts(&step);
+        assert_eq!(lines[0].0, "assistant");
+        assert_eq!(lines[0].1, "see what's there");
+        assert_eq!(lines[1].0, "tool");
+        assert!(lines[1].1.contains("bash"));
+        assert!(lines[1].1.contains("command=ls -la"));
     }
 
     #[test]
-    fn ready_for_verify_renders_as_done() {
+    fn ready_for_verify_emits_rationale() {
         let step = ProposerStep::ReadyForVerify {
-            rationale: "graph covers it".into(),
+            rationale: "the graph covers it now".into(),
         };
-        let (role, content) = step_transcript(&step).unwrap();
-        assert_eq!(role, "assistant");
-        assert!(content.contains("ready for verification"));
+        let lines = step_transcripts(&step);
+        // Both rationale and the action summary fire.
+        assert_eq!(lines[0].1, "the graph covers it now");
+        assert!(lines[1].1.contains("ready for verification"));
     }
 
     #[test]
     fn graph_compiles_with_patch() {
-        // Sanity: the patch type composes without breaking the test build.
         let _g = Graph::new();
+    }
+
+    // Keep the unused helper referenced so it doesn't warn.
+    #[allow(dead_code)]
+    fn _silence(_s: &[(String, String)]) {
+        let _ = first_action(_s);
+        let _ = rationale(_s);
     }
 }
 

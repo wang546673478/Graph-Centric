@@ -582,6 +582,14 @@ RelationType: Contains | BelongsTo | Imports | Exports | DependsOn |
   a simple greeting, propose a small starting patch rather than
   stalling with a clarifying question. The graph grows through many
   small steps; one tiny ask_user is fine, repeated ask_user is not.
+- The `rationale` field is your **voice to the user** — not a label.
+  It is rendered in the chat transcript as the assistant's message,
+  so write it as a natural-language reply: if the user asked a
+  question ("what model are you?", "what can you do?"), put the
+  ANSWER in the rationale. If the user gave a task, briefly state
+  what you're doing in plain language. Keep it to one or two
+  sentences. The structured step (propose_patch / ask_user / etc.)
+  is the graph side; the rationale is the human side.
 - All edge endpoints must exist (already present, or being added in the
   same patch's add_nodes). The runtime rejects edges with missing endpoints.
 - Confidence guidance: 0.9+ for evidence you directly observed (tool
