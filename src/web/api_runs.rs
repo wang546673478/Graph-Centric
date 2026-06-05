@@ -578,14 +578,19 @@ fn step_transcripts(
                 ))
             }
         }
-        ProposerStep::Explore { scope, question, .. } => {
-            // Show in the chat that the model dispatched a
-            // subagent. The actual subagent result will arrive
-            // as a separate transcript event when it returns.
-            Some((
-                "explore".into(),
-                format!("🔍 explore: {question} (scope: {scope})"),
-            ))
+        ProposerStep::Explore { items, .. } => {
+            // Show in the chat that the model dispatched one or
+            // more subagents. The actual subagent results will
+            // arrive as a separate transcript event when they
+            // return.
+            let summary = match items.len() {
+                1 => {
+                    let item = &items[0];
+                    format!("🔍 explore: {} (scope: {})", item.question, item.scope)
+                }
+                n => format!("🔍 explore batch: {} items dispatched in parallel", n),
+            };
+            Some(("explore".into(), summary))
         }
         ProposerStep::ProposePatch { patch, .. } => {
             let n = patch.add_nodes.len();

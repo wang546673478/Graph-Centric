@@ -519,6 +519,15 @@ your entire response — no markdown fences, no prose around it. You can call a 
 information, emit your final answer, or — if you discover the graph itself is wrong — report \
 a graph error instead.\n\
 \n\
+## File-reading strategy (bash, in priority order)\n\
+\n\
+- Specific file: `cat <path>` (full), or `head -n 100 <path>` for long files. Always cite the file path in your `final_answer`.\n\
+- Directory listing: `ls -la <dir>` for shallow structure, `find <dir> -maxdepth 2 -type d` for subdirectory tree.\n\
+- Content search: `grep -rn \"pattern\" <dir>` to find lines; `grep -rln \"pattern\" <dir>` to find files; `grep -rn \"pattern\" <dir> | head -20` to cap output.\n\
+- File discovery: `find <dir> -type f -name \"*.rs\"`, `find <dir> -type f -size +100k`, etc.\n\
+- DO NOT repeat `ls` on the same directory more than once. If you've already seen the structure, the next bash call should be a `cat`/`head`/`grep` on a specific file, not another listing.\n\
+- Aim to read **3-5 files max** before emitting `final_answer`. Don't browse aimlessly. The parent will use your summary to decide the next move.\n\
+\n\
 ## Output schemas\n\
 \n\
 1) TOOL CALL — when you need to gather information:\n\

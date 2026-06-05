@@ -34,6 +34,21 @@ use tracing::debug;
 // Step type
 // ---------------------------------------------------------------------------
 
+/// One item in an `Explore` step's parallel-dispatch list. Each
+/// item gets its own subagent (read-only, capped at 6 tool
+/// calls), and the subagents run concurrently.
+#[derive(Debug, Clone)]
+pub struct ExploreItem {
+    /// What to look at. Free-form: a directory path, a file
+    /// glob, a function name, a list of node ids — whatever
+    /// scopes the question. The subagent interprets.
+    pub scope: String,
+    /// The specific question the subagent should answer. A
+    /// good pair is one a subagent can resolve in 3-6 tool
+    /// calls.
+    pub question: String,
+}
+
 #[derive(Debug, Clone)]
 pub enum ProposerStep {
     AskUser {
@@ -71,25 +86,28 @@ pub enum ProposerStep {
         needed_from_user: String,
         rationale: String,
     },
-    /// Dispatch a subagent to do a multi-file exploration on the
-    /// model's behalf (Claude Code's `EXPLORE_AGENT` pattern).
-    /// Use this when the model has seen a directory listing and
-    /// needs to read several files to answer an open-ended
-    /// question. The subagent runs with its own tool-calling
-    /// loop (capped at `max_steps`), returns a summary string,
-    /// and the main agent continues with that summary in
-    /// context. This prevents the main agent from getting
-    /// stuck in `ls`-`ls`-`ls` loops when it should be
-    /// delegating the heavy reading.
+    /// Dispatch one or more subagents to do multi-file exploration
+    /// on the model's behalf (Claude Code's `EXPLORE_AGENT`
+    /// pattern, with parallel subagent fan-out). Use this when
+    /// the model has seen a directory listing and needs to read
+    /// several files to answer an open-ended question.
+    ///
+    /// When the model emits multiple items with disjoint scopes
+    /// (e.g. "read src/agent AND read src/web"), the items are
+    /// dispatched **in parallel** as separate subagents — the
+    /// main agent's context stays clean (just one summary user
+    /// message with all the results), but the wall-clock
+    /// latency is roughly the slowest single subagent, not the
+    /// sum. This is a key difference from a single big
+    /// subagent that has to choose between scopes.
     Explore {
-        /// What to look at. Free-form: a directory path, a file
-        /// glob, a function name, a list of node ids — whatever
-        /// scopes the question. The subagent interprets.
-        scope: String,
-        /// The specific question the subagent should answer. A
-        /// good pair is one a subagent can resolve in 3-6 tool
-        /// calls.
-        question: String,
+        /// One or more (scope, question) pairs. Each runs in
+        /// its own subagent. Aim for items that are
+        /// independent — if B depends on A's output, do them
+        /// in two separate `Explore` steps so the second
+        /// subagent sees the first's summary in the main
+        /// conversation.
+        items: Vec<ExploreItem>,
         rationale: String,
     },
 }
@@ -582,26 +600,60 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
             })
         }
         "explore" => {
-            let scope = value
-                .get("scope")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let question = value
-                .get("question")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if scope.is_empty() || question.is_empty() {
+            // Accept both the new multi-item shape
+            //   {"items": [{"scope":..., "question":...}, ...]}
+            // and the legacy single-item shape
+            //   {"scope":..., "question":...}
+            // (folded into a 1-element vec) for backward compat.
+            let items: Vec<ExploreItem> = if let Some(arr) =
+                value.get("items").and_then(|v| v.as_array())
+            {
+                let mut out = Vec::with_capacity(arr.len());
+                for (i, item) in arr.iter().enumerate() {
+                    let scope = item
+                        .get("scope")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let question = item
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if scope.is_empty() || question.is_empty() {
+                        return Err(HarnessError::model(format!(
+                            "proposer: explore items[{i}] has empty scope or question"
+                        )));
+                    }
+                    out.push(ExploreItem { scope, question });
+                }
+                out
+            } else {
+                // Legacy: single scope + question
+                let scope = value
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let question = value
+                    .get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if scope.is_empty() || question.is_empty() {
+                    return Err(HarnessError::model(
+                        "proposer: explore requires non-empty 'scope' and 'question' (or 'items')"
+                            .to_string(),
+                    ));
+                }
+                vec![ExploreItem { scope, question }]
+            };
+            if items.is_empty() {
                 return Err(HarnessError::model(
-                    "proposer: explore requires non-empty 'scope' and 'question'".to_string(),
+                    "proposer: explore items[] is empty (need at least one item)".to_string(),
                 ));
             }
-            Ok(ProposerStep::Explore {
-                scope,
-                question,
-                rationale,
-            })
+            Ok(ProposerStep::Explore { items, rationale })
         }
         other => Err(HarnessError::model(format!(
             "proposer: unknown step '{other}'"
@@ -848,21 +900,27 @@ no markdown code fences, nothing else:
     "needed_from_user":"<optional one-line question to surface>",
     "rationale":"<what you tried and why you're stuck>"}
 
-6. EXPLORE — dispatch a subagent to do a multi-file read on your
-   behalf. Use this when the next 3-5 tool calls would all be
-   `cat`/`head`/`grep` against a known scope (a directory, a
-   pattern of files). A subagent with `bash` will read the files
-   and return a summary, which keeps YOUR context clean and
-   breaks the "I've seen the directory but I haven't read any
-   files" failure mode. After the subagent returns, you can
-   `propose_patch` with what you learned. DO NOT use this for
-   single tool calls or for code-modification subtasks
-   (use `call_tool` for the former; build graph + Task phase
-   for the latter).
+6. EXPLORE — dispatch one or more subagents to do multi-file
+   reads on your behalf. Use this when the next 3-5 tool calls
+   would all be `cat`/`head`/`grep` against a known scope. A
+   subagent with `bash` will read the files and return a summary,
+   which keeps YOUR context clean and breaks the
+   "I've-seen-the-directory-but-haven't-read-any-files" failure
+   mode.
+
+   You can dispatch MULTIPLE subagents in parallel by emitting
+   multiple items. The subagents run concurrently; you get one
+   combined summary user message when they all finish. This is
+   the right move when the next questions touch DISJOINT scopes
+   (e.g. "what's the orchestrator?" + "what's the web entrypoint?").
+   Keep items in SEPARATE `Explore` steps when the second
+   depends on the first's findings.
    {"step":"explore",
-    "scope":"<directory / file pattern / node-id list>",
-    "question":"<specific question for the subagent to answer>",
-    "rationale":"<why a subagent is the right tool here>"}
+    "items":[
+      {"scope":"<directory / pattern / node-id list>",
+       "question":"<specific question for this subagent>"}
+    ],
+    "rationale":"<why subagent(s) is the right tool here>"}
 
 ## Vocabularies (use these exact strings)
 
@@ -1131,10 +1189,13 @@ mod tests {
     #[test]
     fn explore_step_kind_is_explore() {
         // Regression guard: the system prompt teaches the model
-        // to emit step="explore" with scope/question/rationale.
+        // to emit step="explore" with items[].scope/question
+        // and rationale.
         let s = ProposerStep::Explore {
-            scope: "src/agent/".into(),
-            question: "what's the orchestrator pattern?".into(),
+            items: vec![ExploreItem {
+                scope: "src/agent/".into(),
+                question: "what's the orchestrator pattern?".into(),
+            }],
             rationale: "I've seen the directory but not read any files".into(),
         };
         assert_eq!(s.kind(), "explore");
@@ -1142,18 +1203,19 @@ mod tests {
 
     #[test]
     fn explore_step_round_trips_through_parse_step() {
-        // A model that emits the documented `explore` JSON should
-        // parse back to the Explore variant. The parse_step arm
-        // is what wires the Claude Code EXPLORE_AGENT pattern
-        // into our system, so this is the regression guard.
+        // A model that emits the documented `explore` JSON with
+        // `items` (the new multi-item shape) should parse back
+        // to the Explore variant. If the JSON shape changes,
+        // this fails.
         let s = parse_step(
-            r#"{"step":"explore","scope":"src/agent/","question":"what's the orchestrator pattern?","rationale":"seen dir, not read files"}"#,
+            r#"{"step":"explore","items":[{"scope":"src/agent/","question":"what's the orchestrator pattern?"}],"rationale":"seen dir, not read files"}"#,
         )
         .unwrap();
         match s {
-            ProposerStep::Explore { scope, question, rationale } => {
-                assert_eq!(scope, "src/agent/");
-                assert_eq!(question, "what's the orchestrator pattern?");
+            ProposerStep::Explore { items, rationale } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].scope, "src/agent/");
+                assert_eq!(items[0].question, "what's the orchestrator pattern?");
                 assert_eq!(rationale, "seen dir, not read files");
             }
             other => panic!("expected Explore, got {other:?}"),
@@ -1161,16 +1223,60 @@ mod tests {
     }
 
     #[test]
-    fn explore_step_rejects_empty_scope_or_question() {
-        // The dispatcher can't proceed without a real scope and
-        // question — empty values would just produce a no-op
-        // subagent call. Reject at parse time.
+    fn explore_step_round_trips_through_parse_step_legacy_shape() {
+        // Backwards compat: a model that emits the old
+        // flat `scope`+`question` (pre-multi-item) should also
+        // parse, with a single-item vec.
+        let s = parse_step(
+            r#"{"step":"explore","scope":"src/agent/","question":"what's the orchestrator pattern?","rationale":"r"}"#,
+        )
+        .unwrap();
+        match s {
+            ProposerStep::Explore { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].scope, "src/agent/");
+                assert_eq!(items[0].question, "what's the orchestrator pattern?");
+            }
+            other => panic!("expected Explore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explore_step_round_trips_through_parse_step_parallel() {
+        // Multi-item form: the model emits N (scope, question)
+        // pairs, we dispatch all in parallel.
+        let s = parse_step(
+            r#"{"step":"explore","items":[
+                {"scope":"src/agent/","question":"what's the orchestrator?"},
+                {"scope":"src/web/","question":"what's the web entrypoint?"}
+            ],"rationale":"two scopes"}"#,
+        )
+        .unwrap();
+        match s {
+            ProposerStep::Explore { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].scope, "src/agent/");
+                assert_eq!(items[1].scope, "src/web/");
+            }
+            other => panic!("expected Explore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explore_step_rejects_empty_items_or_empty_item_fields() {
+        // No items at all → fail (the dispatcher would no-op).
         assert!(parse_step(
-            r#"{"step":"explore","scope":"","question":"anything","rationale":"r"}"#
+            r#"{"step":"explore","items":[],"rationale":"r"}"#
         )
         .is_err());
+        // An item with empty scope → fail.
         assert!(parse_step(
-            r#"{"step":"explore","scope":"src/","question":"","rationale":"r"}"#
+            r#"{"step":"explore","items":[{"scope":"","question":"x"}],"rationale":"r"}"#
+        )
+        .is_err());
+        // An item with empty question → fail.
+        assert!(parse_step(
+            r#"{"step":"explore","items":[{"scope":"x","question":""}],"rationale":"r"}"#
         )
         .is_err());
     }
