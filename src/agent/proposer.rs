@@ -222,35 +222,88 @@ impl GraphProposer {
         conv: &Conversation,
         graph: &Graph,
     ) -> Result<(ProposerStep, u64)> {
-        let first = self.next_step(conv, graph).await;
-        match first {
-            Ok((step, tokens)) => return Ok((step, tokens)),
-            Err(e) => {
-                // Fall through to retry.
-                let first_err = e;
-                warn!(
-                    error = %first_err,
-                    "proposer first response was malformed; retrying once with a fix-it prompt"
-                );
-                let mut patched_conv = conv.clone();
-                patched_conv.messages.push(crate::model::Message {
-                    role: Role::User,
-                    content: format!(
-                        "Your previous response was malformed (parser said: {first_err}). \
-                         Reply with EXACTLY one valid JSON object matching one of the step \
-                         schemas above. No markdown fences, no prose around it. If the \
-                         user just asked a question or a greeting, an `ask_user` step with \
-                         the answer in `question` is appropriate. If no graph change is \
-                         needed, `propose_patch` with no add/remove and a `rationale` that \
-                         answers the user is also acceptable."
-                    ),
-                });
-                match self.next_step(&patched_conv, graph).await {
-                    Ok((step, tokens)) => Ok((step, tokens)),
-                    Err(_) => Err(first_err),
-                }
+        // First attempt: either returns Ok((step, tokens)) or a parse
+        // error. We accumulate tokens across both attempts.
+        let mut total_tokens: u64 = 0;
+        let (step, parse_err) = match self.next_step(conv, graph).await {
+            Ok((s, t)) => {
+                total_tokens += t;
+                (s, None)
             }
+            Err(e) => (ProposerStep::ReadyForVerify { rationale: String::new() }, Some(e)),
+        };
+
+        // Layer 1: parse-error retry. The model emitted something that
+        // wasn't a valid JSON step. Tell it what went wrong and ask
+        // for a clean re-emit.
+        if let Some(parse_err) = parse_err {
+            warn!(
+                error = %parse_err,
+                "proposer first response was malformed; retrying once with a fix-it prompt"
+            );
+            let mut patched_conv = conv.clone();
+            patched_conv.messages.push(crate::model::Message {
+                role: Role::User,
+                content: format!(
+                    "Your previous response was malformed (parser said: {parse_err}). \
+                     Reply with EXACTLY one valid JSON object matching one of the step \
+                     schemas above. No markdown fences, no prose around it. If the \
+                     user just asked a question or a greeting, an `ask_user` step with \
+                     the answer in `question` is appropriate. If no graph change is \
+                     needed, `propose_patch` with no add/remove and a `rationale` that \
+                     answers the user is also acceptable."
+                ),
+            });
+            return match self.next_step(&patched_conv, graph).await {
+                Ok((step, tokens)) => Ok((step, total_tokens + tokens)),
+                Err(_) => Err(parse_err),
+            };
         }
+
+        // Layer 2: intake gate. On a vague task, the first step must
+        // be `ask_user` per ARCHITECTURE §1a (Mode B). The system
+        // prompt teaches this rule but prompt-only is not load-bearing
+        // — a vague task can still produce a `propose_patch` from the
+        // model. When that happens, retry once with an explicit hint
+        // forcing `ask_user`.
+        if let Err(intake_err) = crate::agent::intake::check_intake_compliance(
+            &conv.task_description,
+            conv.round,
+            &step,
+        ) {
+            warn!(
+                error = %intake_err,
+                "proposer first step violated intake rule on a vague task; retrying with ask_user hint"
+            );
+            let mut patched_conv = conv.clone();
+            patched_conv.messages.push(crate::model::Message {
+                role: Role::User,
+                content: format!(
+                    "{intake_err}\n\nYour previous step was wrong: for a vague task, your \
+                     FIRST step must be `ask_user` with ONE specific clarifying question \
+                     (a concrete yes/no or a short multiple-choice). Do not draw any \
+                     graph nodes until the user has answered. Re-emit the JSON step now."
+                ),
+            });
+            return match self.next_step(&patched_conv, graph).await {
+                Ok((step, tokens)) => {
+                    // We tried. If the second attempt still violates
+                    // the gate, accept it anyway — refusing to make
+                    // progress forever is worse than letting the model
+                    // proceed (the human can see the ask_user
+                    // violation in the chat and intervene).
+                    let _ = crate::agent::intake::check_intake_compliance(
+                        &conv.task_description,
+                        conv.round,
+                        &step,
+                    );
+                    Ok((step, total_tokens + tokens))
+                }
+                Err(e) => Err(e),
+            };
+        }
+
+        Ok((step, total_tokens))
     }
 }
 

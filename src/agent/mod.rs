@@ -23,6 +23,7 @@ pub mod decomposer;
 pub mod dispatcher;
 pub mod enricher;
 pub mod graph_loop;
+pub mod intake;
 pub mod proposer;
 pub mod repairer;
 pub mod reviewer;
@@ -38,6 +39,7 @@ pub use graph_loop::{
     ErrorSource, FinalResult, GraphError, GraphLoop, GraphLoopConfig, L0ErrorType, LoopState,
     SubTaskFailure,
 };
+pub use intake::{TaskClarity, check_intake_compliance, classify_task_clarity};
 pub use proposer::{GraphProposer, ProposerStep, extract_json_block, parse_step};
 pub use repairer::LocalRepairer;
 pub use reviewer::{JudgeVerdict, ReviewResult, Reviewer, RootCause};
