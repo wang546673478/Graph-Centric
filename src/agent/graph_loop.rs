@@ -412,6 +412,16 @@ pub struct GraphLoop {
     /// the next step. Lets callers emit a `tool_result` transcript
     /// event alongside the matching `tool_use` line.
     pub last_tool_result: Option<(String, String)>,
+    /// Signature of the most recent `CallTool` step (hash of
+    /// `tool_name` + canonical-JSON args). Used by the stuck detector
+    /// to recognize when the model is calling the same tool with the
+    /// same args over and over.
+    last_tool_signature: Option<u64>,
+    /// How many consecutive rounds had the same tool signature as
+    /// `last_tool_signature`. Reset to 0 when the signature changes.
+    /// When the count crosses a threshold we inject a hint into the
+    /// conversation telling the model to break out of the loop.
+    stuck_repeat_count: u32,
     /// Cumulative tokens used by every model call so far. The
     /// Proposer/Reviewer/Validator all sum into this so the caller
     /// can surface it on a `Status` event for cost / progress
@@ -454,6 +464,8 @@ impl GraphLoop {
             review_result: None,
             last_step: None,
             last_tool_result: None,
+            last_tool_signature: None,
+            stuck_repeat_count: 0,
             tokens_used: 0,
             phase: Phase::Graph,
             pending: Pending::None,
@@ -636,6 +648,9 @@ impl GraphLoop {
         match step {
             ProposerStep::AskUser { question, rationale } => {
                 self.pending = Pending::AwaitingAnswer { question: question.clone() };
+                // Reset stuck detector — engaging the user is a way out.
+                self.stuck_repeat_count = 0;
+                self.last_tool_signature = None;
                 Ok(LoopState::Paused { question, rationale })
             }
             ProposerStep::CallTool {
@@ -646,6 +661,10 @@ impl GraphLoop {
                 let ctx = ToolContext::new(self.config.tool_cwd.clone())
                     .with_policy(self.config.tool_policy.clone())
                     .with_max_output(self.config.tool_output_cap);
+                // Compute the stuck-detector signature BEFORE invoking
+                // the tool — `args` is moved into `invoke` and we still
+                // need a reference for the hash.
+                let sig = tool_signature(&tool, &args);
                 match self.tools.invoke(&tool, args, &ctx).await {
                     Ok(out) => {
                         // Snapshot the result for the caller to surface as
@@ -670,6 +689,39 @@ impl GraphLoop {
                             out.exit_code, out.interrupted, out.duration_ms, out.content
                         );
                         self.conversation.add_user(body);
+
+                        // Stuck detection: if the same tool+args has
+                        // been called repeatedly with the loop not
+                        // making progress, inject a hint telling the
+                        // model to break out (propose_patch or
+                        // ask_user). The user observes this in the
+                        // chat as a regular user-style message so
+                        // the model can also choose to act on it
+                        // naturally.
+                        if self.last_tool_signature == Some(sig) {
+                            self.stuck_repeat_count += 1;
+                        } else {
+                            self.last_tool_signature = Some(sig);
+                            self.stuck_repeat_count = 1;
+                        }
+                        if self.stuck_repeat_count >= STUCK_REPEAT_THRESHOLD {
+                            warn!(
+                                tool = %tool,
+                                count = self.stuck_repeat_count,
+                                "graph-phase stuck detector: same tool+args called repeatedly; injecting break-out hint"
+                            );
+                            self.conversation.add_user(format!(
+                                "Note: you have just called `{tool}` with the same \
+                                 arguments {} times in a row and the output is not \
+                                 changing. Calling it again is unlikely to produce new \
+                                 information. Either:\n\
+                                 - emit a `propose_patch` to record what you have \
+                                 already learned, or\n\
+                                 - emit `ask_user` if you need direction from the user.\n\
+                                 Do NOT call the same tool with the same args again.",
+                                self.stuck_repeat_count
+                            ));
+                        }
                     }
                     Err(e) => {
                         self.last_tool_result = Some((tool.clone(), format!("error: {e}")));
@@ -689,6 +741,9 @@ impl GraphLoop {
                     patch.add_nodes.iter().map(|n| n.id.clone()).collect();
                 match self.graph.apply_patch(patch.clone()) {
                     Ok(()) => {
+                        // Reset stuck detector — the model is making progress.
+                        self.stuck_repeat_count = 0;
+                        self.last_tool_signature = None;
                         self.conversation.add_user(format!(
                             "Patch applied. Graph went from {before_nodes}n/{before_edges}e to {}n/{}e. Continue.",
                             self.graph.node_count(),
@@ -1117,6 +1172,57 @@ impl GraphLoop {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Threshold for stuck detection. If the model has called the same
+/// tool with the same args `STUCK_REPEAT_THRESHOLD` times in a row,
+/// inject a hint into the conversation telling it to break out
+/// (propose_patch or ask_user).
+const STUCK_REPEAT_THRESHOLD: u32 = 3;
+
+/// Hash a (tool_name, args) pair into a u64. Used to recognize when
+/// the model is calling the same tool with the same args over and
+/// over. Hash quality doesn't matter — we just want equality to
+/// match reliably, not be adversarially robust.
+///
+/// The default behavior canonicalizes the full args JSON, but a few
+/// tools have "incidental" fields (e.g. `bash`'s `description` and
+/// `timeout_ms`) that change every call without the underlying
+/// intent changing. For those, we extract the load-bearing field
+/// (`bash.command`) and hash only that — otherwise a model
+/// re-running `ls -la /x` with a fresh description string every
+/// round would escape detection.
+fn tool_signature(tool: &str, args: &serde_json::Value) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    tool.hash(&mut h);
+    let effective = effective_args(tool, args);
+    effective.hash(&mut h);
+    h.finish()
+}
+
+/// Extract the load-bearing portion of a tool's args for signature
+/// purposes. Returns the field(s) that, if unchanged, mean the
+/// model is asking for the same thing as last time — even if
+/// metadata fields like `description` or `timeout_ms` differ.
+fn effective_args(tool: &str, args: &serde_json::Value) -> String {
+    match tool {
+        // Bash: the `command` string is what determines whether
+        // two calls do the same thing. `description` and
+        // `timeout_ms` are model-provided metadata and vary every
+        // call without changing the intent.
+        "bash" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default()),
+        // Other tools: hash the full args for now. Future tools
+        // with similar incidental fields can be added here.
+        _ => serde_json::to_string(args).unwrap_or_default(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+
 /// Re-serialize a parsed [`ProposerStep`] back into the JSON form the model
 /// emitted, so the conversation history stays self-consistent. Not
 /// byte-identical to the model's original output (rationale ordering can
@@ -1159,6 +1265,48 @@ fn render_step_as_json(step: &ProposerStep) -> String {
 mod tests {
     use super::*;
     use crate::agent::verifier::{IssueSource, Severity};
+
+    #[test]
+    fn tool_signature_is_stable_for_same_inputs() {
+        // Two calls with the same tool name and the same args must
+        // hash to the same u64 — otherwise the stuck detector would
+        // never fire.
+        let a = tool_signature("bash", &serde_json::json!({"command": "ls -la"}));
+        let b = tool_signature("bash", &serde_json::json!({"command": "ls -la"}));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tool_signature_differs_on_command() {
+        // The detector's whole purpose: different commands should
+        // hash to different signatures.
+        let a = tool_signature("bash", &serde_json::json!({"command": "ls -la"}));
+        let b = tool_signature("bash", &serde_json::json!({"command": "ls -la /"}));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn tool_signature_differs_on_tool() {
+        let a = tool_signature("bash", &serde_json::json!({"command": "ls"}));
+        let b = tool_signature("web_search", &serde_json::json!({"command": "ls"}));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn tool_signature_ignores_key_order() {
+        // Two calls with the same args but different JSON key order
+        // should hash the same — otherwise the model could escape
+        // detection by re-ordering.
+        let a = tool_signature(
+            "bash",
+            &serde_json::json!({"command": "ls -la", "timeout_ms": 10000}),
+        );
+        let b = tool_signature(
+            "bash",
+            &serde_json::json!({"timeout_ms": 10000, "command": "ls -la"}),
+        );
+        assert_eq!(a, b);
+    }
     use crate::graph::{Edge, NodeKind, RelationType};
     use crate::model::{FinishReason, Model, ModelRequest, ModelResponse, Usage};
     use async_trait::async_trait;
