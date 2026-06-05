@@ -184,7 +184,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let auto_repairer = repairer.clone();
 
     let loop_cfg = GraphLoopConfig {
-        max_rounds: 24,
+        max_rounds: 50,
         max_repair_rounds: 3,
         tool_cwd: cwd.clone(),
         tool_output_cap: 8_000,

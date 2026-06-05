@@ -352,7 +352,7 @@ pub struct GraphLoopConfig {
 impl GraphLoopConfig {
     pub fn defaults_at(cwd: impl Into<PathBuf>) -> Self {
         Self {
-            max_rounds: 32,
+            max_rounds: 50,
             max_repair_rounds: 4,
             tool_cwd: cwd.into(),
             tool_output_cap: 12_000,
@@ -412,6 +412,14 @@ pub struct GraphLoop {
     /// the next step. Lets callers emit a `tool_result` transcript
     /// event alongside the matching `tool_use` line.
     pub last_tool_result: Option<(String, String)>,
+    /// Final summary the model produced when the run terminated
+    /// (max_rounds or stuck_loop). Set by `summarize_with_no_tools`
+    /// just before returning `Done`. The web driver surfaces this
+    /// to the user as the "what we got done" message instead of
+    /// a bare error string. None means the run ended without a
+    /// summary being collected (e.g. summary LLM call itself
+    /// failed, or the run ended in a normal Done path).
+    pub final_summary: Option<String>,
     /// Combined stuck-detector signature for the most recent successful
     /// `CallTool` step: hash of `(command_signature, output_prefix_hash)`.
     /// Used to recognize when the model is calling the same tool with
@@ -424,6 +432,11 @@ pub struct GraphLoop {
     /// Reset to 0 when the signature changes. Drives the tiered
     /// escalation: soft hint at 3, hard hint at 5, terminate at 6.
     stuck_repeat_count: u32,
+    /// Per-tool consecutive-failure counts. When a tool call
+    /// fails, this map is incremented for that tool name; on a
+    /// successful call, it's reset to 0. Drives the
+    /// same-tool-failure warn / halt escalation (Hermes-style).
+    tool_failure_counts: std::collections::HashMap<String, u32>,
     /// Cumulative tokens used by every model call so far. The
     /// Proposer/Reviewer/Validator all sum into this so the caller
     /// can surface it on a `Status` event for cost / progress
@@ -466,8 +479,10 @@ impl GraphLoop {
             review_result: None,
             last_step: None,
             last_tool_result: None,
+            final_summary: None,
             last_stuck_signature: None,
             stuck_repeat_count: 0,
+            tool_failure_counts: std::collections::HashMap::new(),
             tokens_used: 0,
             phase: Phase::Graph,
             pending: Pending::None,
@@ -603,12 +618,20 @@ impl GraphLoop {
         }
 
         if self.round >= self.config.max_rounds {
-            warn!(rounds = self.round, "max_rounds reached, terminating");
+            warn!(rounds = self.round, "max_rounds reached; requesting graceful summary");
             self.phase = Phase::Poisoned;
-            return LoopState::Error(format!(
-                "max_rounds ({}) reached without convergence",
-                self.config.max_rounds
-            ));
+            let summary = self.summarize_with_no_tools().await;
+            let err = match summary {
+                Some(s) => format!(
+                    "max_rounds ({}) reached; here is the model's best-effort summary:\n\n{}",
+                    self.config.max_rounds, s
+                ),
+                None => format!(
+                    "max_rounds ({}) reached without convergence (summary LLM call also failed)",
+                    self.config.max_rounds
+                ),
+            };
+            return LoopState::Error(err);
         }
         self.round += 1;
 
@@ -655,6 +678,23 @@ impl GraphLoop {
                 self.last_stuck_signature = None;
                 Ok(LoopState::Paused { question, rationale })
             }
+            ProposerStep::Block { reason, needed_from_user, rationale } => {
+                // Reset stuck detector — the model is explicitly
+                // self-pausing with a blocker reason. The user sees
+                // a Paused run with the reason on the transcript
+                // and can unblock by sending a free-text answer.
+                self.stuck_repeat_count = 0;
+                self.last_stuck_signature = None;
+                // Format the pause question so the user sees both
+                // the reason and the optional follow-up. If
+                // `needed_from_user` is empty, just show the reason.
+                let question = if needed_from_user.trim().is_empty() {
+                    format!("[block] {reason}")
+                } else {
+                    format!("[block] {reason} — {needed_from_user}")
+                };
+                Ok(LoopState::Paused { question, rationale })
+            }
             ProposerStep::CallTool {
                 tool,
                 args,
@@ -665,6 +705,12 @@ impl GraphLoop {
                     .with_max_output(self.config.tool_output_cap);
                 match self.tools.invoke(&tool, args, &ctx).await {
                     Ok(out) => {
+                        // Reset per-tool failure counter on success
+                        // (the tool is working now). Distinct from
+                        // the stuck detector below, which tracks
+                        // repeated *successful* same-output calls.
+                        self.tool_failure_counts.remove(&tool);
+
                         // Snapshot the result for the caller to surface as
                         // a `tool_result` transcript event. Truncate the
                         // body so a 4MB log dump doesn't flood the UI.
@@ -716,20 +762,30 @@ impl GraphLoop {
                         // state, so the model cannot make the run
                         // drag on by ignoring hints forever.
                         if self.stuck_repeat_count >= STUCK_REPEAT_TERMINATE {
-                            let err = format!(
-                                "stuck loop exceeded: tool `{tool}` has been called \
-                                 {} times in a row with the same command and producing \
-                                 the same output. The model is not making progress. \
-                                 Hint: refine the task description, narrow the scope, or \
-                                 break it into a smaller sub-task before retrying."
-,
-                                self.stuck_repeat_count
-                            );
                             error!(
                                 tool = %tool,
                                 count = self.stuck_repeat_count,
-                                "graph-phase stuck loop: terminating run"
+                                "graph-phase stuck loop: requesting graceful summary"
                             );
+                            self.phase = Phase::Poisoned;
+                            let summary = self.summarize_with_no_tools().await;
+                            let err = match summary {
+                                Some(s) => format!(
+                                    "stuck loop exceeded: tool `{tool}` has been called \
+                                     {} times in a row with the same command and producing \
+                                     the same output. The model is not making progress. \
+                                     Here is the model's best-effort summary:\n\n{}",
+                                    self.stuck_repeat_count, s
+                                ),
+                                None => format!(
+                                    "stuck loop exceeded: tool `{tool}` has been called \
+                                     {} times in a row with the same command and producing \
+                                     the same output. The model is not making progress. \
+                                     Hint: refine the task description, narrow the scope, \
+                                     or break it into a smaller sub-task before retrying.",
+                                    self.stuck_repeat_count
+                                ),
+                            };
                             return Ok(LoopState::Error(err));
                         }
 
@@ -777,6 +833,65 @@ impl GraphLoop {
                         self.conversation.add_user(format!(
                             "tool `{tool}` errored: {e}. Adjust and try a different step."
                         ));
+
+                        // Tool-failure guardrail (Hermes §tool_loop_guardrails).
+                        // Track consecutive failures per tool name; a
+                        // sustained failure pattern means the model is
+                        // retrying the same approach without
+                        // adjustment. At thresholds, escalate:
+                        // 3 → warn, 8 → graceful summary + terminate.
+                        let count = self
+                            .tool_failure_counts
+                            .entry(tool.clone())
+                            .or_insert(0);
+                        *count += 1;
+                        let failure_count = *count;
+                        if failure_count >= TOOL_FAILURE_HALT_AFTER {
+                            error!(
+                                tool = %tool,
+                                count = failure_count,
+                                "graph-phase tool-failure guardrail: requesting graceful summary"
+                            );
+                            self.phase = Phase::Poisoned;
+                            // Drop the borrow on `self.tool_failure_counts`
+                            // before calling `self.summarize_with_no_tools`
+                            // (which mutates `self.conversation`).
+                            self.tool_failure_counts.clear();
+                            let summary = self.summarize_with_no_tools().await;
+                            let err = match summary {
+                                Some(s) => format!(
+                                    "tool-failure guardrail: `{tool}` failed {} \
+                                     times in a row. The model is not making \
+                                     progress. Here is the model's \
+                                     best-effort summary:\n\n{}",
+                                    failure_count, s
+                                ),
+                                None => format!(
+                                    "tool-failure guardrail: `{tool}` failed {} \
+                                     times in a row. The model is not making \
+                                     progress. Check the tool environment \
+                                     (network, credentials, sandbox) and \
+                                     retry with a working setup.",
+                                    failure_count
+                                ),
+                            };
+                            return Ok(LoopState::Error(err));
+                        }
+                        if failure_count >= TOOL_FAILURE_WARN_AFTER {
+                            warn!(
+                                tool = %tool,
+                                count = failure_count,
+                                "graph-phase tool-failure guardrail: same tool failed repeatedly; \
+                                 model should change strategy"
+                            );
+                            self.conversation.add_user(format!(
+                                "Note: `{tool}` has now failed {} times in a row. \
+                                 Stop retrying it the same way. Switch tools, \
+                                 change arguments significantly, or emit \
+                                 `ask_user`/`block` to surface the problem.",
+                                failure_count
+                            ));
+                        }
                     }
                 }
                 Ok(LoopState::Running)
@@ -1190,6 +1305,97 @@ impl GraphLoop {
         }
     }
 
+    /// Graceful summary at budget exhaustion. Per Hermes's
+    /// `handle_max_iterations`: instead of just terminating with
+    /// `max_rounds reached`, ask the model to give a final response
+    /// summarizing what it found. The result is stored in
+    /// `self.final_summary` and the caller surfaces it to the user
+    /// as a "best-effort done" message.
+    ///
+    /// The LLM call is made with the same `next_step` machinery
+    /// but with a stripped tools payload (the model is told
+    /// "no more tools, summarize"). If the LLM call itself fails,
+    /// we return None and the caller falls back to the bare
+    /// error string.
+    async fn summarize_with_no_tools(&mut self) -> Option<String> {
+        use crate::agent::proposer::render_graph_for_prompt;
+        use crate::model::{Message, Role};
+        // Inject the summary request as the latest user message.
+        // Use a clearly-marked framing so the model treats it as
+        // a direct instruction rather than chit-chat.
+        self.conversation.add_user(
+            "The tool-calling iteration budget has been reached. \
+             You may NOT call any more tools. Give a final response \
+             now: summarize what you found, what is still missing, \
+             and (if applicable) what the user should do next to \
+             unblock. Be concrete — name the files / nodes / \
+             decisions you actually made, not aspirations. Keep it \
+             under 400 words."
+                .to_string(),
+        );
+
+        // We need a ModelRequest WITHOUT tools. The proposer
+        // builds requests from the registered ToolRegistry, so we
+        // do the request here directly with an empty tool set.
+        let graph_snapshot = render_graph_for_prompt(&self.graph);
+        let mut messages: Vec<Message> = self
+            .conversation
+            .messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+        // Re-inject the system prompt + graph snapshot header
+        // (matching the proposer's request shape, just without
+        // tools).
+        if let Some(first) = messages.first() {
+            if !matches!(first.role, Role::System) {
+                let system = self.proposer.build_system_prompt(&self.task);
+                let mut with_system = vec![
+                    Message::system(system),
+                    Message::system(format!(
+                        "Current relationship-graph snapshot (authoritative — \
+                         your beliefs about the graph should match this):\n{graph_snapshot}"
+                    )),
+                ];
+                with_system.append(&mut messages);
+                messages = with_system;
+            }
+        }
+
+        let req = crate::model::ModelRequest {
+            messages,
+            tools: vec![],
+            temperature: 0.0,
+            max_tokens: Some(512),
+            stop: vec![],
+        };
+        match self.proposer.model.complete(req).await {
+            Ok(resp) => {
+                let trimmed = resp.content.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    // Also record the summary in the conversation
+                    // so the transcript (audit log) has it.
+                    self.conversation
+                        .messages
+                        .push(crate::model::Message {
+                            role: Role::Assistant,
+                            content: trimmed.clone(),
+                        });
+                    Some(trimmed)
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "graph-phase graceful summary: LLM call failed");
+                None
+            }
+        }
+    }
+
     /// Drive the L1Enricher across `ids` if one is configured. Errors are
     /// logged but never bubble up — L1 enrichment is best-effort linkage,
     /// not a correctness gate (the Verifier's L1 sampling layer is the
@@ -1236,6 +1442,16 @@ const STUCK_REPEAT_HARD_HINT: u32 = 5;
 /// can see "stuck loop: 6 repeats" and try a different task shape.
 const STUCK_REPEAT_TERMINATE: u32 = 6;
 
+/// Tool-failure guardrail tier 1 (Hermes §tool_loop_guardrails
+/// `same_tool_failure_warn_after`): after this many consecutive
+/// failures of the same tool, inject a hint telling the model to
+/// change strategy.
+const TOOL_FAILURE_WARN_AFTER: u32 = 3;
+
+/// Tool-failure guardrail tier 2: after this many consecutive
+/// failures, request a graceful summary and terminate.
+const TOOL_FAILURE_HALT_AFTER: u32 = 8;
+
 /// How many leading characters of the tool output to fold into the
 /// stuck signature. Long enough to catch "same first page" patterns
 /// (e.g. `ls -la` listings) without being expensive to hash.
@@ -1281,6 +1497,12 @@ fn render_step_as_json(step: &ProposerStep) -> String {
         }),
         ProposerStep::ReadyForVerify { rationale } => serde_json::json!({
             "step": "ready_for_verify",
+            "rationale": rationale,
+        }),
+        ProposerStep::Block { reason, needed_from_user, rationale } => serde_json::json!({
+            "step": "block",
+            "reason": reason,
+            "needed_from_user": needed_from_user,
             "rationale": rationale,
         }),
     };

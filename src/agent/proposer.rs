@@ -52,6 +52,25 @@ pub enum ProposerStep {
     ReadyForVerify {
         rationale: String,
     },
+    /// Self-pause with a specific blocker. The model is saying
+    /// "I have enough context to know what's going on, but I cannot
+    /// proceed without a specific human input" — a credential, a
+    /// UX choice, paywalled source output, etc. Different from
+    /// `AskUser` (which is for clarifying the task) and from
+    /// `ReadyForVerify` (which is "I think the graph is complete"):
+    /// this is "I am explicitly blocked on something the user must
+    /// provide." The run pauses with the reason visible to the user.
+    Block {
+        /// Short label of what the model is blocked on (e.g.
+        /// "missing API key", "need UX decision", "paywalled
+        /// source").
+        reason: String,
+        /// Optional one-line question to surface to the user. If
+        /// empty, the user just sees the reason and decides whether
+        /// to unblock manually.
+        needed_from_user: String,
+        rationale: String,
+    },
 }
 
 impl ProposerStep {
@@ -62,6 +81,7 @@ impl ProposerStep {
             Self::CallTool { .. } => "call_tool",
             Self::ProposePatch { .. } => "propose_patch",
             Self::ReadyForVerify { .. } => "ready_for_verify",
+            Self::Block { .. } => "block",
         }
     }
 }
@@ -317,7 +337,13 @@ impl GraphProposer {
 ///
 /// Includes L1 summaries inline next to each node so the model always sees
 /// the current semantic state of the graph alongside the structure.
-fn render_graph_for_prompt(g: &Graph) -> String {
+/// Render the graph compactly for inclusion in the model's prompt. Different
+/// from `context::render_local_graph` in that it uses a more JSON-friendly,
+/// idempotent layout the model is more likely to reason cleanly about.
+///
+/// Includes L1 summaries inline next to each node so the model always sees
+/// the current semantic state of the graph alongside the structure.
+pub(crate) fn render_graph_for_prompt(g: &Graph) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "graph version={} status={:?} nodes={} edges={} l1_entries={}\n",
@@ -516,6 +542,23 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
             Ok(ProposerStep::ProposePatch { patch, rationale })
         }
         "ready_for_verify" => Ok(ProposerStep::ReadyForVerify { rationale }),
+        "block" => {
+            let reason = value
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let needed_from_user = value
+                .get("needed_from_user")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(ProposerStep::Block {
+                reason,
+                needed_from_user,
+                rationale,
+            })
+        }
         other => Err(HarnessError::model(format!(
             "proposer: unknown step '{other}'"
         ))),
@@ -748,6 +791,19 @@ no markdown code fences, nothing else:
 4. READY FOR VERIFY — when the L0 captures the task completely.
    {"step":"ready_for_verify","rationale":"<why you believe the graph is done>"}
 
+5. BLOCK — when you have enough context to know what to do, but
+   cannot proceed without a specific human input that no tool can
+   provide (a credential, a UX choice, paywalled-source output,
+   a decision only the user can make). Different from `ask_user`
+   which is for task clarification; this is "I'm explicitly
+   blocked on something the user must give me." The run pauses
+   with the reason visible to the user; they decide whether to
+   unblock.
+   {"step":"block",
+    "reason":"<short label of what you're blocked on>",
+    "needed_from_user":"<optional one-line question to surface>",
+    "rationale":"<what you tried and why you're stuck>"}
+
 ## Vocabularies (use these exact strings)
 
 NodeKind:     File | Function | Class | Module | Config | Task | Other
@@ -976,6 +1032,39 @@ mod tests {
                 assert_eq!(patch.reason, "capture dep");
             }
             other => panic!("expected ProposePatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_step_kind_is_block() {
+        // Regression guard: the system prompt teaches the model to
+        // emit step="block" with reason/needed_from_user/rationale.
+        // If a future refactor renames the variant, this test names
+        // exactly what changed.
+        let s = ProposerStep::Block {
+            reason: "need API key".into(),
+            needed_from_user: "Do you have a Stripe test key?".into(),
+            rationale: "I'm ready to call but auth blocks me".into(),
+        };
+        assert_eq!(s.kind(), "block");
+    }
+
+    #[test]
+    fn block_step_round_trips_through_parse_step() {
+        // A model that emits the documented `block` JSON should
+        // parse back to the Block variant. If the JSON shape
+        // changes, this fails.
+        let s = parse_step(
+            r#"{"step":"block","reason":"need credential","needed_from_user":"which key?","rationale":"I tried"}"#,
+        )
+        .unwrap();
+        match s {
+            ProposerStep::Block { reason, needed_from_user, rationale } => {
+                assert_eq!(reason, "need credential");
+                assert_eq!(needed_from_user, "which key?");
+                assert_eq!(rationale, "I tried");
+            }
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 

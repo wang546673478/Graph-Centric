@@ -283,7 +283,7 @@ async fn drive_run(
         Arc::new(BashCheckValidator::cargo_check_for(&state.config.project_root));
 
     let loop_cfg = GraphLoopConfig {
-        max_rounds: 24,
+        max_rounds: 50,
         max_repair_rounds: 3,
         tool_cwd: state.config.project_root.clone(),
         tool_output_cap: 8_000,
@@ -547,7 +547,8 @@ fn step_transcripts(
         ProposerStep::AskUser { rationale, .. }
         | ProposerStep::CallTool { rationale, .. }
         | ProposerStep::ProposePatch { rationale, .. }
-        | ProposerStep::ReadyForVerify { rationale, .. } => rationale.trim().to_string(),
+        | ProposerStep::ReadyForVerify { rationale, .. }
+        | ProposerStep::Block { rationale, .. } => rationale.trim().to_string(),
     };
     if !rationale.is_empty() {
         out.push(("assistant".into(), rationale));
@@ -560,6 +561,20 @@ fn step_transcripts(
                 None
             } else {
                 Some(("ask_user".into(), format!("🤔 {question}")))
+            }
+        }
+        ProposerStep::Block { reason, needed_from_user, .. } => {
+            // Surface the blocker to the chat so the user can
+            // immediately see what the model is waiting on.
+            if reason.trim().is_empty() {
+                None
+            } else if needed_from_user.trim().is_empty() {
+                Some(("block".into(), format!("🚧 {reason}")))
+            } else {
+                Some((
+                    "block".into(),
+                    format!("🚧 {reason} — {needed_from_user}"),
+                ))
             }
         }
         ProposerStep::ProposePatch { patch, .. } => {
