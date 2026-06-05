@@ -947,6 +947,14 @@ RelationType: Contains | BelongsTo | Imports | Exports | DependsOn |
   what you're doing in plain language. Keep it to one or two
   sentences. The structured step (propose_patch / ask_user / etc.)
   is the graph side; the rationale is the human side.
+- **Graph content language.** When the user's task is in a
+  non-English language, write all graph content — node
+  `summary`, edge `evidence`, the `reason` field on
+  patches, and (if you set them) L1 fields — in **that same
+  language**. The user will see the graph in the chat UI;
+  English graph content next to a Chinese task is jarring and
+  forces them to mentally translate. English is fine only when
+  the user is also writing English.
 - All edge endpoints must exist (already present, or being added in the
   same patch's add_nodes). The runtime rejects edges with missing endpoints.
 - Confidence guidance: 0.9+ for evidence you directly observed (tool

@@ -1522,8 +1522,47 @@ impl GraphLoop {
             max_tokens: Some(512),
             stop: vec![],
         };
-        match self.proposer.model.complete(req).await {
-            Ok(resp) => {
+
+        // Retry once on transient HTTP errors (529 overloaded,
+        // 5xx server errors, request timeouts). The summary
+        // path is the last resort before terminating the run,
+        // so it's worth one retry. After the retry, fall
+        // back to the bare error string — we'd rather have
+        // the user see "stuck loop + hint" than hang
+        // forever waiting for an API that's down.
+        const MAX_ATTEMPTS: u32 = 2;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut last_err: Option<crate::error::HarnessError> = None;
+        let mut resp_opt: Option<crate::model::ModelResponse> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.proposer.model.complete(req.clone()).await {
+                Ok(r) => {
+                    resp_opt = Some(r);
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    if attempt < MAX_ATTEMPTS {
+                        warn!(
+                            attempt,
+                            error = %e,
+                            "graph-phase graceful summary: LLM call failed; retrying"
+                        );
+                        tokio::time::sleep(RETRY_DELAY).await;
+                        last_err = Some(e);
+                    } else {
+                        warn!(
+                            attempt,
+                            error = %e,
+                            "graph-phase graceful summary: LLM call failed after retry; falling back to bare error"
+                        );
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+        match resp_opt {
+            Some(resp) => {
                 let trimmed = resp.content.trim().to_string();
                 if trimmed.is_empty() {
                     None
@@ -1539,8 +1578,12 @@ impl GraphLoop {
                     Some(trimmed)
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "graph-phase graceful summary: LLM call failed");
+            None => {
+                // Retries exhausted; last_err is Some.
+                debug!(
+                    error = ?last_err,
+                    "graph-phase graceful summary: no response after retries; falling back to bare error"
+                );
                 None
             }
         }

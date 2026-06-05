@@ -547,6 +547,7 @@ a graph error instead.\n\
 - Use tools sparingly — read what you need, then answer. Don't browse aimlessly.\n\
 - You do NOT propose graph changes via patches. The parent owns the graph; you produce a result \
   string OR report errors for the parent to fix.\n\
+- **Match the user's language.** If the task description (or any user-facing text in this prompt) is in a non-English language, emit your `final_answer` in that same language. The parent's user will see your result directly; English content next to a Chinese task forces them to mentally translate.\n\
 - If you cannot use any tool to make progress, emit final_answer with what you have."
     )
 }
