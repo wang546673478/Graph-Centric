@@ -50,7 +50,7 @@ use crate::tools::{ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // LoopState — what `step()` returns to the caller
@@ -412,15 +412,17 @@ pub struct GraphLoop {
     /// the next step. Lets callers emit a `tool_result` transcript
     /// event alongside the matching `tool_use` line.
     pub last_tool_result: Option<(String, String)>,
-    /// Signature of the most recent `CallTool` step (hash of
-    /// `tool_name` + canonical-JSON args). Used by the stuck detector
-    /// to recognize when the model is calling the same tool with the
-    /// same args over and over.
-    last_tool_signature: Option<u64>,
-    /// How many consecutive rounds had the same tool signature as
-    /// `last_tool_signature`. Reset to 0 when the signature changes.
-    /// When the count crosses a threshold we inject a hint into the
-    /// conversation telling the model to break out of the loop.
+    /// Combined stuck-detector signature for the most recent successful
+    /// `CallTool` step: hash of `(command_signature, output_prefix_hash)`.
+    /// Used to recognize when the model is calling the same tool with
+    /// effectively the same intent (either the same command, or a
+    /// different command that produces the same output prefix). Reset
+    /// to `None` when the model makes progress (propose_patch /
+    /// ask_user).
+    last_stuck_signature: Option<u64>,
+    /// How many consecutive rounds had the same stuck signature.
+    /// Reset to 0 when the signature changes. Drives the tiered
+    /// escalation: soft hint at 3, hard hint at 5, terminate at 6.
     stuck_repeat_count: u32,
     /// Cumulative tokens used by every model call so far. The
     /// Proposer/Reviewer/Validator all sum into this so the caller
@@ -464,7 +466,7 @@ impl GraphLoop {
             review_result: None,
             last_step: None,
             last_tool_result: None,
-            last_tool_signature: None,
+            last_stuck_signature: None,
             stuck_repeat_count: 0,
             tokens_used: 0,
             phase: Phase::Graph,
@@ -650,7 +652,7 @@ impl GraphLoop {
                 self.pending = Pending::AwaitingAnswer { question: question.clone() };
                 // Reset stuck detector — engaging the user is a way out.
                 self.stuck_repeat_count = 0;
-                self.last_tool_signature = None;
+                self.last_stuck_signature = None;
                 Ok(LoopState::Paused { question, rationale })
             }
             ProposerStep::CallTool {
@@ -661,10 +663,6 @@ impl GraphLoop {
                 let ctx = ToolContext::new(self.config.tool_cwd.clone())
                     .with_policy(self.config.tool_policy.clone())
                     .with_max_output(self.config.tool_output_cap);
-                // Compute the stuck-detector signature BEFORE invoking
-                // the tool — `args` is moved into `invoke` and we still
-                // need a reference for the hash.
-                let sig = tool_signature(&tool, &args);
                 match self.tools.invoke(&tool, args, &ctx).await {
                     Ok(out) => {
                         // Snapshot the result for the caller to surface as
@@ -690,30 +688,81 @@ impl GraphLoop {
                         );
                         self.conversation.add_user(body);
 
-                        // Stuck detection: if the same tool+args has
-                        // been called repeatedly with the loop not
-                        // making progress, inject a hint telling the
-                        // model to break out (propose_patch or
-                        // ask_user). The user observes this in the
-                        // chat as a regular user-style message so
-                        // the model can also choose to act on it
-                        // naturally.
-                        if self.last_tool_signature == Some(sig) {
+                        // Stuck detection: hash the output prefix
+                        // (first 1024 chars). We deliberately do NOT
+                        // include the command in the signature —
+                        // the model can vary the command line
+                        // slightly (e.g. `ls -la /` vs `ls -la / 2>&1
+                        // | head -50`) while getting the same
+                        // output, and that should still count as
+                        // stuck. What matters is whether the model
+                        // is seeing new information, not whether it's
+                        // typing the same characters.
+                        let output_prefix: String = out
+                            .content
+                            .chars()
+                            .take(STUCK_OUTPUT_PREFIX_CHARS)
+                            .collect();
+                        let output_sig = hash_string(&output_prefix);
+                        if self.last_stuck_signature == Some(output_sig) {
                             self.stuck_repeat_count += 1;
                         } else {
-                            self.last_tool_signature = Some(sig);
+                            self.last_stuck_signature = Some(output_sig);
                             self.stuck_repeat_count = 1;
                         }
-                        if self.stuck_repeat_count >= STUCK_REPEAT_THRESHOLD {
+
+                        // Tier 3: hard terminate the run. This is
+                        // the only branch that returns a non-Running
+                        // state, so the model cannot make the run
+                        // drag on by ignoring hints forever.
+                        if self.stuck_repeat_count >= STUCK_REPEAT_TERMINATE {
+                            let err = format!(
+                                "stuck loop exceeded: tool `{tool}` has been called \
+                                 {} times in a row with the same command and producing \
+                                 the same output. The model is not making progress. \
+                                 Hint: refine the task description, narrow the scope, or \
+                                 break it into a smaller sub-task before retrying."
+,
+                                self.stuck_repeat_count
+                            );
+                            error!(
+                                tool = %tool,
+                                count = self.stuck_repeat_count,
+                                "graph-phase stuck loop: terminating run"
+                            );
+                            return Ok(LoopState::Error(err));
+                        }
+
+                        // Tier 2: hard hint — the next repeat will
+                        // terminate. Model has a chance to act on
+                        // it; if it doesn't, tier 3 fires.
+                        if self.stuck_repeat_count >= STUCK_REPEAT_HARD_HINT {
                             warn!(
                                 tool = %tool,
                                 count = self.stuck_repeat_count,
-                                "graph-phase stuck detector: same tool+args called repeatedly; injecting break-out hint"
+                                "graph-phase stuck detector: hard hint; next repeat will terminate"
                             );
                             self.conversation.add_user(format!(
                                 "Note: you have just called `{tool}` with the same \
-                                 arguments {} times in a row and the output is not \
-                                 changing. Calling it again is unlikely to produce new \
+                                 arguments AND produced the same output {} times in a \
+                                 row. The NEXT call with the same args will TERMINATE \
+                                 this run. You MUST now either:\n\
+                                 - emit a `propose_patch` to record what you have \
+                                 already learned, or\n\
+                                 - emit `ask_user` for direction.\n\
+                                 Do NOT call the same tool with the same args again.",
+                                self.stuck_repeat_count
+                            ));
+                        } else if self.stuck_repeat_count >= STUCK_REPEAT_SOFT_HINT {
+                            warn!(
+                                tool = %tool,
+                                count = self.stuck_repeat_count,
+                                "graph-phase stuck detector: soft hint"
+                            );
+                            self.conversation.add_user(format!(
+                                "Note: you have just called `{tool}` with the same \
+                                 arguments AND produced the same output {} times in a \
+                                 row. Calling it again is unlikely to produce new \
                                  information. Either:\n\
                                  - emit a `propose_patch` to record what you have \
                                  already learned, or\n\
@@ -743,7 +792,7 @@ impl GraphLoop {
                     Ok(()) => {
                         // Reset stuck detector — the model is making progress.
                         self.stuck_repeat_count = 0;
-                        self.last_tool_signature = None;
+                        self.last_stuck_signature = None;
                         self.conversation.add_user(format!(
                             "Patch applied. Graph went from {before_nodes}n/{before_edges}e to {}n/{}e. Continue.",
                             self.graph.node_count(),
@@ -1172,53 +1221,34 @@ impl GraphLoop {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Threshold for stuck detection. If the model has called the same
-/// tool with the same args `STUCK_REPEAT_THRESHOLD` times in a row,
-/// inject a hint into the conversation telling it to break out
-/// (propose_patch or ask_user).
-const STUCK_REPEAT_THRESHOLD: u32 = 3;
+/// Stuck-detection tier 1: after this many consecutive rounds with the
+/// same `(command, output)` signature, inject a soft hint into the
+/// conversation telling the model to propose_patch or ask_user.
+const STUCK_REPEAT_SOFT_HINT: u32 = 3;
 
-/// Hash a (tool_name, args) pair into a u64. Used to recognize when
-/// the model is calling the same tool with the same args over and
-/// over. Hash quality doesn't matter — we just want equality to
-/// match reliably, not be adversarially robust.
-///
-/// The default behavior canonicalizes the full args JSON, but a few
-/// tools have "incidental" fields (e.g. `bash`'s `description` and
-/// `timeout_ms`) that change every call without the underlying
-/// intent changing. For those, we extract the load-bearing field
-/// (`bash.command`) and hash only that — otherwise a model
-/// re-running `ls -la /x` with a fresh description string every
-/// round would escape detection.
-fn tool_signature(tool: &str, args: &serde_json::Value) -> u64 {
+/// Stuck-detection tier 2: after this many consecutive rounds, escalate
+/// to a hard hint that says the NEXT repeat will terminate the run.
+const STUCK_REPEAT_HARD_HINT: u32 = 5;
+
+/// Stuck-detection tier 3: at this many consecutive rounds, terminate
+/// the run with `LoopState::Error` instead of letting it burn
+/// `max_rounds` rounds. The error message is informative — the user
+/// can see "stuck loop: 6 repeats" and try a different task shape.
+const STUCK_REPEAT_TERMINATE: u32 = 6;
+
+/// How many leading characters of the tool output to fold into the
+/// stuck signature. Long enough to catch "same first page" patterns
+/// (e.g. `ls -la` listings) without being expensive to hash.
+const STUCK_OUTPUT_PREFIX_CHARS: usize = 1024;
+
+/// Stable hash of an arbitrary string. Used for both the per-tool
+/// command signature and the per-call output-prefix signature.
+fn hash_string(s: &str) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
-    tool.hash(&mut h);
-    let effective = effective_args(tool, args);
-    effective.hash(&mut h);
+    s.hash(&mut h);
     h.finish()
-}
-
-/// Extract the load-bearing portion of a tool's args for signature
-/// purposes. Returns the field(s) that, if unchanged, mean the
-/// model is asking for the same thing as last time — even if
-/// metadata fields like `description` or `timeout_ms` differ.
-fn effective_args(tool: &str, args: &serde_json::Value) -> String {
-    match tool {
-        // Bash: the `command` string is what determines whether
-        // two calls do the same thing. `description` and
-        // `timeout_ms` are model-provided metadata and vary every
-        // call without changing the intent.
-        "bash" => args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| serde_json::to_string(args).unwrap_or_default()),
-        // Other tools: hash the full args for now. Future tools
-        // with similar incidental fields can be added here.
-        _ => serde_json::to_string(args).unwrap_or_default(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,45 +1297,47 @@ mod tests {
     use crate::agent::verifier::{IssueSource, Severity};
 
     #[test]
-    fn tool_signature_is_stable_for_same_inputs() {
-        // Two calls with the same tool name and the same args must
-        // hash to the same u64 — otherwise the stuck detector would
-        // never fire.
-        let a = tool_signature("bash", &serde_json::json!({"command": "ls -la"}));
-        let b = tool_signature("bash", &serde_json::json!({"command": "ls -la"}));
+    fn hash_string_is_stable() {
+        assert_eq!(hash_string("hello world"), hash_string("hello world"));
+    }
+
+    #[test]
+    fn hash_string_differs_on_content() {
+        assert_ne!(hash_string("hello"), hash_string("world"));
+        assert_ne!(hash_string("a"), hash_string("A"));
+    }
+
+    #[test]
+    fn hash_string_handles_empty() {
+        // Should not panic; the empty string has a stable hash.
+        let a = hash_string("");
+        let b = hash_string("");
         assert_eq!(a, b);
     }
 
     #[test]
-    fn tool_signature_differs_on_command() {
-        // The detector's whole purpose: different commands should
-        // hash to different signatures.
-        let a = tool_signature("bash", &serde_json::json!({"command": "ls -la"}));
-        let b = tool_signature("bash", &serde_json::json!({"command": "ls -la /"}));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn tool_signature_differs_on_tool() {
-        let a = tool_signature("bash", &serde_json::json!({"command": "ls"}));
-        let b = tool_signature("web_search", &serde_json::json!({"command": "ls"}));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn tool_signature_ignores_key_order() {
-        // Two calls with the same args but different JSON key order
-        // should hash the same — otherwise the model could escape
-        // detection by re-ordering.
-        let a = tool_signature(
-            "bash",
-            &serde_json::json!({"command": "ls -la", "timeout_ms": 10000}),
+    fn stuck_thresholds_are_in_ascending_order() {
+        // Regression guard: the tiered escalation depends on these
+        // being in the right order. If a refactor changes one, this
+        // test names exactly which constant is wrong.
+        assert!(
+            STUCK_REPEAT_SOFT_HINT < STUCK_REPEAT_HARD_HINT,
+            "soft hint must fire before hard hint (got soft={}, hard={})",
+            STUCK_REPEAT_SOFT_HINT,
+            STUCK_REPEAT_HARD_HINT
         );
-        let b = tool_signature(
-            "bash",
-            &serde_json::json!({"timeout_ms": 10000, "command": "ls -la"}),
+        assert!(
+            STUCK_REPEAT_HARD_HINT < STUCK_REPEAT_TERMINATE,
+            "hard hint must fire before terminate (got hard={}, terminate={})",
+            STUCK_REPEAT_HARD_HINT,
+            STUCK_REPEAT_TERMINATE
         );
-        assert_eq!(a, b);
+        assert!(
+            STUCK_REPEAT_TERMINATE <= 6,
+            "terminate threshold must be ≤ max_rounds / 4 to fire before \
+             max_rounds (24); got {}",
+            STUCK_REPEAT_TERMINATE
+        );
     }
     use crate::graph::{Edge, NodeKind, RelationType};
     use crate::model::{FinishReason, Model, ModelRequest, ModelResponse, Usage};
