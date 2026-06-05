@@ -71,6 +71,27 @@ pub enum ProposerStep {
         needed_from_user: String,
         rationale: String,
     },
+    /// Dispatch a subagent to do a multi-file exploration on the
+    /// model's behalf (Claude Code's `EXPLORE_AGENT` pattern).
+    /// Use this when the model has seen a directory listing and
+    /// needs to read several files to answer an open-ended
+    /// question. The subagent runs with its own tool-calling
+    /// loop (capped at `max_steps`), returns a summary string,
+    /// and the main agent continues with that summary in
+    /// context. This prevents the main agent from getting
+    /// stuck in `ls`-`ls`-`ls` loops when it should be
+    /// delegating the heavy reading.
+    Explore {
+        /// What to look at. Free-form: a directory path, a file
+        /// glob, a function name, a list of node ids — whatever
+        /// scopes the question. The subagent interprets.
+        scope: String,
+        /// The specific question the subagent should answer. A
+        /// good pair is one a subagent can resolve in 3-6 tool
+        /// calls.
+        question: String,
+        rationale: String,
+    },
 }
 
 impl ProposerStep {
@@ -82,6 +103,7 @@ impl ProposerStep {
             Self::ProposePatch { .. } => "propose_patch",
             Self::ReadyForVerify { .. } => "ready_for_verify",
             Self::Block { .. } => "block",
+            Self::Explore { .. } => "explore",
         }
     }
 }
@@ -559,6 +581,28 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                 rationale,
             })
         }
+        "explore" => {
+            let scope = value
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let question = value
+                .get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if scope.is_empty() || question.is_empty() {
+                return Err(HarnessError::model(
+                    "proposer: explore requires non-empty 'scope' and 'question'".to_string(),
+                ));
+            }
+            Ok(ProposerStep::Explore {
+                scope,
+                question,
+                rationale,
+            })
+        }
         other => Err(HarnessError::model(format!(
             "proposer: unknown step '{other}'"
         ))),
@@ -803,6 +847,22 @@ no markdown code fences, nothing else:
     "reason":"<short label of what you're blocked on>",
     "needed_from_user":"<optional one-line question to surface>",
     "rationale":"<what you tried and why you're stuck>"}
+
+6. EXPLORE — dispatch a subagent to do a multi-file read on your
+   behalf. Use this when the next 3-5 tool calls would all be
+   `cat`/`head`/`grep` against a known scope (a directory, a
+   pattern of files). A subagent with `bash` will read the files
+   and return a summary, which keeps YOUR context clean and
+   breaks the "I've seen the directory but I haven't read any
+   files" failure mode. After the subagent returns, you can
+   `propose_patch` with what you learned. DO NOT use this for
+   single tool calls or for code-modification subtasks
+   (use `call_tool` for the former; build graph + Task phase
+   for the latter).
+   {"step":"explore",
+    "scope":"<directory / file pattern / node-id list>",
+    "question":"<specific question for the subagent to answer>",
+    "rationale":"<why a subagent is the right tool here>"}
 
 ## Vocabularies (use these exact strings)
 
@@ -1066,6 +1126,53 @@ mod tests {
             }
             other => panic!("expected Block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn explore_step_kind_is_explore() {
+        // Regression guard: the system prompt teaches the model
+        // to emit step="explore" with scope/question/rationale.
+        let s = ProposerStep::Explore {
+            scope: "src/agent/".into(),
+            question: "what's the orchestrator pattern?".into(),
+            rationale: "I've seen the directory but not read any files".into(),
+        };
+        assert_eq!(s.kind(), "explore");
+    }
+
+    #[test]
+    fn explore_step_round_trips_through_parse_step() {
+        // A model that emits the documented `explore` JSON should
+        // parse back to the Explore variant. The parse_step arm
+        // is what wires the Claude Code EXPLORE_AGENT pattern
+        // into our system, so this is the regression guard.
+        let s = parse_step(
+            r#"{"step":"explore","scope":"src/agent/","question":"what's the orchestrator pattern?","rationale":"seen dir, not read files"}"#,
+        )
+        .unwrap();
+        match s {
+            ProposerStep::Explore { scope, question, rationale } => {
+                assert_eq!(scope, "src/agent/");
+                assert_eq!(question, "what's the orchestrator pattern?");
+                assert_eq!(rationale, "seen dir, not read files");
+            }
+            other => panic!("expected Explore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explore_step_rejects_empty_scope_or_question() {
+        // The dispatcher can't proceed without a real scope and
+        // question — empty values would just produce a no-op
+        // subagent call. Reject at parse time.
+        assert!(parse_step(
+            r#"{"step":"explore","scope":"","question":"anything","rationale":"r"}"#
+        )
+        .is_err());
+        assert!(parse_step(
+            r#"{"step":"explore","scope":"src/","question":"","rationale":"r"}"#
+        )
+        .is_err());
     }
 
     #[test]

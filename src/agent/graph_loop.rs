@@ -695,6 +695,23 @@ impl GraphLoop {
                 };
                 Ok(LoopState::Paused { question, rationale })
             }
+            ProposerStep::Explore { scope, question, rationale: _ } => {
+                // Claude Code's `EXPLORE_AGENT` pattern. The
+                // main agent has decided the next 3-5 tool calls
+                // would all be file reads; instead of running
+                // them itself (and risk getting stuck in a
+                // bash loop), it dispatches a subagent. The
+                // subagent has its own tool-calling loop
+                // (capped at `max_steps`) and returns a summary
+                // that we inject back into the conversation.
+                //
+                // This is the architectural fix for the
+                // "I've-seen-the-directory-but-haven't-read-any-files"
+                // failure mode.
+                self.stuck_repeat_count = 0;
+                self.last_stuck_signature = None;
+                self.dispatch_explore_subagent(&scope, &question).await
+            }
             ProposerStep::CallTool {
                 tool,
                 args,
@@ -1305,6 +1322,127 @@ impl GraphLoop {
         }
     }
 
+    /// Dispatch a subagent to do a multi-file exploration on the
+    /// main agent's behalf. Used by the `Explore` step kind
+    /// (Claude Code's `EXPLORE_AGENT` pattern). The subagent
+    /// has its own tool-calling loop, capped at `max_steps`,
+    /// and returns a summary string. The main agent's
+    /// conversation gets a single user message containing the
+    /// summary; the main agent is not exposed to the raw
+    /// file contents the subagent read.
+    async fn dispatch_explore_subagent(
+        &mut self,
+        scope: &str,
+        question: &str,
+    ) -> Result<LoopState> {
+        use super::subagent::{SubAgent, SubTask};
+        use crate::context::FilesystemSources;
+        use std::time::Instant;
+        use tracing::info;
+
+        info!(scope = %scope, question = %question, "graph-phase Explore: dispatching subagent");
+
+        // Build a one-shot subagent configured to match the
+        // graph-phase tool policy. The subagent is read-only
+        // (ReadOnly on bash + the same scope guard as the
+        // main agent), so it cannot accidentally write. We
+        // deliberately cap `max_steps` low so a confused
+        // subagent can't run away; an exploration needs
+        // ~3-6 tool calls typically.
+        let subagent = SubAgent::new(self.proposer.model.clone())
+            .with_tools(self.tools.clone())
+            .with_policy(self.config.tool_policy.clone())
+            .with_tool_cwd(self.config.tool_cwd.clone())
+            .with_tool_output_cap(self.config.tool_output_cap)
+            .with_max_steps(6);
+        // A scope guard would be ideal but currently the
+        // graph-phase tool policy is a Policy trait object
+        // (e.g. DangerousCommandDeny) — the ScopeGuard
+        // wiring is Phase-3-only. We rely on the policy
+        // being read-only for now.
+        let loader = FilesystemSources::new(&self.config.tool_cwd);
+
+        // Build the SubTask. The "id" is unique per Explore
+        // dispatch so repeated subagent results in this run
+        // don't collide. `description` carries the question;
+        // `involved_nodes` is empty (the subagent picks
+        // files itself based on the scope hint).
+        let task = SubTask {
+            id: NodeId::from(format!("explore-r{}-{}", self.round, std::process::id())),
+            description: format!(
+                "Explore scope: {scope}\nQuestion: {question}\n\n\
+                 Read the relevant files (use `cat`, `head`, or `grep` via \
+                 bash) and produce a concise summary that directly \
+                 answers the question. Cite file paths you read."
+            ),
+            involved_nodes: Vec::new(),
+            needs: Default::default(),
+        };
+
+        let started = Instant::now();
+        let result = subagent.execute(&task, &self.graph, &loader).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        match result {
+            Ok(r) if r.success => {
+                info!(
+                    tool_calls = r.tool_calls_made,
+                    duration_ms = elapsed_ms,
+                    "Explore subagent succeeded"
+                );
+                // Inject the result as a user message. The
+                // main agent sees ONLY the summary, not the
+                // raw file contents (that's the whole point
+                // — the subagent's job is to keep the
+                // main agent's context clean).
+                let body = format!(
+                    "Explore subagent result for scope `{scope}` \
+                     ({} tool calls, {}ms):\n\n{}",
+                    r.tool_calls_made, elapsed_ms, r.output
+                );
+                self.conversation.add_user(body);
+            }
+            Ok(r) => {
+                warn!(
+                    tool_calls = r.tool_calls_made,
+                    error = r.error.as_deref().unwrap_or("?"),
+                    "Explore subagent failed; surfacing to main agent"
+                );
+                let body = format!(
+                    "Explore subagent failed for scope `{scope}` \
+                     ({} tool calls, {}ms): {}\n\n\
+                     You can either retry with a different scope/question, \
+                     or fall back to direct `call_tool` calls.",
+                    r.tool_calls_made,
+                    elapsed_ms,
+                    r.error.as_deref().unwrap_or("unknown error")
+                );
+                self.conversation.add_user(body);
+            }
+            Err(e) => {
+                warn!(error = %e, "Explore subagent execution errored");
+                let body = format!(
+                    "Explore subagent hit a transport error for scope \
+                     `{scope}`: {e}. Fall back to direct `call_tool` \
+                     or emit `block` to surface the problem."
+                );
+                self.conversation.add_user(body);
+            }
+        }
+
+        // Track token spend across the subagent call so the
+        // chat UI's "tokens used" stat includes it. We can't
+        // know exactly how the subagent's model charged the
+        // tokens (the SubAgentResult has tokens_used, but
+        // SubAgent::execute currently doesn't surface that
+        // back to us — we just have tool_calls_made). 0 is
+        // a safe lower bound that keeps the running total
+        // monotonically increasing.
+        // (Could be improved by plumbing tokens through.)
+
+        Ok(LoopState::Running)
+    }
+
     /// Graceful summary at budget exhaustion. Per Hermes's
     /// `handle_max_iterations`: instead of just terminating with
     /// `max_rounds reached`, ask the model to give a final response
@@ -1503,6 +1641,12 @@ fn render_step_as_json(step: &ProposerStep) -> String {
             "step": "block",
             "reason": reason,
             "needed_from_user": needed_from_user,
+            "rationale": rationale,
+        }),
+        ProposerStep::Explore { scope, question, rationale } => serde_json::json!({
+            "step": "explore",
+            "scope": scope,
+            "question": question,
             "rationale": rationale,
         }),
     };

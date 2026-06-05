@@ -548,7 +548,8 @@ fn step_transcripts(
         | ProposerStep::CallTool { rationale, .. }
         | ProposerStep::ProposePatch { rationale, .. }
         | ProposerStep::ReadyForVerify { rationale, .. }
-        | ProposerStep::Block { rationale, .. } => rationale.trim().to_string(),
+        | ProposerStep::Block { rationale, .. }
+        | ProposerStep::Explore { rationale, .. } => rationale.trim().to_string(),
     };
     if !rationale.is_empty() {
         out.push(("assistant".into(), rationale));
@@ -576,6 +577,15 @@ fn step_transcripts(
                     format!("🚧 {reason} — {needed_from_user}"),
                 ))
             }
+        }
+        ProposerStep::Explore { scope, question, .. } => {
+            // Show in the chat that the model dispatched a
+            // subagent. The actual subagent result will arrive
+            // as a separate transcript event when it returns.
+            Some((
+                "explore".into(),
+                format!("🔍 explore: {question} (scope: {scope})"),
+            ))
         }
         ProposerStep::ProposePatch { patch, .. } => {
             let n = patch.add_nodes.len();
