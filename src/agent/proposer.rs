@@ -195,7 +195,17 @@ impl GraphProposer {
         let mut tools_section = String::new();
         let defs = self.tools.defs();
         if defs.is_empty() {
-            tools_section.push_str("(no tools registered — the agent can only ask the user or propose patches)\n");
+            // Pure-orchestrator mode (the default in web/CLI
+            // paths): the main agent has NO direct tool
+            // access. Its only execution path is the `explore`
+            // step, which dispatches a subagent that DOES have
+            // tools. Tell the model this explicitly so it
+            // doesn't waste steps emitting `call_tool` (which
+            // would fail with "unknown tool").
+            tools_section.push_str(
+                "(no direct tools available to you — your only execution path is the `explore` step, \
+                 which dispatches a subagent that has the actual tools)\n",
+            );
         } else {
             for def in &defs {
                 tools_section.push_str(&format!(
@@ -934,6 +944,11 @@ RelationType: Contains | BelongsTo | Imports | Exports | DependsOn |
 ## Discipline
 
 - Output EXACTLY one JSON object. Nothing before, nothing after.
+- **Pure orchestrator rule.** You have NO direct tools. If you
+  emit `call_tool` it will fail with "unknown tool" — the
+  only way to do anything in the world is to emit
+  `explore` (dispatch a subagent that has the actual tools).
+  Read this as: you are a planner, subagents are your hands.
 - Be conservative. Ask the user when truly blocked — never fabricate edges.
   But respect the Intake rule (Mode A vs Mode B): if the task is vague,
   one targeted `ask_user` is much cheaper than guessing wrong. When
