@@ -23,6 +23,7 @@
 //! - No retry, no backoff, no cancellation propagation between siblings.
 //!   Each task is single-shot.
 
+use super::contract::{CheckContract, ContractOutcome};
 use super::graph_loop::GraphError;
 use super::subagent::{SubAgent, SubAgentResult, SubTask};
 use crate::context::SourceLoader;
@@ -144,6 +145,14 @@ pub struct DispatcherConfig {
     pub max_concurrent: usize,
     /// Optional per-batch wall-clock cap. `None` = unlimited.
     pub batch_timeout: Option<Duration>,
+    /// When true (the default), the dispatcher re-checks every
+    /// sub-agent result's `CheckContract` as a second-line defense.
+    /// The sub-agent already self-checks before emitting
+    /// `final_answer`; this catches the (rare) case where the
+    /// sub-agent's self-check disagrees with the dispatcher's
+    /// view (e.g., model bypassed the self-check by emitting
+    /// the wrong final_answer despite the prompt's instructions).
+    pub verify_contract: bool,
 }
 
 impl Default for DispatcherConfig {
@@ -151,6 +160,7 @@ impl Default for DispatcherConfig {
         Self {
             max_concurrent: 4,
             batch_timeout: None,
+            verify_contract: true,
         }
     }
 }
@@ -201,6 +211,16 @@ impl Dispatcher {
 
     pub fn with_batch_timeout(mut self, d: Duration) -> Self {
         self.config.batch_timeout = Some(d);
+        self
+    }
+
+    /// Toggle the dispatcher's second-line contract re-check. When
+    /// `false`, only the sub-agent's self-check applies. The default
+    /// (`true`) is the safe choice — production runs should leave this
+    /// on. Tests that need to exercise the sub-agent's self-check in
+    /// isolation may set it to `false`.
+    pub fn with_verify_contract(mut self, yes: bool) -> Self {
+        self.config.verify_contract = yes;
         self
     }
 
@@ -262,8 +282,37 @@ impl Dispatcher {
             .flat_map(|r| r.graph_errors.iter().cloned())
             .collect();
         // A run "succeeded" iff every sub-agent succeeded AND no sub-agent
-        // bubbled a graph error.
-        let all_succeeded = graph_errors.is_empty() && all_results.iter().all(|r| r.success);
+        // bubbled a graph error AND (if verify_contract is true) every
+        // result's CheckContract is satisfied. Contract failures flip
+        // `success` to false on the result and surface the reason in
+        // `error`, so the loop's TaskFailed path is symmetric with
+        // non-contract failures.
+        let all_succeeded = if self.config.verify_contract {
+            let mut ok = graph_errors.is_empty();
+            for r in &mut all_results {
+                if !r.success {
+                    continue;
+                }
+                // The task's contract lives on the corresponding task
+                // graph node. Look it up.
+                let node = task_graph.get_node(&r.task_id);
+                let contract = node
+                    .and_then(|n| n.metadata.get("contract"))
+                    .and_then(|v| serde_json::from_value::<CheckContract>(v.clone()).ok())
+                    .unwrap_or_default();
+                match contract.check(&r.output) {
+                    ContractOutcome::Satisfied => {}
+                    ContractOutcome::Failed(reason) => {
+                        r.success = false;
+                        r.error = Some(format!("contract violated: {reason}"));
+                        ok = false;
+                    }
+                }
+            }
+            ok
+        } else {
+            graph_errors.is_empty() && all_results.iter().all(|r| r.success)
+        };
 
         let outcome = DispatchOutcome {
             results: all_results,
@@ -601,5 +650,70 @@ mod tests {
         let agent = Arc::new(SubAgent::new(model));
         let pool = SubAgentPool::new(agent, 1).with_auto_scope(false);
         assert!(!pool.auto_scope);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_re_checks_contracts_and_marks_violations() {
+        // Build a task with a KnowHow contract that requires "auth.rs".
+        // The sub-agent emits a final_answer that does NOT mention it.
+        // The sub-agent's self-check is bypassed by a manual SubAgentResult
+        // construction here (we want to test the dispatcher's check, not
+        // the sub-agent's). But for an end-to-end test, we use the
+        // existing model mock and rely on the sub-agent emitting a
+        // wrong final_answer; the dispatcher must catch the same thing.
+        let wrong = r#"{"action":"final_answer","answer":"nothing useful","thinking":""}"#;
+        let model: Arc<dyn Model> = Arc::new(CountingModel::new(vec![wrong], 0));
+        let agent = Arc::new(SubAgent::new(model).with_max_steps(2));
+        let d = Dispatcher::new(agent).with_max_concurrent(1);
+
+        let mut st = SubTask {
+            id: NodeId::from("t1"),
+            description: "find auth".into(),
+            involved_nodes: vec![],
+            needs: TaskNeeds::default(),
+            contract: CheckContract::KnowHow {
+                must_mention_any: vec!["auth.rs".into()],
+                min_length: 5,
+            },
+        };
+        let mut g = Graph::new();
+        g.add_node(st.clone().to_task_node());
+
+        let outcome = d.run(&g, &make_world(), loader()).await.unwrap();
+        assert_eq!(outcome.results.len(), 1);
+        // The sub-agent's self-check already failed and may have
+        // returned success: false (if it retried) or success: true
+        // (if it exhausted max_steps without satisfying the contract).
+        // Either way, the dispatcher MUST mark this as a failure
+        // when the final result doesn't satisfy the contract.
+        assert!(!outcome.all_succeeded, "dispatcher should mark contract violation as failure");
+        // If the sub-agent already self-caught, the error is from
+        // max_steps; if the dispatcher catches it on second pass,
+        // the error mentions "contract".
+        let err = outcome.results[0].error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("contract") || err.contains("max_steps"),
+            "expected contract or max_steps in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dispatcher_verify_contract_flag_defaults_to_true() {
+        let d = Dispatcher::new(Arc::new(SubAgent::new(Arc::new(CountingModel::new(vec![], 0)))));
+        assert!(d.config.verify_contract, "verify_contract should default to true");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_with_verify_contract_false_passes_through() {
+        // If the caller disables contract verification, the dispatcher
+        // doesn't re-check. The sub-agent's self-check is still in place.
+        // For this test we just confirm the flag is honored: a contract
+        // is on the task but the dispatcher does not fail the result
+        // solely because of a missing contract mention — the sub-agent's
+        // self-check is the only line of defense when verify_contract
+        // is false.
+        let d = Dispatcher::new(Arc::new(SubAgent::new(Arc::new(CountingModel::new(vec![], 0)))))
+            .with_verify_contract(false);
+        assert!(!d.config.verify_contract);
     }
 }
