@@ -18,6 +18,7 @@
 //! The remaining pieces — `GraphProposer`, `Verifier`, `LocalRepairer`,
 //! `GraphLoop` — land alongside this as Phase 2 progresses.
 
+pub mod contract;
 pub mod conversation;
 pub mod decomposer;
 pub mod dispatcher;
@@ -31,6 +32,7 @@ pub mod subagent;
 pub mod validator;
 pub mod verifier;
 
+pub use contract::{CheckContract, ContractOutcome};
 pub use conversation::Conversation;
 pub use decomposer::Decomposer;
 pub use dispatcher::{DispatchOutcome, Dispatcher, DispatcherConfig, SubAgentPool};
