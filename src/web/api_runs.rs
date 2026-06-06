@@ -240,7 +240,31 @@ async fn drive_run(
     let deep_model = cfg.deep_model();
 
     // Tools.
-    let tool_registry = Arc::new({
+    //
+    // Pure-orchestrator wiring (per ARCHITECTURE §1a, the
+    // main agent is a planner, subagents are its hands):
+    //
+    //   - `main_tool_registry` is what the main agent sees
+    //     in its system prompt and what its `call_tool`
+    //     would invoke. We make it empty so the model can
+    //     only emit `explore` / `propose_patch` / `ask_user` /
+    //     `block` / `ready_for_verify` — not `call_tool`
+    //     (which would fail with "unknown tool" and waste a
+    //     round). The system prompt's
+    //     "(no direct tools available to you ...)"
+    //     message tells the model this.
+    //
+    //   - `subagent_tool_registry` is what every explore
+    //     subagent gets. It HAS bash / web_search / web_fetch
+    //     because the subagent's job is to actually run
+    //     commands and read files.
+    //
+    // The previous wiring used a single shared registry —
+    // which is why the main agent could call bash directly
+    // and got stuck in `ls` loops. Splitting the registries
+    // is the root fix.
+    let main_tool_registry = Arc::new(ToolRegistry::new());
+    let subagent_tool_registry = Arc::new({
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(BashTool::new()));
         reg.register(Arc::new(WebSearchTool::new()));
@@ -251,10 +275,14 @@ async fn drive_run(
     // also keeps a copy. We don't actually need to call it from here.
     let _tool_ctx = ToolContext::new(state.config.project_root.clone());
 
-    // Proposer (with skills).
+    // Proposer (with skills). Note: the proposer advertises
+    // its `tools` in the system prompt. We pass the EMPTY
+    // `main_tool_registry` so the prompt says "no direct
+    // tools — your only execution path is `explore`" and
+    // the model emits Explore steps instead of bash loops.
     let proposer = GraphProposer::new(
         fast_model.clone(),
-        tool_registry.clone(),
+        main_tool_registry.clone(),
         Some(state.skills.clone()),
     );
 
@@ -266,16 +294,24 @@ async fn drive_run(
     let repairer = LocalRepairer::new(deep_model.clone()).with_l1_enricher(enricher.clone());
 
     // Phase 3 — Decomposer + Dispatcher + SubAgent.
+    //
+    // SubAgent (used by the dispatcher in Task phase) gets
+    // the FULL tool registry — it actually executes the
+    // sub-tasks. The main agent gets the empty one (see
+    // `main_tool_registry` above).
     let decomposer = Decomposer::new(deep_model.clone());
     let subagent = Arc::new(
         SubAgent::new(fast_model.clone())
-            .with_tools(tool_registry.clone())
+            .with_tools(subagent_tool_registry.clone())
             .with_policy(Arc::new(DangerousCommandDeny::new()))
             .with_tool_cwd(state.config.project_root.clone())
             .with_tool_output_cap(6_000)
             .with_max_steps(6),
     );
-    let dispatcher = Dispatcher::new(subagent).with_max_concurrent(3);
+    // 2 subagents in parallel = 1 main + 2 subagents total
+    // (per [[project-concurrency-limits]]). Main runs single-threaded
+    // as the orchestrator; the pool below caps subagent fan-out.
+    let dispatcher = Dispatcher::new(subagent).with_max_concurrent(2);
 
     // Phase 4 — Reviewer + PostExecutionValidator.
     let reviewer = Reviewer::with_model(deep_model.clone());
@@ -283,7 +319,13 @@ async fn drive_run(
         Arc::new(BashCheckValidator::cargo_check_for(&state.config.project_root));
 
     let loop_cfg = GraphLoopConfig {
-        max_rounds: 50,
+        // Per [[project-concurrency-limits]] the main agent and each
+        // sub-agent get a 180-turn budget (no internal cap below that
+        // — it's a ceiling, not a target). The total concurrent runs
+        // cap is 3 across main + subagents; with the main loop running
+        // single-threaded, that means the dispatcher pool below is
+        // sized to 2.
+        max_rounds: 180,
         max_repair_rounds: 3,
         tool_cwd: state.config.project_root.clone(),
         tool_output_cap: 8_000,
@@ -295,10 +337,18 @@ async fn drive_run(
         proposer.clone(),
         verifier,
         Some(repairer),
-        tool_registry.clone(),
+        // Main agent's toolset: empty. Its only execution
+        // path is `explore`, which dispatches subagents
+        // (with the subagent_tool_registry below).
+        main_tool_registry.clone(),
         loop_cfg,
     )
     .with_l1_enricher(enricher)
+    // Override subagent toolset to give subagents the full
+    // bash / web_search / web_fetch. Without this, the
+    // graph-phase Explore subagent would inherit the
+    // empty main registry and have no way to read files.
+    .with_subagent_tools(subagent_tool_registry.clone())
     .with_decomposer(decomposer)
     .with_dispatcher(dispatcher)
     .with_subagent_loader(loader)

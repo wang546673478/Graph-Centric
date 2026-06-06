@@ -156,7 +156,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .with_tool_output_cap(6_000)
             .with_max_steps(6),
     );
-    let dispatcher = Dispatcher::new(subagent).with_max_concurrent(3);
+    // 2 subagents in parallel = 1 main + 2 subagents total
+    // (per [[project-concurrency-limits]]). Main runs single-threaded
+    // as the orchestrator; the pool below caps subagent fan-out.
+    let dispatcher = Dispatcher::new(subagent).with_max_concurrent(2);
 
     // Phase 4 — Reviewer: deterministic backstops (graph consistency +
     // sub-agent success + last_verification) plus LLM-as-judge that flags
@@ -184,7 +187,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let auto_repairer = repairer.clone();
 
     let loop_cfg = GraphLoopConfig {
-        max_rounds: 50,
+        // Per [[project-concurrency-limits]] the main agent and each
+        // sub-agent get a 180-turn budget (no internal cap below that
+        // — it's a ceiling, not a target). The total concurrent runs
+        // cap is 3 across main + subagents; with the main loop running
+        // single-threaded, that means the dispatcher pool below is
+        // sized to 2.
+        max_rounds: 180,
         max_repair_rounds: 3,
         tool_cwd: cwd.clone(),
         tool_output_cap: 8_000,
