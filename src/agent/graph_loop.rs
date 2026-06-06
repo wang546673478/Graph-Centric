@@ -1359,23 +1359,36 @@ impl GraphLoop {
         let tasks: Vec<SubTask> = items
             .iter()
             .enumerate()
-            .map(|(i, item)| SubTask {
-                id: NodeId::from(format!(
-                    "explore-r{}-i{}-pid{}",
-                    self.round,
-                    i,
-                    std::process::id()
-                )),
-                description: format!(
-                    "Explore scope: {}\nQuestion: {}\n\n\
-                     Read the relevant files (use `cat`, `head`, or `grep` via \
-                     bash) and produce a concise summary that directly \
-                     answers the question. Cite file paths you read.",
-                    item.scope, item.question
-                ),
-                involved_nodes: Vec::new(),
-                needs: Default::default(),
-                contract: CheckContract::default(),
+            .map(|(i, item)| {
+                // Exploratory contract: the sub-agent must mention the
+                // scope (to prove it actually looked there) and report
+                // at most 5 items per step (to bound per-subagent
+                // output size). Region is empty here because Explore
+                // items don't pin to a fixed set of nodes — the scope
+                // string is the addressing scheme.
+                let contract = CheckContract::Exploratory {
+                    region: Vec::new(),
+                    max_items: 5,
+                    must_mention_any: vec![item.scope.clone()],
+                };
+                SubTask {
+                    id: NodeId::from(format!(
+                        "explore-r{}-i{}-pid{}",
+                        self.round,
+                        i,
+                        std::process::id()
+                    )),
+                    description: format!(
+                        "Explore scope: {}\nQuestion: {}\n\n\
+                         Read the relevant files (use `cat`, `head`, or `grep` via \
+                         bash) and produce a concise summary that directly \
+                         answers the question. Cite file paths you read.",
+                        item.scope, item.question
+                    ),
+                    involved_nodes: Vec::new(),
+                    needs: Default::default(),
+                    contract,
+                }
             })
             .collect();
 
