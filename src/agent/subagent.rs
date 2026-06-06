@@ -37,6 +37,7 @@
 //!   on Message) — for now the JSON-action protocol is portable across
 //!   any model that follows instructions.
 
+use super::contract::CheckContract;
 use super::graph_loop::{GraphError, L0ErrorType};
 use super::proposer::extract_json_block;
 use crate::context::{ContextBuilder, SourceLoader};
@@ -67,6 +68,12 @@ pub struct SubTask {
     pub involved_nodes: Vec<NodeId>,
     #[serde(default)]
     pub needs: TaskNeeds,
+    /// Pre-dispatch verification predicate. Checked by the sub-agent
+    /// before emitting `final_answer`, and re-checked by the dispatcher.
+    /// Defaults to `CheckContract::None` — preserves the legacy behavior
+    /// of taking the sub-agent's output at face value.
+    #[serde(default)]
+    pub contract: CheckContract,
 }
 
 impl SubTask {
@@ -86,11 +93,17 @@ impl SubTask {
             .get("needs")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        let contract: CheckContract = node
+            .metadata
+            .get("contract")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
         Ok(Self {
             id: node.id.clone(),
             description: node.summary.clone(),
             involved_nodes,
             needs,
+            contract,
         })
     }
 
@@ -102,6 +115,15 @@ impl SubTask {
             "needs",
             serde_json::to_value(&self.needs).unwrap_or(serde_json::json!({})),
         );
+        // Serialize the contract only when non-trivial; `None` is the
+        // default and produces no metadata entry. This keeps the wire
+        // format compact for the common case.
+        if !matches!(self.contract, CheckContract::None) {
+            node = node.with_metadata(
+                "contract",
+                serde_json::to_value(&self.contract).unwrap_or(serde_json::json!(null)),
+            );
+        }
         node
     }
 }
@@ -819,6 +841,7 @@ mod tests {
             description: "Analyze module A and report on its role".into(),
             involved_nodes: vec![NodeId::from("a")],
             needs: TaskNeeds::read_only(),
+            contract: CheckContract::default(),
         }
     }
 
@@ -831,6 +854,51 @@ mod tests {
         assert_eq!(st2.description, st.description);
         assert_eq!(st2.involved_nodes, st.involved_nodes);
         assert_eq!(st2.needs.can_read, st.needs.can_read);
+    }
+
+    #[test]
+    fn subtask_round_trips_with_contract() {
+        // A SubTask with a KnowHow contract must survive
+        // `to_task_node` → `from_task_node` round-trip with the
+        // contract intact. This is how the dispatcher sees contracts
+        // for tasks it didn't construct itself.
+        let st = SubTask {
+            id: NodeId::from("t1"),
+            description: "analyze module A".into(),
+            involved_nodes: vec![NodeId::from("a")],
+            needs: TaskNeeds::read_only(),
+            contract: CheckContract::KnowHow {
+                must_mention_any: vec!["module A".into()],
+                min_length: 20,
+            },
+        };
+        let node = st.to_task_node();
+        let st2 = SubTask::from_task_node(&node).unwrap();
+        match &st2.contract {
+            CheckContract::KnowHow { must_mention_any, min_length } => {
+                assert_eq!(must_mention_any, &vec!["module A".to_string()]);
+                assert_eq!(*min_length, 20);
+            }
+            other => panic!("expected KnowHow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtask_contract_defaults_to_none() {
+        // A freshly-constructed SubTask with no contract field set
+        // must default to CheckContract::None. The task graph nodes
+        // the decomposer emits today don't have a `contract` metadata
+        // key, so from_task_node has to handle the absence gracefully.
+        let st = SubTask {
+            id: NodeId::from("t1"),
+            description: "x".into(),
+            involved_nodes: vec![],
+            needs: TaskNeeds::default(),
+            contract: CheckContract::default(),
+        };
+        let node = st.to_task_node();
+        let st2 = SubTask::from_task_node(&node).unwrap();
+        assert!(matches!(st2.contract, CheckContract::None));
     }
 
     #[test]

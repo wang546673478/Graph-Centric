@@ -1329,6 +1329,7 @@ impl GraphLoop {
         &mut self,
         items: Vec<ExploreItem>,
     ) -> Result<LoopState> {
+        use super::contract::CheckContract;
         use super::subagent::{SubAgent, SubAgentResult, SubTask};
         use crate::context::FilesystemSources;
         use std::time::Instant;
@@ -1374,6 +1375,7 @@ impl GraphLoop {
                 ),
                 involved_nodes: Vec::new(),
                 needs: Default::default(),
+                contract: CheckContract::default(),
             })
             .collect();
 

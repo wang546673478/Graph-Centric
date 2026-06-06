@@ -42,6 +42,7 @@
 //! - No cycles in the resulting task DAG (caught later by `DagScheduler`,
 //!   but we also check here to fail fast with a clearer error).
 
+use super::contract::CheckContract;
 use super::proposer::extract_json_block;
 use super::subagent::SubTask;
 use super::Conversation;
@@ -276,6 +277,7 @@ fn build_task_graph(parsed: Vec<ParsedTask>, world_graph: &Graph) -> Result<Grap
             description: t.description.clone(),
             involved_nodes: t.involved_nodes.clone(),
             needs: t.needs.clone(),
+            contract: CheckContract::default(),
         };
         g.add_node(st.to_task_node());
     }

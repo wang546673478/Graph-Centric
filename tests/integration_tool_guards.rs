@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
+use graph_harness::agent::contract::CheckContract;
 use graph_harness::agent::subagent::{SubAgent, SubTask};
 use graph_harness::context::{InMemorySources, SourceLoader};
 use graph_harness::error::HarnessError;
@@ -73,6 +74,7 @@ fn task(involved: Vec<&str>) -> SubTask {
         description: "Test task".into(),
         involved_nodes: involved.into_iter().map(NodeId::from).collect(),
         needs: Default::default(),
+        contract: CheckContract::default(),
     }
 }
 
