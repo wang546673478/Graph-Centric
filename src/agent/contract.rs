@@ -82,7 +82,7 @@ impl CheckContract {
             CheckContract::KnowHow { must_mention_any, min_length } => {
                 if output.len() < *min_length {
                     return ContractOutcome::Failed(format!(
-                        "KnowHow: output length {} < min_length {}",
+                        "output length {} < min_length {}",
                         output.len(),
                         min_length
                     ));
@@ -92,7 +92,7 @@ impl CheckContract {
                 match hit {
                     Some(_) => ContractOutcome::Satisfied,
                     None => ContractOutcome::Failed(format!(
-                        "KnowHow: output doesn't mention any of {:?}",
+                        "output doesn't mention any of {:?}",
                         must_mention_any
                     )),
                 }
@@ -101,7 +101,7 @@ impl CheckContract {
                 let items = count_graph_items(output);
                 if items > *max_items {
                     return ContractOutcome::Failed(format!(
-                        "Exploratory: reported {} items > max_items {}",
+                        "reported {} items > max_items {}",
                         items, max_items
                     ));
                 }
@@ -110,7 +110,7 @@ impl CheckContract {
                 match hit {
                     Some(_) => ContractOutcome::Satisfied,
                     None => ContractOutcome::Failed(format!(
-                        "Exploratory: output doesn't mention any of {:?}",
+                        "output doesn't mention any of {:?}",
                         must_mention_any
                     )),
                 }
