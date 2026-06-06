@@ -389,7 +389,18 @@ pub struct GraphLoop {
     /// + optional LLM-as-judge before declaring Done. Without it the
     /// stub Review fires (immediate Done after Task phase).
     pub reviewer: Option<Reviewer>,
+    /// Tools available to the **main agent**. In pure-orchestrator
+    /// mode this is empty (no bash) — the main agent's only
+    /// execution path is `explore`, which dispatches a subagent
+    /// with the `subagent_tools` registry below.
     pub tools: Arc<ToolRegistry>,
+    /// Tools available to subagents dispatched via the `explore`
+    /// step. Defaults to `tools.clone()` so single-registry
+    /// callers (e.g. CLI binary, tests) keep working unchanged.
+    /// Production web/CLI paths override via
+    /// `with_subagent_tools(...)` so the main agent has no
+    /// bash but subagents do.
+    pub subagent_tools: Arc<ToolRegistry>,
     pub config: GraphLoopConfig,
 
     pub task: String,
@@ -468,7 +479,12 @@ impl GraphLoop {
             subagent_loader: None,
             validator: None,
             reviewer: None,
-            tools,
+            tools: tools.clone(),
+            // Default: subagent gets the same toolset as the
+            // main agent. Production web/CLI paths override
+            // with `with_subagent_tools(...)` so the main
+            // agent has no bash but subagents do.
+            subagent_tools: tools,
             config,
             task,
             conversation,
@@ -1347,12 +1363,11 @@ impl GraphLoop {
         // graph-phase tool policy: DangerousCommandDeny by
         // default), and capped at 6 tool calls.
         let subagent = SubAgent::new(self.proposer.model.clone())
-            .with_tools(self.tools.clone())
+            .with_tools(self.subagent_tools.clone())
             .with_policy(self.config.tool_policy.clone())
             .with_tool_cwd(self.config.tool_cwd.clone())
             .with_tool_output_cap(self.config.tool_output_cap)
             .with_max_steps(6);
-        let loader = FilesystemSources::new(&self.config.tool_cwd);
 
         // Build one SubTask per item. Unique IDs so repeated
         // Explore dispatches in the same run don't collide.
@@ -1411,6 +1426,7 @@ impl GraphLoop {
                 subagent.execute(&task, &graph, &loader).await
             });
         }
+
         let mut results: Vec<std::result::Result<SubAgentResult, crate::error::HarnessError>> =
             Vec::with_capacity(tasks.len());
         while let Some(res) = joinset.join_next().await {
@@ -1604,6 +1620,18 @@ impl GraphLoop {
         }
     }
 
+    /// Override the subagent tool registry. Used by the
+    /// web/CLI path to give subagents a full toolset (with
+    /// bash) while leaving the main agent's `tools` empty
+    /// (no direct execution — pure orchestrator mode). The
+    /// CLI binary and tests don't call this; they get the
+    /// same registry for both, preserving the legacy
+    /// behavior.
+    pub fn with_subagent_tools(mut self, tools: Arc<ToolRegistry>) -> Self {
+        self.subagent_tools = tools;
+        self
+    }
+
     /// Drive the L1Enricher across `ids` if one is configured. Errors are
     /// logged but never bubble up — L1 enrichment is best-effort linkage,
     /// not a correctness gate (the Verifier's L1 sampling layer is the
@@ -1733,6 +1761,7 @@ fn render_step_as_json(step: &ProposerStep) -> String {
 mod tests {
     use super::*;
     use crate::agent::verifier::{IssueSource, Severity};
+    use crate::tools::BashTool;
 
     #[test]
     fn hash_string_is_stable() {
@@ -1922,6 +1951,56 @@ mod tests {
         assert_eq!(msgs[0].role, Role::User);
         assert!(msgs[0].content.contains("first turn said hi"));
         assert!(msgs.last().unwrap().content.contains("next turn task"));
+    }
+
+    #[test]
+    fn main_agent_has_no_direct_tools_under_pure_orchestrator() {
+        // Regression guard: the main agent's `tools` field is the
+        // empty registry in production wiring (api_runs.rs). If a
+        // future change accidentally re-populates it with bash,
+        // the system prompt would advertise bash and the
+        // call_tool step would succeed — defeating the
+        // pure-orchestrator design and bringing the bash-loop
+        // failure mode back.
+        let bash_only = Arc::new({
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(BashTool::new()));
+            reg
+        });
+        let empty = Arc::new(ToolRegistry::new());
+
+        // `with_subagent_tools` is the production wiring shape:
+        // main = empty, subagent = full. `tools` and
+        // `subagent_tools` MUST differ.
+        let mut gl = build_loop_with(vec![r#"{"step":"ready_for_verify","rationale":"x"}"#]);
+        gl = gl.with_subagent_tools(bash_only.clone());
+        assert_eq!(gl.tools.defs().len(), 0, "main agent must have no direct tools");
+        assert_eq!(
+            gl.subagent_tools.defs().len(),
+            1,
+            "subagent toolset must include bash"
+        );
+
+        // Default (no with_subagent_tools) keeps the legacy
+        // behavior — both main and subagent share whatever the
+        // caller passed. This is the path the CLI binary and
+        // unit tests use.
+        let gl_default = build_loop_with(vec![r#"{"step":"ready_for_verify","rationale":"x"}"#]);
+        assert_eq!(gl_default.tools.defs().len(), 0); // build_loop_with uses empty
+        assert_eq!(gl_default.subagent_tools.defs().len(), 0);
+        assert!(Arc::ptr_eq(&gl_default.tools, &gl_default.subagent_tools));
+
+        // The system prompt's "Available tools" message tells the
+        // model it has no direct tools and to use `explore`.
+        let p = gl.proposer.build_system_prompt("any task");
+        assert!(
+            p.contains("your only execution path is the `explore` step"),
+            "system prompt must explicitly teach the pure-orchestrator rule"
+        );
+        assert!(
+            p.contains("`call_tool` it will fail"),
+            "system prompt must warn that call_tool is no longer available"
+        );
     }
 
     #[tokio::test]
