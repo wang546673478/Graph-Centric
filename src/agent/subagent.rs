@@ -37,7 +37,7 @@
 //!   on Message) — for now the JSON-action protocol is portable across
 //!   any model that follows instructions.
 
-use super::contract::CheckContract;
+use super::contract::{CheckContract, ContractOutcome};
 use super::graph_loop::{GraphError, L0ErrorType};
 use super::proposer::extract_json_block;
 use crate::context::{ContextBuilder, SourceLoader};
@@ -366,6 +366,29 @@ impl SubAgent {
 
             match parse_action(&resp.content) {
                 Action::FinalAnswer { answer, .. } => {
+                    let outcome = task.contract.check(&answer);
+                    if !outcome.is_satisfied() {
+                        // Contract failed. Feed the failure back as a user
+                        // message so the model can retry. This counts as a
+                        // step but does NOT increment tool_calls_made.
+                        let reason = match outcome {
+                            ContractOutcome::Failed(s) => s,
+                            ContractOutcome::Satisfied => unreachable!(),
+                        };
+                        warn!(
+                            task_id = %task.id,
+                            step,
+                            "sub-agent: contract check failed; feeding back for retry"
+                        );
+                        messages.push(Message::user(format!(
+                            "Your final_answer did not satisfy the dispatch contract:\n\
+                             {reason}\n\n\
+                             Either revise the answer (emit another `final_answer`) or, if the \
+                             contract is genuinely impossible, emit `report_graph_error` \
+                             explaining why."
+                        )));
+                        continue;
+                    }
                     let duration_ms = started.elapsed().as_millis() as u64;
                     info!(
                         task_id = %task.id,
@@ -373,7 +396,7 @@ impl SubAgent {
                         tool_calls_made,
                         tokens_used,
                         duration_ms,
-                        "sub-agent emitted final_answer"
+                        "sub-agent emitted final_answer (contract satisfied)"
                     );
                     return Ok(SubAgentResult {
                         task_id: task.id.clone(),
@@ -1273,5 +1296,64 @@ mod tests {
         let guard = ScopeGuard::new(Vec::new()); // inactive
         let prompt = build_initial_user_prompt(&task, "ctx", Some(&guard));
         assert!(!prompt.contains("## Write scope"));
+    }
+
+    #[tokio::test]
+    async fn contract_failure_feeds_message_back_to_model_for_retry() {
+        // SubTask carries a KnowHow contract that requires mentioning
+        // "auth.rs". The sub-agent's first final_answer doesn't mention
+        // it; the sub-agent should feed the failure back and let the
+        // model retry. The second final_answer mentions it; success.
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(BashTool::new()));
+        let tools = Arc::new(reg);
+
+        let first_wrong = r#"{"action":"final_answer","answer":"looked around, nothing relevant","thinking":"x"}"#;
+        let second_right = r#"{"action":"final_answer","answer":"found auth.rs handles the auth path","thinking":"got it"}"#;
+        let model: Arc<dyn Model> = Arc::new(MockModel::new(vec![first_wrong, second_right]));
+        let agent = SubAgent::new(model).with_tools(tools).with_max_steps(5);
+
+        let mut st = sample_subtask();
+        st.contract = CheckContract::KnowHow {
+            must_mention_any: vec!["auth.rs".into()],
+            min_length: 5,
+        };
+        let result = agent
+            .execute(&st, &world_with_three_nodes(), empty_loader().as_ref())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("auth.rs"));
+        // 2 model calls: one for the failed first attempt, one for the retry.
+        assert_eq!(result.tool_calls_made, 0);
+        assert!(result.tokens_used >= 300);
+    }
+
+    #[tokio::test]
+    async fn contract_failure_at_max_steps_marks_result_as_failure() {
+        // Sub-agent keeps emitting final_answers that fail the contract;
+        // eventually max_steps is reached and the result is
+        // `success: false` with a contract-violation error string.
+        let first_wrong = r#"{"action":"final_answer","answer":"no idea","thinking":""}"#;
+        let second_wrong = r#"{"action":"final_answer","answer":"still nothing","thinking":""}"#;
+        let model: Arc<dyn Model> =
+            Arc::new(MockModel::new(vec![first_wrong, second_wrong]));
+        let agent = SubAgent::new(model).with_max_steps(2);
+
+        let mut st = sample_subtask();
+        st.contract = CheckContract::KnowHow {
+            must_mention_any: vec!["auth.rs".into()],
+            min_length: 5,
+        };
+        let result = agent
+            .execute(&st, &world_with_three_nodes(), empty_loader().as_ref())
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.expect("error string set");
+        assert!(
+            err.contains("contract") || err.contains("max_steps"),
+            "expected contract or max_steps error, got: {err}"
+        );
     }
 }
