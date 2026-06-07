@@ -1359,15 +1359,14 @@ impl GraphLoop {
 
         // One shared subagent config — `SubAgent::execute` is
         // `&self`, so we can reuse one instance for the
-        // whole batch. Each subagent is read-only (the
-        // graph-phase tool policy: DangerousCommandDeny by
-        // default), and capped at 6 tool calls.
+        // whole batch. No step cap (per user override 2026-06-06):
+        // the subagent reads as long as it needs to.
         let subagent = SubAgent::new(self.proposer.model.clone())
             .with_tools(self.subagent_tools.clone())
             .with_policy(self.config.tool_policy.clone())
             .with_tool_cwd(self.config.tool_cwd.clone())
             .with_tool_output_cap(self.config.tool_output_cap)
-            .with_max_steps(6);
+            .with_max_steps(usize::MAX);
 
         // Build one SubTask per item. Unique IDs so repeated
         // Explore dispatches in the same run don't collide.

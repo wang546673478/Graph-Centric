@@ -306,7 +306,7 @@ async fn drive_run(
             .with_policy(Arc::new(DangerousCommandDeny::new()))
             .with_tool_cwd(state.config.project_root.clone())
             .with_tool_output_cap(6_000)
-            .with_max_steps(6),
+            .with_max_steps(usize::MAX),
     );
     // 2 subagents in parallel = 1 main + 2 subagents total
     // (per [[project-concurrency-limits]]). Main runs single-threaded
@@ -319,13 +319,10 @@ async fn drive_run(
         Arc::new(BashCheckValidator::cargo_check_for(&state.config.project_root));
 
     let loop_cfg = GraphLoopConfig {
-        // Per [[project-concurrency-limits]] the main agent and each
-        // sub-agent get a 180-turn budget (no internal cap below that
-        // — it's a ceiling, not a target). The total concurrent runs
-        // cap is 3 across main + subagents; with the main loop running
-        // single-threaded, that means the dispatcher pool below is
-        // sized to 2.
-        max_rounds: 180,
+        // No hard cap on main-agent rounds or sub-agent steps — let
+        // them run until they converge. 1 main + 2 subagents concurrent
+        // is still enforced by the dispatcher pool below.
+        max_rounds: usize::MAX,
         max_repair_rounds: 3,
         tool_cwd: state.config.project_root.clone(),
         tool_output_cap: 8_000,

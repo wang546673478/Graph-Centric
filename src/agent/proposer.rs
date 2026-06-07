@@ -49,6 +49,22 @@ pub struct ExploreItem {
     pub question: String,
 }
 
+/// Hard cap on the number of items in a single `Explore` step.
+/// Above this, the model's emitted JSON gets long enough that it
+/// loses well-formedness (quote-escape errors mid-string). The
+/// `parse_step` error message tells the model to split into two
+/// `Explore` steps with fewer items each.
+const MAX_EXPLORE_ITEMS_PER_STEP: usize = 4;
+
+/// Hard cap on per-item question length. Generous enough for
+/// structured questions with sub-bullets (which the model
+/// naturally writes at 1500-2000 chars for "compare two systems"
+/// prompts); still small enough to keep the whole step's JSON
+/// well-formed. Exceeding this triggers a `parse_step` error
+/// that names the cap and tells the model to split into
+/// multiple focused items.
+const MAX_EXPLORE_QUESTION_CHARS: usize = 2000;
+
 #[derive(Debug, Clone)]
 pub enum ProposerStep {
     AskUser {
@@ -321,21 +337,39 @@ impl GraphProposer {
                      user just asked a question or a greeting, an `ask_user` step with \
                      the answer in `question` is appropriate. If no graph change is \
                      needed, `propose_patch` with no add/remove and a `rationale` that \
-                     answers the user is also acceptable."
+                     answers the user is also acceptable.\n\n\
+                     If the error mentioned a `cap is N` (question length or items count), \
+                     DO NOT re-emit the same payload — split it. For a long question, \
+                     break it into 2-3 `Explore` items each with a focused sub-question \
+                     (<=2000 chars). For too many items, split the batch into two `Explore` \
+                     steps across rounds."
                 ),
             });
             return match self.next_step(&patched_conv, graph).await {
                 Ok((step, tokens)) => Ok((step, total_tokens + tokens)),
-                Err(_) => Err(parse_err),
+                Err(retry_err) => {
+                    // The retry didn't converge. Surface the LATEST
+                    // error (not the first one) so the human can see
+                    // what the second attempt actually produced. The
+                    // original `parse_err` is included in the message
+                    // for context.
+                    Err(HarnessError::model(format!(
+                        "fix-it retry did not converge. First error: {parse_err}. \
+                         Retry error: {retry_err}"
+                    )))
+                }
             };
         }
 
-        // Layer 2: intake gate. On a vague task, the first step must
-        // be `ask_user` per ARCHITECTURE §1a (Mode B). The system
-        // prompt teaches this rule but prompt-only is not load-bearing
-        // — a vague task can still produce a `propose_patch` from the
-        // model. When that happens, retry once with an explicit hint
-        // forcing `ask_user`.
+        // Intake gate (softened 2026-06-06): the system prompt still
+        // teaches the Mode A / Mode B rule, but the runtime no longer
+        // blocks when the model returns `explore` (or anything other
+        // than `ask_user`) on a vague task. We log the violation for
+        // visibility, then let the step through — refusing to make
+        // progress because the model didn't ask a question was worse
+        // than letting it read first and decide. A "propose_patch on
+        // a vague task" is still surfaced through this log line; the
+        // human can intervene in chat.
         if let Err(intake_err) = crate::agent::intake::check_intake_compliance(
             &conv.task_description,
             conv.round,
@@ -343,34 +377,8 @@ impl GraphProposer {
         ) {
             warn!(
                 error = %intake_err,
-                "proposer first step violated intake rule on a vague task; retrying with ask_user hint"
+                "intake: vague task first step was not ask_user; allowing it through"
             );
-            let mut patched_conv = conv.clone();
-            patched_conv.messages.push(crate::model::Message {
-                role: Role::User,
-                content: format!(
-                    "{intake_err}\n\nYour previous step was wrong: for a vague task, your \
-                     FIRST step must be `ask_user` with ONE specific clarifying question \
-                     (a concrete yes/no or a short multiple-choice). Do not draw any \
-                     graph nodes until the user has answered. Re-emit the JSON step now."
-                ),
-            });
-            return match self.next_step(&patched_conv, graph).await {
-                Ok((step, tokens)) => {
-                    // We tried. If the second attempt still violates
-                    // the gate, accept it anyway — refusing to make
-                    // progress forever is worse than letting the model
-                    // proceed (the human can see the ask_user
-                    // violation in the chat and intervene).
-                    let _ = crate::agent::intake::check_intake_compliance(
-                        &conv.task_description,
-                        conv.round,
-                        &step,
-                    );
-                    Ok((step, total_tokens + tokens))
-                }
-                Err(e) => Err(e),
-            };
         }
 
         Ok((step, total_tokens))
@@ -618,6 +626,20 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
             let items: Vec<ExploreItem> = if let Some(arr) =
                 value.get("items").and_then(|v| v.as_array())
             {
+                // Hard cap on items per step. Above this the JSON gets
+                // too long for the model to keep well-formed (we hit
+                // `invalid JSON: expected ',' or '}' at line N col M`
+                // on a 6-item step in production 2026-06-06). The
+                // fix-it retry path surfaces this back to the model,
+                // which splits into two `Explore` steps.
+                if arr.len() > MAX_EXPLORE_ITEMS_PER_STEP {
+                    return Err(HarnessError::model(format!(
+                        "proposer: explore items[] has {} entries; the cap is \
+                         {}. Split into two `Explore` steps with fewer items each.",
+                        arr.len(),
+                        MAX_EXPLORE_ITEMS_PER_STEP
+                    )));
+                }
                 let mut out = Vec::with_capacity(arr.len());
                 for (i, item) in arr.iter().enumerate() {
                     let scope = item
@@ -633,6 +655,20 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                     if scope.is_empty() || question.is_empty() {
                         return Err(HarnessError::model(format!(
                             "proposer: explore items[{i}] has empty scope or question"
+                        )));
+                    }
+                    // Hard cap on per-item question length. Long
+                    // questions (1k+ chars) are where the model loses
+                    // JSON well-formedness — quote escaping, line
+                    // continuation, etc. Split into multiple focused
+                    // items instead.
+                    if question.len() > MAX_EXPLORE_QUESTION_CHARS {
+                        return Err(HarnessError::model(format!(
+                            "proposer: explore items[{i}] question is {} chars; \
+                             cap is {}. Split the question into multiple \
+                             `Explore` items, each with a focused question.",
+                            question.len(),
+                            MAX_EXPLORE_QUESTION_CHARS
                         )));
                     }
                     out.push(ExploreItem { scope, question });
@@ -925,10 +961,24 @@ no markdown code fences, nothing else:
    (e.g. "what's the orchestrator?" + "what's the web entrypoint?").
    Keep items in SEPARATE `Explore` steps when the second
    depends on the first's findings.
+
+   Sizing rules (the runtime enforces them and will reject your
+   step if you violate them — see MAX_EXPLORE_ITEMS_PER_STEP /
+   MAX_EXPLORE_QUESTION_CHARS):
+   - At most 4 items per `Explore` step. If you have more
+     disjoint scopes to investigate, split into two `Explore`
+     steps. The items in one step run in parallel; two steps
+     run sequentially, which is fine for back-to-back reads.
+   - Each `question` is at most 2000 characters. If your
+     question would be longer, split it into multiple
+     `Explore` items with focused sub-questions (one per
+     scope or angle). A focused question a subagent can
+     resolve in 3-6 tool calls is the right size.
+
    {"step":"explore",
     "items":[
       {"scope":"<directory / pattern / node-id list>",
-       "question":"<specific question for this subagent>"}
+       "question":"<specific question for this subagent, <=2000 chars>"}
     ],
     "rationale":"<why subagent(s) is the right tool here>"}
 
