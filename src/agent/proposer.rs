@@ -50,11 +50,16 @@ pub struct ExploreItem {
 }
 
 /// Hard cap on the number of items in a single `Explore` step.
-/// Above this, the model's emitted JSON gets long enough that it
-/// loses well-formedness (quote-escape errors mid-string). The
-/// `parse_step` error message tells the model to split into two
-/// `Explore` steps with fewer items each.
-const MAX_EXPLORE_ITEMS_PER_STEP: usize = 4;
+/// At 1 (per user override 2026-06-08), each Explore step dispatches
+/// exactly one subagent — forcing the main agent to do hierarchical
+/// decomposition (scan → list → read) instead of front-loading
+/// everything into one subagent. Without this, the model packs
+/// "list the whole repo + read every key file" into a single item,
+/// the subagent runs 17+ steps and dumps 800k+ tokens back into
+/// the main conversation, eventually blowing past the LLM's
+/// instruction-following range and triggering "no '{' in response"
+/// death.
+const MAX_EXPLORE_ITEMS_PER_STEP: usize = 1;
 
 /// Hard cap on per-item question length. Generous enough for
 /// structured questions with sub-bullets (which the model
@@ -965,22 +970,28 @@ no markdown code fences, nothing else:
    Sizing rules (the runtime enforces them and will reject your
    step if you violate them — see MAX_EXPLORE_ITEMS_PER_STEP /
    MAX_EXPLORE_QUESTION_CHARS):
-   - At most 4 items per `Explore` step. If you have more
-     disjoint scopes to investigate, split into two `Explore`
-     steps. The items in one step run in parallel; two steps
-     run sequentially, which is fine for back-to-back reads.
+   - **Exactly 1 item per `Explore` step.** No parallelism across
+     items. Dispatching multiple subagents in a single step
+     front-loads work, makes the subagents over-stuff their
+     final_answer (raw tool output + inferences), and grows the
+     main conversation by 100k+ tokens per round — eventually
+     blowing past the LLM's instruction-following range. Instead,
+     decompose hierarchically across rounds: one round = one
+     subagent = one focused scope/question. The subagent's
+     summary becomes the main conversation's context for the
+     next round, so each next round can dispatch a more
+     informed subagent.
    - Each `question` is at most 2000 characters. If your
-     question would be longer, split it into multiple
-     `Explore` items with focused sub-questions (one per
-     scope or angle). A focused question a subagent can
-     resolve in 3-6 tool calls is the right size.
+     question would be longer, split it into a multi-round
+     sequence — first round a scan/list, next rounds
+     targeted reads.
 
    {"step":"explore",
     "items":[
-      {"scope":"<directory / pattern / node-id list>",
-       "question":"<specific question for this subagent, <=2000 chars>"}
+      {"scope":"<one directory / pattern / node-id list>",
+       "question":"<one focused question, <=2000 chars>"}
     ],
-    "rationale":"<why subagent(s) is the right tool here>"}
+    "rationale":"<why this subagent is the right tool here>"}
 
 ## Vocabularies (use these exact strings)
 
