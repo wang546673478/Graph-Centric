@@ -271,6 +271,7 @@ impl GraphProposer {
         &self,
         conv: &Conversation,
         graph: &Graph,
+        prev_step: Option<&ProposerStep>,
     ) -> Result<(ProposerStep, u64)> {
         let snapshot = render_graph_for_prompt(graph);
         let mut req = conv.to_request(&snapshot, self.temperature, self.max_tokens);
@@ -296,7 +297,45 @@ impl GraphProposer {
             tokens,
             "proposer received model response"
         );
-        parse_step(&resp.content).map(|s| (s, tokens))
+        let step = parse_step(&resp.content)?;
+
+        // Layer 3: post-Explore commit gate. After an Explore step the
+        // next step MUST be a graph-committing or pause-declaring step
+        // (ProposePatch / Block / AskUser / ReadyForVerify) — never
+        // another Explore (or CallTool that bypasses the graph). Without
+        // this, the model keeps dispatching subagents and never updates
+        // the graph, which is the 602-round infinite-explore failure
+        // mode we hit in production 2026-06-09. The error message is
+        // picked up by the fix-it retry path so the model gets a
+        // second chance to commit before the run dies.
+        if let Some(ProposerStep::Explore { .. }) = prev_step {
+            let ok = matches!(
+                step,
+                ProposerStep::ProposePatch { .. }
+                    | ProposerStep::Block { .. }
+                    | ProposerStep::AskUser { .. }
+                    | ProposerStep::ReadyForVerify { .. }
+            );
+            if !ok {
+                return Err(HarnessError::model(format!(
+                    "post-Explore commit gate: your previous step was an Explore \
+                     (subagent finished and reported back). The next step must be \
+                     one of: \
+                     1) `propose_patch` — commit the subagent's findings to the \
+                        graph (add nodes/edges for what you learned), \
+                     2) `block` — declare you're stuck on something the user must \
+                        resolve, \
+                     3) `ask_user` — ask the user a clarifying question, \
+                     4) `ready_for_verify` — declare the graph is complete. \
+                     Dispatching another Explore (or any non-committing step) \
+                     without first committing the previous subagent's findings \
+                     is a violation. Got step kind: {}",
+                    step.kind()
+                )));
+            }
+        }
+
+        Ok((step, tokens))
     }
 
     /// Same as [`Self::next_step`] but retries the model call once if
@@ -312,11 +351,12 @@ impl GraphProposer {
         &self,
         conv: &Conversation,
         graph: &Graph,
+        prev_step: Option<&ProposerStep>,
     ) -> Result<(ProposerStep, u64)> {
         // First attempt: either returns Ok((step, tokens)) or a parse
         // error. We accumulate tokens across both attempts.
         let mut total_tokens: u64 = 0;
-        let (step, parse_err) = match self.next_step(conv, graph).await {
+        let (step, parse_err) = match self.next_step(conv, graph, prev_step).await {
             Ok((s, t)) => {
                 total_tokens += t;
                 (s, None)
@@ -350,7 +390,7 @@ impl GraphProposer {
                      steps across rounds."
                 ),
             });
-            return match self.next_step(&patched_conv, graph).await {
+            return match self.next_step(&patched_conv, graph, prev_step).await {
                 Ok((step, tokens)) => Ok((step, total_tokens + tokens)),
                 Err(retry_err) => {
                     // The retry didn't converge. Surface the LATEST
@@ -986,6 +1026,24 @@ no markdown code fences, nothing else:
      sequence — first round a scan/list, next rounds
      targeted reads.
 
+   **Post-Explore commit rule** (the runtime enforces this —
+   "post-Explore commit gate" in the code): the step IMMEDIATELY
+   following an `Explore` must be one of:
+     - `propose_patch` — commit the subagent's findings to the
+       graph (add nodes/edges describing what you learned). This
+       is the normal path: every Explore should produce at least
+       one graph node, otherwise you're not making progress.
+     - `block` — declare you're stuck on something only the user
+       can resolve.
+     - `ask_user` — ask the user a clarifying question.
+     - `ready_for_verify` — declare the graph is complete.
+   Dispatching another `Explore` (or any other non-committing
+   step) immediately after an `Explore` is a violation and the
+   runtime will reject it. The flow is Explore → ProposePatch
+   → Explore → ProposePatch → …, with each Explore producing
+   at least one new graph node (or a corrective ProposePatch
+   that fixes a previous one).
+
    {"step":"explore",
     "items":[
       {"scope":"<one directory / pattern / node-id list>",
@@ -1326,24 +1384,22 @@ mod tests {
     }
 
     #[test]
-    fn explore_step_round_trips_through_parse_step_parallel() {
-        // Multi-item form: the model emits N (scope, question)
-        // pairs, we dispatch all in parallel.
-        let s = parse_step(
+    fn explore_step_rejects_multiple_items_per_cap() {
+        // Cap is 1 item per Explore step (post-2026-06-09). The model
+        // is supposed to dispatch one subagent per step and decompose
+        // hierarchically across rounds; multi-item parallel dispatch
+        // front-loads work and produces 800k-token final_answers.
+        // The parse path now rejects this with a clear error.
+        let r = parse_step(
             r#"{"step":"explore","items":[
                 {"scope":"src/agent/","question":"what's the orchestrator?"},
                 {"scope":"src/web/","question":"what's the web entrypoint?"}
             ],"rationale":"two scopes"}"#,
-        )
-        .unwrap();
-        match s {
-            ProposerStep::Explore { items, .. } => {
-                assert_eq!(items.len(), 2);
-                assert_eq!(items[0].scope, "src/agent/");
-                assert_eq!(items[1].scope, "src/web/");
-            }
-            other => panic!("expected Explore, got {other:?}"),
-        }
+        );
+        let err = r.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("cap is 1"), "expected cap error, got: {msg}");
+        assert!(msg.contains("Split into two"), "expected split hint, got: {msg}");
     }
 
     #[test]
@@ -1442,7 +1498,7 @@ mod tests {
         let p = proposer_with(vec![r#"{"step":"ready_for_verify","rationale":"trivial"}"#]);
         let conv = p.make_conversation("test task");
         let graph = Graph::new();
-        let (step, tokens) = p.next_step(&conv, &graph).await.unwrap();
+        let (step, tokens) = p.next_step(&conv, &graph, None).await.unwrap();
         match step {
             ProposerStep::ReadyForVerify { rationale } => assert_eq!(rationale, "trivial"),
             other => panic!("expected ReadyForVerify, got {other:?}"),
@@ -1462,7 +1518,7 @@ mod tests {
         ]);
         let conv = p.make_conversation("test task");
         let graph = Graph::new();
-        let (step, _tokens) = p.next_step_with_retry(&conv, &graph).await.unwrap();
+        let (step, _tokens) = p.next_step_with_retry(&conv, &graph, None).await.unwrap();
         match step {
             ProposerStep::AskUser { question, rationale } => {
                 assert_eq!(question, "what now?");
@@ -1470,6 +1526,68 @@ mod tests {
             }
             other => panic!("expected AskUser, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn next_step_rejects_explore_after_explore_without_commit() {
+        // Post-Explore commit gate (added 2026-06-09): after an Explore
+        // step, the next step must be a graph-committing or
+        // pause-declaring step. A second Explore is rejected.
+        use crate::agent::proposer::ExploreItem;
+        let prev = ProposerStep::Explore {
+            items: vec![ExploreItem {
+                scope: "src/".into(),
+                question: "what's the structure?".into(),
+            }],
+            rationale: "r".into(),
+        };
+        // Model tries to dispatch another Explore right after the
+        // first one — should be rejected.
+        let p = proposer_with(vec![
+            r#"{"step":"explore","items":[{"scope":"src/web/","question":"what's the entry?"}],"rationale":"more"}"#,
+        ]);
+        let conv = p.make_conversation("test task");
+        let graph = Graph::new();
+        let r = p.next_step(&conv, &graph, Some(&prev)).await;
+        let err = r.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("post-Explore commit gate"),
+            "expected post-Explore commit gate error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_step_accepts_propose_patch_after_explore() {
+        // The normal path: Explore → ProposePatch (commit findings).
+        // Should pass without error.
+        use crate::agent::proposer::ExploreItem;
+        let prev = ProposerStep::Explore {
+            items: vec![ExploreItem {
+                scope: "src/".into(),
+                question: "what's the structure?".into(),
+            }],
+            rationale: "r".into(),
+        };
+        let p = proposer_with(vec![r#"{"step":"propose_patch","patch":{"add_nodes":[],"add_edges":[],"remove_node_ids":[],"remove_edge_indices":[],"reason":"committed"},"rationale":"committing"}"#]);
+        let conv = p.make_conversation("test task");
+        let graph = Graph::new();
+        let (step, _tokens) = p
+            .next_step(&conv, &graph, Some(&prev))
+            .await
+            .unwrap();
+        assert!(matches!(step, ProposerStep::ProposePatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn next_step_accepts_explore_when_no_prev_step() {
+        // First round of a fresh conversation has no prev_step, so
+        // Explore is always allowed.
+        let p = proposer_with(vec![r#"{"step":"explore","items":[{"scope":"src/","question":"what?"}],"rationale":"r"}"#]);
+        let conv = p.make_conversation("test task");
+        let graph = Graph::new();
+        let (step, _tokens) = p.next_step(&conv, &graph, None).await.unwrap();
+        assert!(matches!(step, ProposerStep::Explore { .. }));
     }
 
     #[tokio::test]
@@ -1484,7 +1602,7 @@ mod tests {
         let conv = p.make_conversation("test task");
         let graph = Graph::new();
         let err = p
-            .next_step_with_retry(&conv, &graph)
+            .next_step_with_retry(&conv, &graph, None)
             .await
             .expect_err("both attempts should fail");
         // The error message is from extract_json_block, which is the
@@ -1502,7 +1620,7 @@ mod tests {
         let conv = p.make_conversation("test");
         let mut g = Graph::new();
         g.add_node(Node::file("hello.rs", "greeting"));
-        let _ = p.next_step(&conv, &g).await.unwrap();
+        let _ = p.next_step(&conv, &g, None).await.unwrap();
         // Check that the captured request's system message contains the node
         let model = p.model.clone();
         // Downcast trick: we only have Arc<dyn Model>; use the inherent test API.
@@ -1638,7 +1756,7 @@ mod tests {
             crate::graph::L1Description::new("does X", "wraps Y", "for Z", "always W")
                 .with_confidence(0.85),
         );
-        let _ = p.next_step(&conv, &g).await.unwrap();
+        let _ = p.next_step(&conv, &g, None).await.unwrap();
         let model_arc = p.model.clone();
         let mock = model_arc.as_any_mock();
         let captured = mock.captured.lock().unwrap();

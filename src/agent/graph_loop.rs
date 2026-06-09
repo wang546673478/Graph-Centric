@@ -673,7 +673,7 @@ impl GraphLoop {
     async fn step_graph(&mut self) -> Result<LoopState> {
         let (step, tokens) = self
             .proposer
-            .next_step_with_retry(&self.conversation, &self.graph)
+            .next_step_with_retry(&self.conversation, &self.graph, self.last_step.as_ref())
             .await?;
         // Accumulate tokens used by this Proposer call.
         self.tokens_used = self.tokens_used.saturating_add(tokens);
