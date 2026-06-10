@@ -93,6 +93,7 @@ mod tests {
             bind_addr: "0.0.0.0:0".to_string(),
             static_dir: String::new(),
             project_root: dir.path().to_path_buf(),
+            engine: super::super::state::EngineConfig::default(),
         };
         Arc::new(super::super::WebState::new(local, cfg))
     }

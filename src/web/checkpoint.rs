@@ -14,7 +14,7 @@ pub struct Checkpoint {
     pub transcript: Vec<Message>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum CheckpointPhase {
     Graph,
     Task,
