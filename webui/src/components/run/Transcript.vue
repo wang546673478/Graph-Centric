@@ -1,3 +1,0 @@
-<template><div class="transcript" ref="el"><div v-for="(m,i) in messages" :key="i" class="msg" :class="m.role">{{ m.content }}</div></div></template>
-<script setup lang="ts">import { ref } from 'vue'; const messages = ref<{role:string,content:string}[]>([]); const el = ref<HTMLElement>()</script>
-<style scoped>.transcript{flex:1;overflow-y:auto;padding:8px}.msg{padding:4px 8px;margin:2px 0;border-radius:4px;font-size:.82rem;white-space:pre-wrap}.msg.user{background:var(--bg-hover)}.msg.assistant{color:var(--text)}.msg.tool_result{color:var(--text-muted);font-family:var(--font-mono);font-size:.75rem}</style>

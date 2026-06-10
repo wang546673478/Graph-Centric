@@ -1,24 +1,20 @@
-//! Web gateway: axum HTTP/WS server wrapping the existing agent loop.
+//! Web gateway: axum HTTP/SSE server wrapping the existing agent loop.
 //!
-//! See `docs/superpowers/specs/2026-06-10-v2-architecture-design.md` for the v2 design.
+//! See `docs/superpowers/specs/2026-06-03-web-gateway-design.md` for the design.
 //!
 //! This module is a thin HTTP surface. The actual agent logic lives in
 //! `crate::agent` (GraphLoop, SubAgent, etc.) and `crate::skills` (skill
-//! storage). The web module exposes these via REST + WebSocket.
+//! storage). The web module just exposes these via REST + SSE.
 
-pub mod api_files;
-pub mod api_runs;
-pub mod api_skills;
-pub mod checkpoint;
-pub mod config_api;
 pub mod errors;
+pub mod state;
 pub mod events;
 pub mod run_session;
-pub mod state;
-pub mod ws;
+pub mod api_runs;
+pub mod api_skills;
+pub mod api_files;
 
-use axum::routing::{get, post};
-use axum::Router;
+use axum::{routing::get, Router};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 use crate::skills::SkillStorage;
@@ -50,29 +46,19 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
     let state = Arc::new(state);
     let api = Router::new()
         .route("/health", get(api_runs::health))
-        .route("/config", get(config_api::get_config).post(config_api::post_config))
         .route("/runs", get(api_runs::list_runs).post(api_runs::create_run))
         .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))
         .route("/runs/:id/events", get(api_runs::run_events))
-        .route("/runs/:id/checkpoints", get(api_runs::list_checkpoints))
-        .route("/runs/:id/checkpoints/:idx", get(api_runs::get_checkpoint))
-        .route("/runs/:id/branch", post(api_runs::create_branch))
-        .route("/runs/:id/answer", post(api_runs::post_answer))
-        .route("/runs/:id/repair", post(api_runs::post_repair))
+        .route("/runs/:id/answer", axum::routing::post(api_runs::post_answer))
+        .route("/runs/:id/repair", axum::routing::post(api_runs::post_repair))
         .route("/skills", get(api_skills::list_skills))
         .route("/skills/:slug", get(api_skills::get_skill).delete(api_skills::delete_skill))
-        .route("/skills/:slug/promote", post(api_skills::promote_skill))
+        .route("/skills/:slug/promote", axum::routing::post(api_skills::promote_skill))
         .route("/files/changed", get(api_files::files_changed))
         .route("/files/diff", get(api_files::file_diff))
-        .with_state(state.clone());
-
-    let ws_routes = Router::new()
-        .route("/ws/runs/:id", get(ws::ws_handler))
         .with_state(state);
 
-    let mut app = Router::new()
-        .nest("/api", api)
-        .merge(ws_routes);
+    let mut app = Router::new().nest("/api", api);
 
     if !static_dir.is_empty() {
         app = app.fallback_service(ServeDir::new(static_dir));

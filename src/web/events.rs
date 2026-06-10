@@ -34,34 +34,6 @@ pub enum RunEvent {
     Done { final_result: serde_json::Value },
     /// An error occurred.
     Error { message: String },
-    /// A model call's input and output. Verbose — only sent when detail_mode is on.
-    ModelCall {
-        component: String,
-        model_name: String,
-        tier: String,
-        request_preview: String,
-        response_content: String,
-        finish_reason: String,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        duration_ms: u64,
-    },
-    /// One step in a cascade backtracking pass.
-    CascadeStep {
-        changed_node: String,
-        predecessor: String,
-        depth: usize,
-        verdict: String,
-        rationale: String,
-    },
-    /// Lightweight notification that a checkpoint was created.
-    CheckpointCreated {
-        index: usize,
-        round: usize,
-        phase: String,
-        node_count: usize,
-        edge_count: usize,
-    },
 }
 
 impl RunEvent {
@@ -77,9 +49,6 @@ impl RunEvent {
             Self::Status { .. } => "status",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
-            Self::ModelCall { .. } => "model_call",
-            Self::CascadeStep { .. } => "cascade_step",
-            Self::CheckpointCreated { .. } => "checkpoint",
         }
     }
 
@@ -154,17 +123,6 @@ pub struct InitialGraphDto {
 }
 
 impl InitialGraphDto {
-    /// Build a DTO from an existing Graph (for branch creation).
-    pub fn from_graph(g: &crate::graph::Graph) -> Self {
-        let nodes: Vec<NodeDto> = g
-            .nodes
-            .values()
-            .map(|n| NodeDto::from_node(n, g.l1.get(&n.id)))
-            .collect();
-        let edges: Vec<EdgeDto> = g.edges.iter().map(EdgeDto::from_edge).collect();
-        Self { nodes, edges }
-    }
-
     /// Build a `Graph` from the L0 skeleton. The reconstructed graph
     /// has no L1 (those are re-derived by the enricher on any new
     /// patch the Proposer proposes), no metadata, and edge indices

@@ -1,6 +1,5 @@
 //! Per-run state machine. One `RunSession` per active or completed run.
 
-use super::checkpoint::CheckpointStore;
 use super::events::{EdgeDto, NodeDto, RunEvent};
 use crate::agent::reviewer::ReviewResult;
 use crate::graph::Graph;
@@ -34,8 +33,6 @@ pub struct RunSession {
     pub last_review: tokio::sync::RwLock<Option<ReviewResult>>,
     /// The captured skill (if the run completed with Pass and capture succeeded).
     pub captured_skill: tokio::sync::RwLock<Option<SkillRef>>,
-    /// v2: per-run checkpoint store for branching and replay.
-    pub checkpoints: tokio::sync::Mutex<CheckpointStore>,
 }
 
 /// Run state visible to the API and the UI.
@@ -72,7 +69,6 @@ impl RunSession {
             last_graph: tokio::sync::RwLock::new(Arc::new(Graph::new())),
             last_review: tokio::sync::RwLock::new(None),
             captured_skill: tokio::sync::RwLock::new(None),
-            checkpoints: tokio::sync::Mutex::new(CheckpointStore::new()),
         }
     }
 

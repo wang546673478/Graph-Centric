@@ -18,7 +18,6 @@
 //! The remaining pieces — `GraphProposer`, `Verifier`, `LocalRepairer`,
 //! `GraphLoop` — land alongside this as Phase 2 progresses.
 
-pub mod cascade;
 pub mod contract;
 pub mod conversation;
 pub mod decomposer;

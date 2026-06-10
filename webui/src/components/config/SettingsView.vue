@@ -1,2 +1,0 @@
-<template><div class="settings"><h2>Settings</h2><p class="muted">Model config, policy, and loop tuning.</p></div></template>
-<style scoped>.settings{padding:24px}.muted{color:var(--text-muted)}</style>

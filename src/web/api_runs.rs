@@ -6,9 +6,8 @@
 //! channel. Cancellation, answers, and repairs are all coordinated
 //! through `tokio::sync::Notify` + the session's storage.
 
-use super::checkpoint::CheckpointMeta;
 use super::errors::ApiError;
-use super::events::{InitialGraphDto, RunEvent};
+use super::events::RunEvent;
 use super::run_session::{RunMetadata, RunSession, RunStatus};
 use super::{RunId, WebState};
 use crate::agent::decomposer::Decomposer;
@@ -206,101 +205,6 @@ pub async fn post_repair(
     Ok(Json(serde_json::json!({"accepted": true})))
 }
 
-// --- Checkpoint endpoints ---
-
-pub async fn list_checkpoints(
-    State(state): State<Arc<WebState>>,
-    Path(id): Path<RunId>,
-) -> Result<Json<Vec<CheckpointMeta>>, ApiError> {
-    let runs = state.runs.read().await;
-    let session = runs
-        .get(&id)
-        .ok_or_else(|| ApiError::NotFound(format!("run {id}")))?;
-    let store = session.checkpoints.lock().await;
-    Ok(Json(store.list()))
-}
-
-pub async fn get_checkpoint(
-    State(state): State<Arc<WebState>>,
-    Path((id, idx)): Path<(RunId, usize)>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let runs = state.runs.read().await;
-    let session = runs
-        .get(&id)
-        .ok_or_else(|| ApiError::NotFound(format!("run {id}")))?;
-    let store = session.checkpoints.lock().await;
-    let cp = store
-        .get(idx)
-        .ok_or_else(|| ApiError::NotFound(format!("checkpoint {idx}")))?;
-    Ok(Json(serde_json::json!({
-        "index": cp.index,
-        "round": cp.round,
-        "phase": cp.phase.to_string(),
-        "graph": cp.graph_snapshot,
-        "transcript": cp.transcript,
-    })))
-}
-
-#[derive(Deserialize)]
-pub struct BranchBody {
-    pub from_checkpoint: usize,
-}
-
-pub async fn create_branch(
-    State(state): State<Arc<WebState>>,
-    Path(id): Path<RunId>,
-    Json(body): Json<BranchBody>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let (parent_task, graph, transcript) = {
-        let runs = state.runs.read().await;
-        let parent = runs
-            .get(&id)
-            .ok_or_else(|| ApiError::NotFound(format!("run {id}")))?;
-        let store = parent.checkpoints.lock().await;
-        let cp = store
-            .get(body.from_checkpoint)
-            .ok_or_else(|| ApiError::NotFound(format!("checkpoint {}", body.from_checkpoint)))?;
-        (parent.task.clone(), cp.graph_snapshot.clone(), cp.transcript.clone())
-    };
-
-    let new_id = uuid::Uuid::new_v4().to_string();
-    let new_session = Arc::new(RunSession::new(new_id.clone(), parent_task));
-    state.runs.write().await.insert(new_id.clone(), new_session.clone());
-
-    // Record branch relationship.
-    {
-        let runs = state.runs.read().await;
-        if let Some(parent) = runs.get(&id) {
-            let mut store = parent.checkpoints.lock().await;
-            store.create_branch(body.from_checkpoint, new_id.clone());
-        }
-    }
-
-    // Spawn new run driver with checkpoint as initial state.
-    let state_clone = state.clone();
-    let id_clone = new_id.clone();
-    let initial_graph_dto = InitialGraphDto::from_graph(&graph);
-    let initial_transcript: Vec<InitialMessage> = transcript
-        .iter()
-        .map(|m| InitialMessage {
-            role: format!("{:?}", m.role).to_lowercase(),
-            content: m.content.clone(),
-        })
-        .collect();
-
-    tokio::spawn(async move {
-        drive_run(
-            state_clone,
-            id_clone,
-            Some(initial_graph_dto),
-            Some(initial_transcript),
-        )
-        .await;
-    });
-
-    Ok(Json(serde_json::json!({"id": new_id})))
-}
-
 // --- Run driver ---
 
 /// The actual agent loop. Spawned as a tokio task by `create_run`. Maps
@@ -414,13 +318,11 @@ async fn drive_run(
     let validator: Arc<dyn PostExecutionValidator> =
         Arc::new(BashCheckValidator::cargo_check_for(&state.config.project_root));
 
-    // v2: channel for cascade step events from the backtracker → WS clients.
-    let (cascade_tx, mut cascade_rx) = tokio::sync::mpsc::unbounded_channel::<
-        crate::agent::cascade::CascadeStep,
-    >();
-
     let loop_cfg = GraphLoopConfig {
-        max_rounds: state.config.engine.loop_tuning.max_rounds,
+        // No hard cap on main-agent rounds or sub-agent steps — let
+        // them run until they converge. 1 main + 2 subagents concurrent
+        // is still enforced by the dispatcher pool below.
+        max_rounds: usize::MAX,
         max_repair_rounds: 3,
         tool_cwd: state.config.project_root.clone(),
         tool_output_cap: 8_000,
@@ -448,12 +350,7 @@ async fn drive_run(
     .with_dispatcher(dispatcher)
     .with_subagent_loader(loader)
     .with_reviewer(reviewer)
-    .with_validator(validator)
-    // v2: cascade backtracking on sub-agent failure.
-    .with_cascade(
-        crate::agent::cascade::CascadeBacktracker::new(deep_model.clone())
-            .with_step_sink(cascade_tx),
-    );
+    .with_validator(validator);
 
     if let Some(dto) = initial_graph {
         let g = dto.into_graph();
@@ -501,42 +398,6 @@ async fn drive_run(
         }
 
         let state_clone = gl.step().await;
-
-        // v2: push checkpoint after each step.
-        {
-            use super::checkpoint::CheckpointPhase;
-            let phase = match &state_clone {
-                crate::agent::graph_loop::LoopState::Running => CheckpointPhase::Task,
-                crate::agent::graph_loop::LoopState::Paused { .. } => CheckpointPhase::Graph,
-                _ => CheckpointPhase::Review,
-            };
-            let mut store = session.checkpoints.lock().await;
-            store.push(gl.round, phase, &gl.graph, &gl.conversation.messages);
-            let cp_count = store.len();
-            drop(store);
-            if cp_count % 5 == 0 {
-                // Emit a checkpoint-created event every 5 steps (not every step — too noisy).
-                session.emit(RunEvent::CheckpointCreated {
-                    index: cp_count - 1,
-                    round: gl.round,
-                    phase: phase.to_string(),
-                    node_count: gl.graph.node_count(),
-                    edge_count: gl.graph.edge_count(),
-                });
-            }
-        }
-
-        // v2: drain any pending cascade steps.
-        while let Ok(step) = cascade_rx.try_recv() {
-            session.emit(RunEvent::CascadeStep {
-                changed_node: step.changed_node,
-                predecessor: step.predecessor,
-                depth: step.depth,
-                verdict: step.verdict,
-                rationale: step.rationale,
-            });
-        }
-
         session.emit_graph_snapshot(&gl.graph).await;
         // Status update — fires after every step so the UI can show
         // cumulative token cost + current phase. Cheap (one small
