@@ -278,6 +278,8 @@ LIVE_MODEL_TEST=1 cargo test --lib model::openai_compat
 - **[简体中文](README.zh-CN.md)** — 中文版
 - **[ARCHITECTURE.md](ARCHITECTURE.md)** — design rationale, rejected alternatives, trade-offs
 - **[ARCHITECTURE.zh-CN.md](ARCHITECTURE.zh-CN.md)** — 中文版架构文档
+- **[Design v2: Cascade Backtracking](docs/design-v2-cascade-backtrack.md)** — next-generation design with immutable anchor, cascade-backtrack verification, and weak-model-first philosophy
+- **[设计 v2: 级联回溯](docs/design-v2-cascade-backtrack.zh-CN.md)** — 中文版 v2 设计文档
 - `docs/superpowers/specs/` — design specs (English) for the two completed tool-system features
 - `docs/superpowers/plans/` — implementation plans (English) for the same
 
