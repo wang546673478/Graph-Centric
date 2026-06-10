@@ -1,18 +1,28 @@
 <script setup lang="ts">
 import DetailModeToggle from './DetailModeToggle.vue'
 import StatusPill from './StatusPill.vue'
+import { useI18n, locale, Locale } from '../../composables/useI18n'
+
+const { t } = useI18n()
+
+function toggleLang() {
+  locale.value = locale.value === 'en' ? 'zh-CN' : 'en'
+}
 </script>
 
 <template>
   <header class="topbar">
     <nav>
-      <router-link to="/">Run</router-link>
-      <router-link to="/runs">History</router-link>
-      <router-link to="/skills">Skills</router-link>
-      <router-link to="/files">Files</router-link>
-      <router-link to="/settings">Settings</router-link>
+      <router-link to="/">{{ t('nav.run') }}</router-link>
+      <router-link to="/runs">{{ t('nav.history') }}</router-link>
+      <router-link to="/skills">{{ t('nav.skills') }}</router-link>
+      <router-link to="/files">{{ t('nav.files') }}</router-link>
+      <router-link to="/settings">{{ t('nav.settings') }}</router-link>
     </nav>
     <div class="right">
+      <button class="lang-btn" @click="toggleLang" :title="locale === 'en' ? '切换到中文' : 'Switch to English'">
+        {{ locale === 'en' ? '中文' : 'EN' }}
+      </button>
       <DetailModeToggle />
       <StatusPill />
     </div>
@@ -34,4 +44,9 @@ nav a:hover, nav a.router-link-active {
   color: var(--text); border-bottom-color: var(--accent);
 }
 .right { display: flex; gap: 10px; align-items: center; }
+.lang-btn {
+  background: var(--bg-hover); color: var(--text-muted); border: 1px solid var(--border);
+  padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; cursor: pointer;
+}
+.lang-btn:hover { color: var(--text); border-color: var(--accent); }
 </style>

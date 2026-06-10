@@ -1,18 +1,12 @@
 <script setup lang="ts">
 import { ref, watch, nextTick } from 'vue'
+import { useI18n } from '../../composables/useI18n'
+const { t } = useI18n()
 
-const props = defineProps<{
-  messages: { role: string; content: string }[]
-  status: string
-  error: string
-}>()
-
+const props = defineProps<{ messages: { role: string; content: string }[]; status: string; error: string }>()
 const el = ref<HTMLElement>()
 
-watch(() => props.messages.length, async () => {
-  await nextTick()
-  if (el.value) el.value.scrollTop = el.value.scrollHeight
-})
+watch(() => props.messages.length, async () => { await nextTick(); if (el.value) el.value.scrollTop = el.value.scrollHeight })
 
 function roleClass(r: string) {
   if (r === 'user') return 'user'
@@ -26,12 +20,12 @@ function roleClass(r: string) {
 
 <template>
   <div class="transcript" ref="el">
-    <div v-if="!messages.length" class="empty">Send a task to start building the relationship graph.</div>
+    <div v-if="!messages.length" class="empty">{{ t('transcript.empty') }}</div>
     <div v-for="(m, i) in messages" :key="i" class="msg" :class="roleClass(m.role)">
       <span class="role-tag">{{ m.role }}</span>
       <pre class="body">{{ m.content }}</pre>
     </div>
-    <div v-if="status === 'Running' || status === 'graph'" class="thinking">💭 thinking…</div>
+    <div v-if="status === 'Running' || status === 'graph'" class="thinking">💭 {{ t('transcript.thinking') }}</div>
     <div v-if="error" class="msg error"><span class="role-tag">error</span><pre class="body">{{ error }}</pre></div>
   </div>
 </template>

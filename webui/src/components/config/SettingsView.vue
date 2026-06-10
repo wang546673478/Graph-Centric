@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { api } from '../../composables/useRunSocket'
+import { useI18n } from '../../composables/useI18n'
+const { t } = useI18n()
 
 const config = ref<any>({ model: {}, policy: {}, loop_tuning: {} })
 const saved = ref(false)
@@ -8,37 +10,30 @@ const saved = ref(false)
 onMounted(async () => { try { config.value = await api.get('/api/config') } catch { /* */ } })
 
 async function save() {
-  try {
-    await api.post('/api/config', config.value)
-    saved.value = true
-    setTimeout(() => saved.value = false, 2000)
-  } catch (e) { alert(String(e)) }
+  try { await api.post('/api/config', config.value); saved.value = true; setTimeout(() => saved.value = false, 2000) }
+  catch (e) { alert(String(e)) }
 }
 </script>
 
 <template>
   <div class="settings">
-    <h2>Engine Configuration</h2>
-
+    <h2>{{ t('settings.title') }}</h2>
     <section>
-      <h3>Model</h3>
-      <label>Base URL <input v-model="config.model.base_url" /></label>
-      <label>Fast Model <input v-model="config.model.fast_model" /></label>
-      <label>Deep Model <input v-model="config.model.deep_model" /></label>
+      <h3>{{ t('settings.model') }}</h3>
+      <label>{{ t('settings.baseUrl') }} <input v-model="config.model.base_url" /></label>
+      <label>{{ t('settings.fastModel') }} <input v-model="config.model.fast_model" /></label>
+      <label>{{ t('settings.deepModel') }} <input v-model="config.model.deep_model" /></label>
     </section>
-
     <section>
-      <h3>Policy</h3>
-      <label>Max Concurrent Subagents <input type="number" v-model.number="config.policy.max_concurrent_subagents" /></label>
+      <h3>{{ t('settings.policy') }}</h3>
+      <label>{{ t('settings.maxConcurrent') }} <input type="number" v-model.number="config.policy.max_concurrent_subagents" /></label>
     </section>
-
     <section>
-      <h3>Loop Tuning</h3>
-      <label>Max Rounds <input type="number" v-model.number="config.loop_tuning.max_rounds" /></label>
-      <label><input type="checkbox" v-model="config.loop_tuning.cascade_backtrack" /> Cascade Backtracking</label>
+      <h3>{{ t('settings.loopTuning') }}</h3>
+      <label>{{ t('settings.maxRounds') }} <input type="number" v-model.number="config.loop_tuning.max_rounds" /></label>
+      <label><input type="checkbox" v-model="config.loop_tuning.cascade_backtrack" /> {{ t('settings.cascadeBacktrack') }}</label>
     </section>
-
-    <button class="primary" @click="save">{{ saved ? '✓ Saved' : 'Save Config' }}</button>
+    <button class="primary" @click="save">{{ saved ? t('settings.saved') : t('settings.save') }}</button>
   </div>
 </template>
 

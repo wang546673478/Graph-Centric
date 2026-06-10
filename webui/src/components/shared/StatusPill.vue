@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { activeRunId, runs, findRun } from '../../composables/useRunSocket'
+import { useI18n } from '../../composables/useI18n'
+const { t } = useI18n()
 
 const status = computed(() => {
   if (!activeRunId.value) return 'idle'
@@ -10,7 +12,7 @@ const status = computed(() => {
 </script>
 
 <template>
-  <span class="status-pill" :class="status">{{ status }}</span>
+  <span class="status-pill" :class="status">{{ status === 'idle' ? t('status.idle') : status }}</span>
 </template>
 
 <style scoped>
