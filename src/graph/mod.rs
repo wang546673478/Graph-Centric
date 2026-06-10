@@ -322,6 +322,12 @@ pub struct Node {
     pub summary: String,
     #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
+    /// If true, this node is the anchor (user's immutable intent) and
+    /// must never be removed or have its kind/path/summary changed by
+    /// any repair or re-plan operation. Cascade backtracking stops at
+    /// this node.
+    #[serde(default)]
+    pub immutable: bool,
 }
 
 impl Node {
@@ -337,6 +343,7 @@ impl Node {
             path: path.into(),
             summary: summary.into(),
             metadata: HashMap::new(),
+            immutable: false,
         }
     }
 
@@ -631,6 +638,57 @@ impl Graph {
     pub(crate) fn insert_edge_raw(&mut self, edge: Edge) {
         self.edges.push(edge);
     }
+
+    /// Return all edges where `node` is the target, paired with the source node.
+    /// This is the inverse of the natural edge direction — "which nodes point TO me?"
+    pub fn predecessors_of(&self, node: &NodeId) -> Vec<(&Edge, &Node)> {
+        self.incoming(node)
+            .filter_map(|e| self.nodes.get(&e.source).map(|n| (e, n)))
+            .collect()
+    }
+
+    /// Walk inbound edges from `start` toward the anchor. Returns the ordered
+    /// path from the farthest ancestor to `start` (includes the anchor itself
+    /// if reachable). Uses BFS on reversed edges; stops when an immutable node
+    /// is reached.
+    pub fn path_to_anchor(&self, start: &NodeId) -> Vec<NodeId> {
+        let mut path = Vec::new();
+        let mut current = start.clone();
+        // Safety cap: max 1000 hops.
+        for _ in 0..1000 {
+            let preds: Vec<NodeId> = self.predecessors(&current).cloned().collect();
+            if preds.is_empty() {
+                break;
+            }
+            // Prefer the first predecessor that is the anchor; otherwise follow
+            // the first predecessor. For DAG nodes with multiple inbound edges,
+            // callers should use `predecessors_of()` directly to handle branches.
+            if let Some(anchor) = preds.iter().find(|id| {
+                self.nodes.get(id).map(|n| n.immutable).unwrap_or(false)
+            }) {
+                path.push(anchor.clone());
+                break;
+            }
+            path.push(preds[0].clone());
+            current = preds[0].clone();
+        }
+        // Path was built from start backward; reverse to get root→leaf order.
+        path.reverse();
+        path
+    }
+
+    /// Mark a node as the immutable anchor. Panics if the node doesn't exist
+    /// (caller should check first via `contains_node`).
+    pub fn set_anchor(&mut self, id: &NodeId) {
+        if let Some(node) = self.nodes.get_mut(id) {
+            node.immutable = true;
+        }
+    }
+
+    /// Return the anchor node, if one has been set.
+    pub fn anchor(&self) -> Option<&Node> {
+        self.nodes.values().find(|n| n.immutable)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -924,5 +982,39 @@ mod tests {
             NodeKind::Other(s) => assert_eq!(s, "database"),
             other => panic!("expected Other(\"database\"), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn predecessors_of_returns_inbound_edges() {
+        let mut g = Graph::new();
+        g.add_node(Node::task("a", "anchor"));
+        g.add_node(Node::task("b", "child"));
+        g.add_edge(Edge::new("a", "b", RelationType::DependsOn, 1.0, "")).unwrap();
+        let preds = g.predecessors_of(&NodeId::from("b"));
+        assert_eq!(preds.len(), 1);
+        assert_eq!(preds[0].1.id.as_str(), "a");
+    }
+
+    #[test]
+    fn path_to_anchor_stops_at_immutable() {
+        let mut g = Graph::new();
+        let mut anchor = Node::task("a", "anchor");
+        anchor.immutable = true;
+        g.add_node(anchor);
+        g.add_node(Node::task("b", "mid"));
+        g.add_node(Node::task("c", "leaf"));
+        g.add_edge(Edge::new("a", "b", RelationType::DependsOn, 1.0, "")).unwrap();
+        g.add_edge(Edge::new("b", "c", RelationType::DependsOn, 1.0, "")).unwrap();
+        let path = g.path_to_anchor(&NodeId::from("c"));
+        // path_to_anchor returns farthest-ancestor-first: anchor → ... → parent-of-start
+        assert_eq!(path, vec![NodeId::from("a"), NodeId::from("b")]);
+    }
+
+    #[test]
+    fn set_anchor_marks_node_immutable() {
+        let mut g = Graph::new();
+        g.add_node(Node::task("a", "anchor"));
+        g.set_anchor(&NodeId::from("a"));
+        assert!(g.anchor().unwrap().immutable);
     }
 }

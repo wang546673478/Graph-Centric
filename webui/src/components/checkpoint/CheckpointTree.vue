@@ -1,0 +1,3 @@
+<template><div class="checkpoint-tree"><h3>Checkpoints</h3><div v-if="!items.length" class="muted">None yet</div><div v-for="cp in items" :key="cp.index" class="cp-item">#{{ cp.index }} · {{ cp.phase }} · {{ cp.node_count }}n</div></div></template>
+<script setup lang="ts">import { ref } from 'vue'; const items = ref<any[]>([])</script>
+<style scoped>.checkpoint-tree{padding:8px}.cp-item{padding:3px 6px;font-size:.7rem;color:var(--text-muted)}.muted{color:var(--text-muted);font-size:.75rem}</style>

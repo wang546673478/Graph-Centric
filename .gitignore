@@ -9,4 +9,3 @@ Cargo.lock
 /webui/.svelte-kit/
 /webui/build/
 /webui/dist/
-.worktrees/

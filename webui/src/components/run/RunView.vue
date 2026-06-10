@@ -1,0 +1,3 @@
+<template><div class="run-view"><div class="chat-panel"><Transcript /><Composer /></div><div class="side-panel"><GraphPanel /></div></div></template>
+<script setup lang="ts">import Transcript from './Transcript.vue'; import Composer from './Composer.vue'; import GraphPanel from '../graph/GraphPanel.vue'</script>
+<style scoped>.run-view{display:flex;flex:1;min-height:0}.chat-panel{flex:1;display:flex;flex-direction:column;min-width:0}.side-panel{width:400px;border-left:1px solid var(--border)}</style>

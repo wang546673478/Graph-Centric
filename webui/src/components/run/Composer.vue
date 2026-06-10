@@ -1,0 +1,3 @@
+<template><div class="composer"><input v-model="msg" @keydown.enter="send" placeholder="Type a message…" /><button class="primary" @click="send">Send</button></div></template>
+<script setup lang="ts">import { ref } from 'vue'; const msg = ref(''); function send() { if (!msg.value.trim()) return; msg.value = '' }</script>
+<style scoped>.composer{display:flex;gap:8px;padding:12px;border-top:1px solid var(--border)}button{padding:8px 20px}</style>

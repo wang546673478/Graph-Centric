@@ -24,7 +24,7 @@
 use super::Conversation;
 use crate::error::{HarnessError, Result};
 use crate::graph::{Edge, Graph, GraphPatch, Node, NodeId, NodeKind, RelationType};
-use crate::model::{Model, Role};
+use crate::model::{Message, Model, Role};
 use crate::tools::ToolRegistry;
 use tracing::warn;
 use std::sync::Arc;
@@ -427,6 +427,72 @@ impl GraphProposer {
         }
 
         Ok((step, total_tokens))
+    }
+
+    /// Called when a sub-agent reports that a node failed execution.
+    /// The Proposer re-plans the failed node and its downstream path,
+    /// producing a GraphPatch.
+    pub async fn replan_failed_node(
+        &self,
+        failed_node: &NodeId,
+        error_evidence: &str,
+        graph: &Graph,
+        task: &str,
+        conversation: &Conversation,
+    ) -> Result<GraphPatch> {
+        let graph_snapshot = render_graph_for_prompt(graph);
+        let prompt = format!(
+            r#"You are re-planning a failed node in a task graph.
+
+## Original Task
+{task}
+
+## Current Graph
+{graph_snapshot}
+
+## Failed Node
+Node ID: {failed_node}
+Failure Evidence: {error_evidence}
+
+## Instructions
+The sub-agent attempted to execute this node and failed.
+Your job is to:
+1. Analyze WHY the node failed (from the evidence)
+2. Design a REPLACEMENT for this node that avoids the failure
+3. If the replacement changes this node's output contract, also adjust
+   downstream nodes that depend on it
+4. Output a GraphPatch with:
+   - remove_nodes: the failed node's ID (and any dependent nodes that
+     must change)
+   - add_nodes: replacement node(s) with L0 (id, kind, path, summary)
+   - add_edges: edges connecting new node(s) to existing nodes
+
+Respond with JSON:
+{{"step":"propose_patch","patch":{{"remove_nodes":[...],"add_nodes":[...],"add_edges":[...],"reason":"..."}},"rationale":"..."}}"#,
+            failed_node = failed_node.as_str(),
+        );
+
+        let req = crate::model::ModelRequest {
+            messages: {
+                let mut msgs = conversation.messages.clone();
+                msgs.push(Message::user(prompt));
+                msgs
+            },
+            tools: vec![],
+            temperature: 0.1,
+            max_tokens: Some(4096),
+            stop: vec![],
+        };
+
+        let resp = self.model.complete(req).await?;
+        let step = parse_step(&resp.content)?;
+        match step {
+            ProposerStep::ProposePatch { patch, .. } => Ok(patch),
+            other => Err(HarnessError::model(format!(
+                "expected propose_patch from replan, got {}",
+                other.kind()
+            ))),
+        }
     }
 }
 

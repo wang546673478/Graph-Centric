@@ -1,0 +1,3 @@
+<template><aside class="sidebar"><h3>Runs</h3><div class="run-list"><div v-for="r in runs" :key="r.id" class="run-item" @click="$router.push('/')">{{ r.task?.slice(0, 40) }}</div></div></aside></template>
+<script setup lang="ts">import { ref } from 'vue'; const runs = ref<any[]>([])</script>
+<style scoped>.sidebar{width:220px;background:var(--bg-panel);border-right:1px solid var(--border);padding:12px;overflow-y:auto}.run-item{padding:6px 8px;border-radius:4px;cursor:pointer;font-size:.8rem;color:var(--text-muted)}.run-item:hover{background:var(--bg-hover);color:var(--text)}</style>
