@@ -352,7 +352,7 @@ pub struct GraphLoopConfig {
 impl GraphLoopConfig {
     pub fn defaults_at(cwd: impl Into<PathBuf>) -> Self {
         Self {
-            max_rounds: 50,
+            max_rounds: 300,
             max_repair_rounds: 4,
             tool_cwd: cwd.into(),
             tool_output_cap: 12_000,
@@ -378,6 +378,10 @@ pub struct GraphLoop {
     /// same loader configured on the L1Enricher; kept separate so callers
     /// can swap (e.g., wider read scope for sub-agents than for L1).
     pub subagent_loader: Option<Arc<dyn SourceLoader>>,
+    /// v2: optional CascadeBacktracker. When present, sub-agent graph errors
+    /// trigger auto-replan + cascade verification instead of surfacing
+    /// GraphInvalid to the caller.
+    pub cascade: Option<crate::agent::cascade::CascadeBacktracker>,
     /// Phase 4: optional PostExecutionValidator that runs between the Task
     /// phase and the Review phase. When the validator returns
     /// `FailedAsGraphIssue`, the loop surfaces
@@ -477,6 +481,7 @@ impl GraphLoop {
             decomposer: None,
             dispatcher: None,
             subagent_loader: None,
+            cascade: None,
             validator: None,
             reviewer: None,
             tools: tools.clone(),
@@ -568,6 +573,13 @@ impl GraphLoop {
     /// `Passed`, the loop also continues to Review.
     pub fn with_validator(mut self, v: Arc<dyn PostExecutionValidator>) -> Self {
         self.validator = Some(v);
+        self
+    }
+
+    /// v2: attach a CascadeBacktracker for auto-replan + cascade verification
+    /// on sub-agent failure.
+    pub fn with_cascade(mut self, cascade: crate::agent::cascade::CascadeBacktracker) -> Self {
+        self.cascade = Some(cascade);
         self
     }
 
@@ -1182,10 +1194,14 @@ impl GraphLoop {
             .collect();
         self.task_outcome = Some(outcome);
 
-        // Priority: graph errors reported by sub-agents bubble up FIRST.
-        // The v2 design says any sub-agent's graph-error signal interrupts
-        // the parent and routes back to GRAPH state for local repair.
+        // v2: when cascade backtracker is configured, auto-replan and
+        // cascade-verify instead of surfacing GraphInvalid to the caller.
+        // v1 fallback: if no cascade, surface GraphInvalid (user handles).
         if !task_graph_errors.is_empty() {
+            if self.cascade.is_some() {
+                return self.handle_task_phase_graph_errors(task_graph_errors).await;
+            }
+            // v1 fallback
             warn!(
                 count = task_graph_errors.len(),
                 "graph_loop: sub-agent(s) reported graph errors; surfacing GraphInvalid"
@@ -1319,6 +1335,120 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
     // Bookkeeping
     // -----------------------------------------------------------------------
+
+    /// v2: when sub-agents report graph errors during Task phase and a
+    /// CascadeBacktracker is configured, auto-replan the failed nodes and
+    /// cascade-backtrack instead of surfacing GraphInvalid to the caller.
+    async fn handle_task_phase_graph_errors(
+        &mut self,
+        errors: Vec<GraphError>,
+    ) -> LoopState {
+        use crate::agent::cascade::CascadeBacktracker;
+
+        warn!(
+            count = errors.len(),
+            "graph_loop: auto-replanning after sub-agent graph errors"
+        );
+
+        let cascade = self.cascade.as_ref().cloned();
+        let loader = self.subagent_loader.clone();
+
+        for err in &errors {
+            let failed_nodes = err.related_nodes();
+            if failed_nodes.is_empty() {
+                continue;
+            }
+            let failed_id = &failed_nodes[0];
+
+            // Check if the failed node is the anchor.
+            if let Some(node) = self.graph.nodes.get(failed_id) {
+                if node.immutable {
+                    warn!(anchor = %failed_id, "anchor node is infeasible; surfacing to caller");
+                    self.pending = Pending::AwaitingRepair;
+                    return LoopState::GraphInvalid {
+                        source: ErrorSource::DuringExecution,
+                        errors: vec![err.clone()],
+                        snapshot: self.graph.clone(),
+                    };
+                }
+            }
+
+            // Ask the Proposer to re-plan the failed node.
+            let evidence = err.detail();
+            match self.proposer.replan_failed_node(
+                failed_id,
+                &evidence,
+                &self.graph,
+                &self.task,
+                &self.conversation,
+            ).await {
+                Ok(patch) => {
+                    if let Err(e) = self.graph.apply_patch(patch) {
+                        warn!(error = %e, "re-plan patch rejected by graph");
+                        self.pending = Pending::AwaitingRepair;
+                        return LoopState::GraphInvalid {
+                            source: ErrorSource::DuringExecution,
+                            errors: vec![err.clone()],
+                            snapshot: self.graph.clone(),
+                        };
+                    }
+                    self.conversation.add_user(format!(
+                        "Auto-replan: redesigned node {} after failure: {}",
+                        failed_id, evidence
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "re-plan model call failed; surfacing to caller");
+                    self.pending = Pending::AwaitingRepair;
+                    return LoopState::GraphInvalid {
+                        source: ErrorSource::DuringExecution,
+                        errors: vec![err.clone()],
+                        snapshot: self.graph.clone(),
+                    };
+                }
+            }
+
+            // Cascade backtrack if configured.
+            if let (Some(cascade), Some(l)) = (&cascade, &loader) {
+                match cascade.backtrack_from(failed_id, &self.graph, &self.task, l.as_ref()).await {
+                    Ok(result) => {
+                        info!(
+                            preserved = result.preserved.len(),
+                            needs_repair = result.needs_repair.len(),
+                            needs_reexec = result.needs_reexec.len(),
+                            "cascade backtracking complete"
+                        );
+                        for repair_id in &result.needs_repair {
+                            self.conversation.add_user(format!(
+                                "Cascade: predecessor {} needs re-design. Re-planning.",
+                                repair_id
+                            ));
+                            // Recursively re-plan this predecessor.
+                            let sub_err = GraphError::L0Structural {
+                                error_type: L0ErrorType::MissingRelation,
+                                detail: format!(
+                                    "Cascade: predecessor {} incompatible with redesigned successor",
+                                    repair_id
+                                ),
+                                related_nodes: vec![repair_id.clone()],
+                                discovered_by: Some("cascade_backtracker".into()),
+                            };
+                            return Box::pin(
+                                self.handle_task_phase_graph_errors(vec![sub_err])
+                            ).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "cascade backtracking errored; continuing");
+                    }
+                }
+            }
+        }
+
+        // All errors processed. Re-enter Graph phase for re-verification.
+        self.phase = Phase::Graph;
+        LoopState::Running
+    }
 
     fn build_final_result(&self) -> FinalResult {
         FinalResult {
