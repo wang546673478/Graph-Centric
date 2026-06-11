@@ -51,6 +51,19 @@ watch(activeRunId, (id) => {
   }
 })
 
+function newChat() {
+  if (socket) { socket.disconnect(); socket = null }
+  activeRunId.value = null
+}
+
+async function stopRun() {
+  const id = activeRunId.value
+  if (!id) return
+  try { await fetch(`/api/runs/${id}`, { method: 'DELETE' }) } catch { /* ignore */ }
+  const s = getRunStore(id)
+  if (s) s.status = 'Cancelled'
+}
+
 async function submitTask(task: string) {
   if (sending.value) return
   sending.value = true
@@ -104,6 +117,11 @@ async function submitTask(task: string) {
   <div class="run-view">
     <div class="chat-panel">
       <Transcript :messages="transcript" :status="status" :error="errorMsg" />
+      <div class="toolbar">
+        <button class="secondary" @click="newChat">+ New</button>
+        <button v-if="status === 'Running'" class="danger" @click="stopRun">■ Stop</button>
+        <span class="run-label" v-if="activeRunId">{{ activeRunId.slice(0,8) }}… · {{ status }}</span>
+      </div>
       <Composer :disabled="sending" @send="submitTask" />
     </div>
     <div class="side-panel">
@@ -120,6 +138,9 @@ async function submitTask(task: string) {
 <style scoped>
 .run-view { display: flex; flex: 1; min-height: 0; }
 .chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-top: 1px solid var(--border); background: var(--bg); }
+.toolbar button { font-size: 0.75rem; padding: 4px 10px; }
+.run-label { font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono); }
 .side-panel { width: 420px; border-left: 1px solid var(--border); display: flex; flex-direction: column; background: var(--bg-panel); }
 .tabs { display: flex; border-bottom: 1px solid var(--border); }
 .tabs button { flex: 1; padding: 8px; background: none; color: var(--text-muted); border-radius: 0; font-size: 0.8rem; }
