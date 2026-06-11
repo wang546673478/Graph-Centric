@@ -27,15 +27,16 @@ function connectToRun(id: string) {
   if (socket) socket.disconnect()
 
   socket = useRunSocket(id, (e: WSEvent) => {
+    const d = e.data || e  // backend nests inside "data", backward compat
     switch (e.type) {
-      case 'transcript': s.transcript.push({ role: e.role || 'assistant', content: e.content || '' }); break
-      case 'graph': case 'graph_snapshot': if (e.nodes) s.nodes = e.nodes; if (e.edges) s.edges = e.edges; break
-      case 'status': if (e.phase) s.status = e.phase; s.tokensUsed = e.tokens_used || s.tokensUsed; break
+      case 'transcript': s.transcript.push({ role: d.role || 'assistant', content: d.content || '' }); break
+      case 'graph': case 'graph_snapshot': if (d.nodes) s.nodes = d.nodes; if (d.edges) s.edges = d.edges; break
+      case 'status': if (d.phase) s.status = d.phase; s.tokensUsed = d.tokens_used || s.tokensUsed; break
       case 'done': s.status = 'Done'; break
-      case 'error': s.error = e.message || 'Unknown error'; s.status = 'Error'; break
-      case 'cascade_step': if (detailMode.value) s.transcript.push({ role: 'cascade', content: `🔍 ${e.changed_node} ← ${e.predecessor}: ${e.verdict} — ${e.rationale}` }); break
-      case 'model_call': if (detailMode.value) s.transcript.push({ role: 'model', content: `🤖 ${e.component} (${e.completion_tokens || 0}t, ${e.duration_ms || 0}ms): ${(e.response_content || '').slice(0, 200)}` }); break
-      case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${e.index} · r${e.round} · ${e.node_count}n/${e.edge_count}e` }); break
+      case 'error': s.error = d.message || 'Unknown error'; s.status = 'Error'; break
+      case 'cascade_step': if (detailMode.value) s.transcript.push({ role: 'cascade', content: `🔍 ${d.changed_node} ← ${d.predecessor}: ${d.verdict} — ${d.rationale}` }); break
+      case 'model_call': if (detailMode.value) s.transcript.push({ role: 'model', content: `🤖 ${d.component} (${d.completion_tokens || 0}t, ${d.duration_ms || 0}ms): ${(d.response_content || '').slice(0, 200)}` }); break
+      case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` }); break
     }
   })
 }
