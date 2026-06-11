@@ -14,9 +14,7 @@ function toggleLang() {
   <header class="topbar">
     <nav>
       <router-link to="/">{{ t('nav.run') }}</router-link>
-      <router-link to="/runs">{{ t('nav.history') }}</router-link>
       <router-link to="/skills">{{ t('nav.skills') }}</router-link>
-      <router-link to="/files">{{ t('nav.files') }}</router-link>
       <router-link to="/settings">{{ t('nav.settings') }}</router-link>
     </nav>
     <div class="right">

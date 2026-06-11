@@ -1,16 +1,17 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { runs, activeRunId, loadRuns, getRunStore } from '../../composables/useRunSocket'
+import { runs, activeRunId, loadRuns, getRunStore, loadRunData } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 const { t } = useI18n()
 const router = useRouter()
 
 onMounted(() => { loadRuns() })
 
-function openRun(id: string) {
+async function openRun(id: string) {
   activeRunId.value = id
   getRunStore(id)
+  await loadRunData(id)
   router.push('/')
 }
 </script>

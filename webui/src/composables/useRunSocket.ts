@@ -116,6 +116,30 @@ export function findRun(id: string): RunData | undefined {
   return runs.value.find(r => r.id === id)
 }
 
+/// Fetch checkpoint data for a completed run and populate the global store.
+export async function loadRunData(id: string) {
+  const store = getRunStore(id)
+  try {
+    const checkpoints: any[] = await api.get(`/api/runs/${id}/checkpoints`)
+    if (checkpoints.length > 0) {
+      const last = checkpoints[checkpoints.length - 1]
+      const cp: any = await api.get(`/api/runs/${id}/checkpoints/${last.index}`)
+      if (cp.transcript) store.transcript = cp.transcript.map((m: any) => {
+        const role = typeof m.role === 'string' ? m.role.toLowerCase().replace(/^"|"$/g, '') : 'assistant'
+        return { role, content: m.content }
+      })
+      if (cp.graph) {
+        store.nodes = cp.graph.nodes ? Object.values(cp.graph.nodes) : []
+        store.edges = cp.graph.edges || []
+      }
+      store.status = 'Done'
+    }
+  } catch { /* checkpoints may not exist */ }
+  // Also load from active runs list for status.
+  const r = findRun(id)
+  if (r) { store.status = r.status; store.tokensUsed = r.tokensUsed }
+}
+
 function statusLabel(s: any): string {
   if (!s) return 'unknown'
   if (typeof s === 'string') return s.toLowerCase()

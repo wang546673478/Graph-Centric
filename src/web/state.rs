@@ -34,7 +34,7 @@ impl WebConfig {
             bind_addr,
             static_dir,
             project_root,
-            engine: EngineConfig::default(),
+            engine: EngineConfig::load(),
         }
     }
 }
@@ -74,6 +74,44 @@ pub struct LoopTuningConfig {
     pub max_rounds: usize,
     pub max_repair_rounds: usize,
     pub cascade_backtrack: bool,
+}
+
+impl EngineConfig {
+    const CONFIG_FILE: &str = ".graph_harness_config.json";
+
+    /// Load config from disk, falling back to env vars + defaults.
+    pub fn load() -> Self {
+        let path = std::path::Path::new(Self::CONFIG_FILE);
+        if path.exists() {
+            if let Ok(json) = std::fs::read_to_string(path) {
+                if let Ok(cfg) = serde_json::from_str(&json) {
+                    return cfg;
+                }
+            }
+        }
+        // Fallback: read from env vars like ModelConfig does.
+        let base_url = std::env::var("MODEL_BASE_URL").unwrap_or_default();
+        let api_key = std::env::var("MODEL_API_KEY").unwrap_or_default();
+        let fast_model = std::env::var("MODEL_NAME_FAST").unwrap_or_else(|_| "deepseek-v4-flash".into());
+        let deep_model = std::env::var("MODEL_NAME_DEEP").unwrap_or_else(|_| "deepseek-v4-pro".into());
+        EngineConfig {
+            model: ModelTierConfig {
+                base_url,
+                api_key,
+                api_key_masked: String::new(),
+                fast_model,
+                deep_model,
+                default_model: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Persist config to disk.
+    pub fn save(&self) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(Self::CONFIG_FILE, json)
+    }
 }
 
 impl Default for EngineConfig {

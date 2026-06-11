@@ -54,6 +54,9 @@ pub async fn post_config(
         }
     }
 
+    // Persist to disk so config survives restarts.
+    let _ = config.save();
+
     // Set env vars so ModelConfig::load() picks them up for subsequent runs.
     // Safety: single-threaded web server, no concurrent access.
     if !config.model.base_url.is_empty() {

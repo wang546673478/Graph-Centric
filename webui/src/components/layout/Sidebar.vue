@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { activeRunId, runs, loadRuns, getRunStore } from '../../composables/useRunSocket'
+import { activeRunId, runs, loadRuns, getRunStore, loadRunData } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 
 const { t } = useI18n()
@@ -9,9 +9,10 @@ const router = useRouter()
 
 onMounted(() => { loadRuns(); setInterval(loadRuns, 5000) })
 
-function selectRun(id: string) {
+async function selectRun(id: string) {
   activeRunId.value = id
   getRunStore(id)
+  await loadRunData(id)
   router.push('/')
 }
 
