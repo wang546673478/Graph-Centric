@@ -23,13 +23,17 @@ function selectRun(id: string) { activeRunId.value = id }
 </template>
 
 <style scoped>
-.sidebar { width: 220px; background: var(--bg-panel); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; }
-.brand { padding: 14px 12px; font-weight: 700; font-size: 0.95rem; cursor: pointer; color: var(--accent); }
-.section-header { padding: 4px 12px; font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.5px; }
-.empty { padding: 12px; color: var(--text-muted); font-size: 0.75rem; }
-.run-item { padding: 6px 12px; cursor: pointer; border-radius: 0; }
-.run-item:hover { background: var(--bg-hover); }
-.run-item.active { background: var(--bg-hover); border-left: 3px solid var(--accent); }
+.sidebar {
+  width: 220px; background: var(--bg-panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow-y: auto; box-shadow: var(--shadow);
+  z-index: 1;
+}
+.brand { padding: 16px 14px; font-weight: 700; font-size: 0.95rem; cursor: pointer; color: var(--accent); letter-spacing: -0.01em; }
+.section-header { padding: 6px 14px 4px; font-size: 0.6rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.08em; font-weight: 600; }
+.empty { padding: 14px; color: var(--text-muted); font-size: 0.75rem; }
+.run-item { padding: 8px 14px; cursor: pointer; border-left: 3px solid transparent; transition: all 0.1s ease; }
+.run-item:hover { background: var(--bg); }
+.run-item.active { background: var(--accent-soft); border-left-color: var(--accent); }
 .task-line { font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.meta-line { font-size: 0.65rem; color: var(--text-muted); margin-top: 1px; }
+.meta-line { font-size: 0.65rem; color: var(--text-muted); margin-top: 2px; }
 </style>

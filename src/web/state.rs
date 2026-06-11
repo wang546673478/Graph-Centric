@@ -51,6 +51,8 @@ pub struct EngineConfig {
 pub struct ModelTierConfig {
     pub base_url: String,
     #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
     pub api_key_masked: String,
     pub fast_model: String,
     pub deep_model: String,
@@ -79,6 +81,7 @@ impl Default for EngineConfig {
         Self {
             model: ModelTierConfig {
                 base_url: String::new(),
+                api_key: String::new(),
                 api_key_masked: String::new(),
                 fast_model: "deepseek-v4-flash".into(),
                 deep_model: "deepseek-v4-pro".into(),

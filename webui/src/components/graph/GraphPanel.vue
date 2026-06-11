@@ -10,8 +10,8 @@ onMounted(() => {
     cy = (window as any).cytoscape({
       container: container.value,
       style: [
-        { selector: 'node', style: { 'background-color': '#3b82f6', 'label': 'data(label)', 'color': '#e2e8f0', 'text-wrap': 'wrap', 'text-max-width': '110px', 'font-size': '9px' } },
-        { selector: 'edge', style: { 'width': 1, 'line-color': '#64748b', 'target-arrow-color': '#64748b', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '7px', 'color': '#94a3b8' } },
+        { selector: 'node', style: { 'background-color': '#7c3aed', 'label': 'data(label)', 'color': '#1a1a2e', 'text-wrap': 'wrap', 'text-max-width': '110px', 'font-size': '9px', 'background-opacity': 0.9 } },
+        { selector: 'edge', style: { 'width': 1.5, 'line-color': '#c4b5e0', 'target-arrow-color': '#a78bda', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '7px', 'color': '#787878' } },
       ],
       layout: { name: 'cose', animate: false, idealEdgeLength: 80, nodeRepulsion: 4000 },
     })
@@ -39,5 +39,5 @@ function updateGraph() {
 </template>
 
 <style scoped>
-.graph-panel { flex: 1; min-height: 300px; }
+.graph-panel { flex: 1; min-height: 300px; background: var(--bg); border-radius: var(--radius); }
 </style>

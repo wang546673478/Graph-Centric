@@ -10,9 +10,10 @@ pub async fn get_config(
     State(state): State<Arc<WebState>>,
 ) -> Json<EngineConfig> {
     let mut cfg = state.config.engine.clone();
-    // Mask API key in response.
-    if !cfg.model.api_key_masked.is_empty() {
-        cfg.model.api_key_masked = mask_key(&cfg.model.api_key_masked);
+    if !cfg.model.api_key.is_empty() {
+        cfg.model.api_key_masked = mask_key(&cfg.model.api_key);
+    } else {
+        cfg.model.api_key_masked = String::new();
     }
     Json(cfg)
 }
@@ -28,7 +29,9 @@ pub async fn post_config(
             config.model.base_url = v.to_string();
         }
         if let Some(v) = model.get("api_key_masked").and_then(|v| v.as_str()) {
-            config.model.api_key_masked = v.to_string();
+            if v != "***" && !v.is_empty() {
+                config.model.api_key = v.to_string();
+            }
         }
         if let Some(v) = model.get("fast_model").and_then(|v| v.as_str()) {
             config.model.fast_model = v.to_string();
@@ -51,18 +54,29 @@ pub async fn post_config(
         }
     }
 
-    // Config takes effect on next run. Mask key in response.
+    // Set env vars so ModelConfig::load() picks them up for subsequent runs.
+    // Safety: single-threaded web server, no concurrent access.
+    if !config.model.base_url.is_empty() {
+        unsafe { std::env::set_var("MODEL_BASE_URL", &config.model.base_url); }
+    }
+    if !config.model.api_key.is_empty() {
+        unsafe { std::env::set_var("MODEL_API_KEY", &config.model.api_key); }
+    }
+    unsafe {
+        std::env::set_var("MODEL_NAME_FAST", &config.model.fast_model);
+        std::env::set_var("MODEL_NAME_DEEP", &config.model.deep_model);
+    }
+
+    // Mask key in response.
     let mut response = config.clone();
-    if !response.model.api_key_masked.is_empty() {
-        response.model.api_key_masked = mask_key(&response.model.api_key_masked);
+    if !response.model.api_key.is_empty() {
+        response.model.api_key_masked = mask_key(&response.model.api_key);
     }
 
     Ok(Json(response))
 }
 
 fn mask_key(key: &str) -> String {
-    if key.len() <= 8 {
-        return "***".to_string();
-    }
+    if key.len() <= 8 { return "***".to_string(); }
     format!("{}***{}", &key[..4], &key[key.len() - 4..])
 }
