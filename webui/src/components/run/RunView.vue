@@ -77,7 +77,7 @@ async function submitTask(task: string) {
   <div class="run-view">
     <div class="chat-panel">
       <Transcript :messages="transcript" :status="status" :error="errorMsg" />
-      <Composer :disabled="sending || status === 'Running'" @send="submitTask" />
+      <Composer :disabled="sending" @send="submitTask" />
     </div>
     <div class="side-panel">
       <div class="tabs">
