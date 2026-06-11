@@ -28,7 +28,13 @@ impl WebConfig {
             .map(|p| format!("0.0.0.0:{p}"))
             .unwrap_or_else(|| "0.0.0.0:8080".to_string());
         let static_dir = std::env::var("WEB_STATIC_DIR")
-            .unwrap_or_else(|_| "webui".to_string());
+            .unwrap_or_else(|_| {
+                if std::path::Path::new("webui/dist").exists() {
+                    "webui/dist".to_string()
+                } else {
+                    "webui".to_string()
+                }
+            });
         let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         Self {
             bind_addr,
@@ -77,12 +83,15 @@ pub struct LoopTuningConfig {
 }
 
 impl EngineConfig {
-    const CONFIG_FILE: &str = ".graph_harness_config.json";
-
     /// Load config from disk, falling back to env vars + defaults.
     pub fn load() -> Self {
-        let path = std::path::Path::new(Self::CONFIG_FILE);
-        if path.exists() {
+        // Try project-relative path first, then cwd-relative.
+        let candidates = [
+            std::path::PathBuf::from(".graph_harness_config.json"),
+            std::env::current_dir().unwrap_or_default().join(".graph_harness_config.json"),
+        ];
+        let path = candidates.iter().find(|p| p.exists());
+        if let Some(path) = path {
             if let Ok(json) = std::fs::read_to_string(path) {
                 if let Ok(cfg) = serde_json::from_str(&json) {
                     return cfg;
@@ -110,7 +119,9 @@ impl EngineConfig {
     /// Persist config to disk.
     pub fn save(&self) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(Self::CONFIG_FILE, json)
+        // Write to cwd so the next load() finds it regardless of how the server was started.
+        let path = std::env::current_dir()?.join(".graph_harness_config.json");
+        std::fs::write(&path, json)
     }
 }
 

@@ -9,7 +9,8 @@ use std::sync::Arc;
 pub async fn get_config(
     State(state): State<Arc<WebState>>,
 ) -> Json<EngineConfig> {
-    let mut cfg = state.config.engine.clone();
+    // Re-read from disk so saved config survives page refresh.
+    let mut cfg = EngineConfig::load();
     if !cfg.model.api_key.is_empty() {
         cfg.model.api_key_masked = mask_key(&cfg.model.api_key);
     } else {
