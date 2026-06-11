@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted } from 'vue'
-import { activeRunId, runs, findRun, createRun, useRunSocket, detailMode, WSEvent, getRunStore } from '../../composables/useRunSocket'
+import { activeRunId, runs, findRun, createRun, useRunSocket, detailMode, WSEvent, getRunStore, loadRunData } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 import Transcript from './Transcript.vue'
 import Composer from './Composer.vue'
@@ -27,7 +27,7 @@ function connectToRun(id: string) {
   if (socket) socket.disconnect()
 
   socket = useRunSocket(id, (e: WSEvent) => {
-    const d = e.data || e  // backend nests inside "data", backward compat
+    const d = e.data || e
     switch (e.type) {
       case 'transcript': s.transcript.push({ role: d.role || 'assistant', content: d.content || '' }); break
       case 'graph': case 'graph_snapshot': if (d.nodes) s.nodes = d.nodes; if (d.edges) s.edges = d.edges; break
@@ -39,6 +39,9 @@ function connectToRun(id: string) {
       case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` }); break
     }
   })
+
+  // Backfill: load checkpoint data for events that happened before WS connected.
+  loadRunData(id)
 }
 
 // When activeRunId changes from sidebar, switch to that run.
