@@ -1,9 +1,8 @@
-import { ref, reactive, onUnmounted, computed } from 'vue'
+import { ref, reactive, onUnmounted } from 'vue'
 
 // ---- types ----
 export interface WSEvent {
-  type: string
-  data?: any
+  type: string; data?: any
   role?: string; content?: string
   nodes?: any[]; edges?: any[]
   phase?: string; message?: string; tokens_used?: number
@@ -11,14 +10,44 @@ export interface WSEvent {
   verdict?: string; rationale?: string
   index?: number; round?: number; node_count?: number; edge_count?: number
   changed_node?: string; predecessor?: string; depth?: number
+  component?: string; model_name?: string; tier?: string
+  request_preview?: string; response_content?: string
+  finish_reason?: string; prompt_tokens?: number; completion_tokens?: number; duration_ms?: number
 }
 
-export interface RunState {
+export interface RunData {
   id: string; task: string; status: string
   duration_sec: number; tokensUsed: number
   transcript: { role: string; content: string }[]
   nodes: any[]; edges: any[]
   error: string | null
+}
+
+// ---- global state (survives navigation) ----
+export const runs = ref<RunData[]>([])
+export const activeRunId = ref<string | null>(null)
+export const detailMode = ref(false)
+
+// Per-run reactive data store — keyed by run ID.
+const runStores = new Map<string, {
+  transcript: { role: string; content: string }[]
+  nodes: any[]; edges: any[]
+  status: string; tokensUsed: number; error: string
+}>()
+
+function getStore(id: string) {
+  if (!runStores.has(id)) {
+    runStores.set(id, reactive({
+      transcript: [] as { role: string; content: string }[],
+      nodes: [] as any[], edges: [] as any[],
+      status: 'idle', tokensUsed: 0, error: '',
+    }))
+  }
+  return runStores.get(id)!
+}
+
+export function getRunStore(id: string) {
+  return runStores.get(id) || null
 }
 
 // ---- WS connection ----
@@ -61,51 +90,46 @@ export const api = {
   del: (path: string) => fetch(path, { method: 'DELETE' }).then(r => r.json()),
 }
 
-// ---- global run list ----
-export const runs = ref<RunState[]>([])
-export const activeRunId = ref<string | null>(null)
-export const detailMode = ref(false)
-
+// ---- run management ----
 export function createRun(task: string): Promise<{ id: string }> {
   return api.post('/api/runs', { task })
 }
 
 export async function loadRuns() {
   const raw = await api.get('/api/runs')
-  runs.value = raw.map((r: any) => ({
-    id: r.id, task: r.task, status: statusLabel(r.status),
-    duration_sec: Math.round((r.duration_ms || 0) / 1000),
-    tokensUsed: 0, transcript: [], nodes: [], edges: [], error: null,
-  }))
+  runs.value = raw.map((r: any) => {
+    const id = r.id
+    const existing = runStores.get(id)
+    return {
+      id, task: r.task, status: statusLabel(r.status),
+      duration_sec: Math.round((r.duration_ms || 0) / 1000),
+      tokensUsed: existing?.tokensUsed || 0,
+      transcript: existing?.transcript || [],
+      nodes: existing?.nodes || [],
+      edges: existing?.edges || [],
+      error: existing?.error || null,
+    }
+  })
 }
 
-export function findRun(id: string) { return runs.value.find(r => r.id === id) }
+export function findRun(id: string): RunData | undefined {
+  return runs.value.find(r => r.id === id)
+}
 
 function statusLabel(s: any): string {
   if (!s) return 'unknown'
   if (typeof s === 'string') return s.toLowerCase()
-  // axum enum variants: {"Running":null} etc
   const keys = Object.keys(s)
-  return keys[0]?.toLowerCase() || 'unknown'
+  const k = keys[0]?.toLowerCase() || 'unknown'
+  if (k === 'error') return 'Error'
+  if (k === 'running') return 'Running'
+  if (k === 'paused') return 'Paused'
+  if (k === 'done') return 'Done'
+  if (k === 'cancelled') return 'Cancelled'
+  if (k === 'graphinvalid') return 'GraphInvalid'
+  return k
 }
 
 export function toggleDetailMode() {
   detailMode.value = !detailMode.value
-}
-
-// ---- Cytoscape helpers ----
-export function initCytoscape(container: HTMLElement, nodes: any[], edges: any[]) {
-  const cy = (window as any).cytoscape({
-    container,
-    elements: [
-      ...nodes.map((n: any) => ({ data: { id: n.id, label: n.summary || n.id } })),
-      ...edges.map((e: any, i: number) => ({ data: { id: `e${i}`, source: e.source, target: e.target, label: e.relation } })),
-    ],
-    style: [
-      { selector: 'node', style: { 'background-color': '#3b82f6', 'label': 'data(label)', 'color': '#e2e8f0', 'text-wrap': 'wrap', 'text-max-width': '120px', 'font-size': '9px' } },
-      { selector: 'edge', style: { 'width': 1, 'line-color': '#64748b', 'target-arrow-color': '#64748b', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '7px', 'color': '#94a3b8' } },
-    ],
-    layout: { name: 'cose', animate: false, idealEdgeLength: 80, nodeRepulsion: 4000 },
-  })
-  return cy
 }
