@@ -54,15 +54,42 @@ watch(activeRunId, (id) => {
 async function submitTask(task: string) {
   if (sending.value) return
   sending.value = true
+
+  // If viewing a paused run, send the answer to resume it.
+  const curId = activeRunId.value
+  const curStore = curId ? getRunStore(curId) : null
+  if (curId && curStore && curStore.status === 'Paused') {
+    try {
+      await fetch(`/api/runs/${curId}/answer`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ answer: task }),
+      })
+      curStore.transcript.push({ role: 'user', content: task })
+      curStore.status = 'Running'
+    } catch (e: any) { curStore.error = String(e) }
+    sending.value = false
+    return
+  }
+
+  // Otherwise create a new run. If viewing a completed run, seed with its context.
   try {
-    const { id } = await createRun(task)
+    const body: any = { task }
+    if (curId && curStore && curStore.transcript.length) {
+      body.initial_transcript = curStore.transcript.map(m => ({ role: m.role, content: m.content }))
+      if (curStore.nodes.length || curStore.edges.length) {
+        body.initial_graph = { nodes: curStore.nodes, edges: curStore.edges }
+      }
+    }
+    const resp = await fetch('/api/runs', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json())
+    const id = resp.id
     activeRunId.value = id
-    // Initialize store for this new run.
-    getRunStore(id)
     const s = getRunStore(id)!
     s.status = 'Running'; s.error = ''
     s.transcript = [{ role: 'user', content: task }]
-    s.nodes = []; s.edges = []; s.tokensUsed = 0
+    s.nodes = curStore?.nodes || []; s.edges = curStore?.edges || []; s.tokensUsed = 0
     connectToRun(id)
   } catch (e: any) {
     if (activeRunId.value) {
