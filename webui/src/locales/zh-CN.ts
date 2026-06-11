@@ -6,6 +6,7 @@ export default {
   transcript: { empty: '发送任务以开始构建关系图。', thinking: '思考中…' },
   status: { idle: '空闲', running: '运行中', paused: '已暂停', done: '完成', error: '错误', graphInvalid: '图无效' },
   detail: { label: '详细' },
+  run: { newChat: '新建对话', stop: '停止', placeholder: '输入任务…', send: '发送' },
   settings: {
     title: '引擎配置',
     model: '模型',

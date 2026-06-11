@@ -118,8 +118,7 @@ async function submitTask(task: string) {
     <div class="chat-panel">
       <Transcript :messages="transcript" :status="status" :error="errorMsg" />
       <div class="toolbar">
-        <button class="secondary" @click="newChat">+ New</button>
-        <button v-if="status === 'Running'" class="danger" @click="stopRun">■ Stop</button>
+        <button v-if="status === 'Running'" class="danger" @click="stopRun">{{ t('run.stop') }}</button>
         <span class="run-label" v-if="activeRunId">{{ activeRunId.slice(0,8) }}… · {{ status }}</span>
       </div>
       <Composer :disabled="sending" @send="submitTask" />
