@@ -47,7 +47,7 @@ function getStore(id: string) {
 }
 
 export function getRunStore(id: string) {
-  return runStores.get(id) || null
+  return getStore(id)
 }
 
 // ---- WS connection ----
