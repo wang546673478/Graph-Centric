@@ -99,7 +99,8 @@ pub async fn post_config(
             config.model.base_url = v.to_string();
         }
         if let Some(v) = model.get("api_key_masked").and_then(|v| v.as_str()) {
-            if v != "***" && !v.is_empty() {
+            // Only update if it's a real key, not the masked display form.
+            if !v.is_empty() && !v.contains("***") && v != "***" {
                 config.model.api_key = v.to_string();
             }
         }

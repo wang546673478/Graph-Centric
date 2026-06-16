@@ -9,8 +9,17 @@ const saved = ref(false)
 const showKey = ref(false)
 const modelList = ref<string[]>([])
 const fetching = ref(false)
+const keyDirty = ref(false)
+const origKey = ref('')
 
-onMounted(async () => { try { config.value = await api.get('/api/config') } catch { /* */ } })
+onMounted(async () => {
+  try {
+    config.value = await api.get('/api/config')
+    origKey.value = config.value.model?.api_key_masked || ''
+  } catch { /* */ }
+})
+
+function onKeyInput() { keyDirty.value = true }
 
 async function fetchModels() {
   const baseUrl = config.value.model?.base_url?.trim()
@@ -26,8 +35,16 @@ async function fetchModels() {
 }
 
 async function save() {
-  try { await api.post('/api/config', config.value); saved.value = true; setTimeout(() => saved.value = false, 2000) }
-  catch (e) { alert(String(e)) }
+  if (!keyDirty.value) {
+    // Don't overwrite the real key with the masked display value.
+    config.value.model.api_key_masked = origKey.value
+  }
+  try {
+    config.value = await api.post('/api/config', config.value)
+    origKey.value = config.value.model?.api_key_masked || ''
+    keyDirty.value = false
+    saved.value = true; setTimeout(() => saved.value = false, 2000)
+  } catch (e) { alert(String(e)) }
 }
 </script>
 
@@ -46,7 +63,7 @@ async function save() {
       </div>
       <label>API Key
         <div class="key-row">
-          <input :type="showKey ? 'text' : 'password'" v-model="config.model.api_key_masked" placeholder="sk-…" />
+          <input :type="showKey ? 'text' : 'password'" v-model="config.model.api_key_masked" placeholder="sk-…" @input="onKeyInput" />
           <button class="secondary" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button>
         </div>
       </label>
