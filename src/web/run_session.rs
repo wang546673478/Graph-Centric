@@ -36,6 +36,8 @@ pub struct RunSession {
     pub captured_skill: tokio::sync::RwLock<Option<SkillRef>>,
     /// v2: per-run checkpoint store for branching and replay.
     pub checkpoints: tokio::sync::Mutex<CheckpointStore>,
+    /// Cumulative tokens used across all model calls in this run.
+    pub tokens_used: tokio::sync::Mutex<u64>,
 }
 
 /// Run state visible to the API and the UI.
@@ -73,6 +75,7 @@ impl RunSession {
             last_review: tokio::sync::RwLock::new(None),
             captured_skill: tokio::sync::RwLock::new(None),
             checkpoints: tokio::sync::Mutex::new(CheckpointStore::new()),
+            tokens_used: tokio::sync::Mutex::new(0),
         }
     }
 
@@ -136,12 +139,14 @@ impl RunSession {
     pub async fn metadata(&self) -> RunMetadata {
         let status = self.status.read().await.clone();
         let duration_ms = self.started_at.elapsed().as_millis() as u64;
+        let tokens_used = *self.tokens_used.lock().await;
         RunMetadata {
             id: self.id.clone(),
             task: self.task.clone(),
             status,
             duration_ms,
             captured_skill: self.captured_skill.read().await.clone(),
+            tokens_used,
         }
     }
 }
@@ -155,6 +160,9 @@ pub struct RunMetadata {
     pub status: RunStatus,
     pub duration_ms: u64,
     pub captured_skill: Option<SkillRef>,
+    /// Tokens consumed by this run (cumulative from graph loop).
+    #[serde(default)]
+    pub tokens_used: u64,
 }
 
 // RunStatus also needs Serialize/Deserialize for persistence. Add here.

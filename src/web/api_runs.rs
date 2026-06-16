@@ -562,6 +562,9 @@ async fn drive_run(
             crate::agent::graph_loop::LoopState::Error(_) => ("error", "loop error".into()),
             crate::agent::graph_loop::LoopState::TaskFailed { .. } => ("task_failed", "sub-task failed".into()),
         };
+        // Sync tokens to session for usage stats.
+        *session.tokens_used.lock().await = gl.tokens_used;
+
         session.emit(RunEvent::Status {
             phase: status_phase.into(),
             message: status_msg,
@@ -857,6 +860,66 @@ fn step_transcripts(
     }
 
     out
+}
+
+// --- Usage endpoint ---
+
+#[derive(serde::Serialize)]
+pub struct UsageStats {
+    total_tokens: u64,
+    total_runs: usize,
+    model_breakdown: std::collections::HashMap<String, ModelUsage>,
+    runs: Vec<RunUsage>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ModelUsage {
+    calls: u64,
+    tokens: u64,
+}
+
+#[derive(serde::Serialize)]
+pub struct RunUsage {
+    id: String,
+    task: String,
+    status: String,
+    tokens: u64,
+    duration_ms: u64,
+}
+
+pub async fn get_usage(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<UsageStats>, ApiError> {
+    let runs = state.runs.read().await;
+    let mut total_tokens: u64 = 0;
+    let mut model_breakdown = std::collections::HashMap::new();
+    let mut run_list = Vec::new();
+
+    for s in runs.values() {
+        let meta = s.metadata().await;
+        let tokens = meta.tokens_used;
+        total_tokens += tokens;
+        run_list.push(RunUsage {
+            id: meta.id.clone(),
+            task: meta.task.clone(),
+            status: format!("{:?}", meta.status),
+            tokens,
+            duration_ms: meta.duration_ms,
+        });
+        // Collect model usage from config (what's currently configured).
+        let model_key = format!("fast:{} deep:{}",
+            state.config.engine.model.fast_model,
+            state.config.engine.model.deep_model,
+        );
+        model_breakdown.entry(model_key).or_insert(ModelUsage { calls: 0, tokens: 0 }).tokens += tokens;
+    }
+
+    Ok(Json(UsageStats {
+        total_tokens,
+        total_runs: runs.len(),
+        model_breakdown,
+        runs: run_list,
+    }))
 }
 
 #[cfg(test)]

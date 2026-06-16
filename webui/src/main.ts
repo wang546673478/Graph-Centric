@@ -6,11 +6,13 @@ import HistoryView from './components/history/HistoryView.vue'
 import SkillsView from './components/skills/SkillsView.vue'
 import FilesView from './components/files/FilesView.vue'
 import SettingsView from './components/config/SettingsView.vue'
+import UsageView from './components/usage/UsageView.vue'
 import './styles/main.css'
 
 const routes = [
   { path: '/', component: RunView },
   { path: '/runs', component: HistoryView },
+  { path: '/usage', component: UsageView },
   { path: '/skills', component: SkillsView },
   { path: '/files', component: FilesView },
   { path: '/settings', component: SettingsView },
