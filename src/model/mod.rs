@@ -40,9 +40,17 @@ pub struct ModelRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelResponse {
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: FinishReason,
     pub usage: Usage,
+}
+
+impl ModelResponse {
+    pub fn new(content: impl Into<String>, finish_reason: FinishReason, usage: Usage) -> Self {
+        Self { content: content.into(), reasoning_content: None, tool_calls: vec![], finish_reason, usage }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,13 +74,21 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: usize,
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: usize,
 }
 
 /// A chunk of streaming output — either a content delta or a terminal done signal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum StreamDelta {
-    Delta { content: String },
+    Delta {
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+    },
     Done { finish_reason: FinishReason, usage: Usage },
 }
 
@@ -91,6 +107,7 @@ pub trait Model: Send + Sync {
         let resp = self.complete(request).await?;
         let _ = tx.send(StreamDelta::Delta {
             content: resp.content.clone(),
+            reasoning_content: resp.reasoning_content.clone(),
         });
         let _ = tx.send(StreamDelta::Done {
             finish_reason: resp.finish_reason,

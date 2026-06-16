@@ -298,11 +298,13 @@ impl Model for OpenAICompatModel {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                ..Default::default()
             })
             .unwrap_or_default();
 
         Ok(ModelResponse {
             content,
+            reasoning_content: None,
             tool_calls,
             finish_reason,
             usage,
@@ -385,6 +387,7 @@ impl Model for OpenAICompatModel {
                                 full_content.push_str(content);
                                 let _ = tx.send(crate::model::StreamDelta::Delta {
                                     content: content.to_string(),
+                                    reasoning_content: None,
                                 });
                             }
                         }
@@ -403,6 +406,8 @@ impl Model for OpenAICompatModel {
                         prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as usize,
                         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as usize,
                         total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as usize,
+                        prompt_cache_hit_tokens: u["prompt_cache_hit_tokens"].as_u64().unwrap_or(0) as usize,
+                        prompt_cache_miss_tokens: u["prompt_cache_miss_tokens"].as_u64().unwrap_or(0) as usize,
                     };
                 }
             }
@@ -410,6 +415,7 @@ impl Model for OpenAICompatModel {
 
         Ok(ModelResponse {
             content: full_content,
+            reasoning_content: None,
             tool_calls: Vec::new(),
             finish_reason,
             usage,
