@@ -147,6 +147,27 @@ impl Decomposer {
         );
         Ok(task_graph)
     }
+
+    /// Expand complex nodes: for every node in `involved_nodes` that has
+    /// `Contains` sub-nodes (expanded=true), add those sub-nodes to the
+    /// involved list. This enables function-level granularity.
+    pub fn expand_involved_nodes(world_graph: &Graph, involved: &[NodeId]) -> Vec<NodeId> {
+        let mut expanded = involved.to_vec();
+        for id in involved {
+            // Collect child nodes via Contains edges.
+            let children: Vec<NodeId> = world_graph
+                .outgoing(id)
+                .filter(|e| e.relation == RelationType::Contains)
+                .map(|e| e.target.clone())
+                .collect();
+            for child in &children {
+                if !expanded.contains(child) {
+                    expanded.push(child.clone());
+                }
+            }
+        }
+        expanded
+    }
 }
 
 // ---------------------------------------------------------------------------

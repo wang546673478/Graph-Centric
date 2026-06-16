@@ -1,31 +1,17 @@
-//! Phase 1 code-domain scanner.
+//! Code-domain scanner — file discovery, import edges, and symbol extraction.
 //!
-//! Walks a directory tree, builds `File` nodes, and extracts import edges.
+//! ## Fractal architecture (v2)
 //!
-//! ### Resolution strategy
-//!
-//! Imports are language-aware on the *extraction* side and best-effort on the
-//! *resolution* side:
-//!
-//! - For `.rs` files: parse `use` statements, expand brace groups, normalize
-//!   `crate::`/`super::`/`self::` prefixes to repo-relative paths, then look
-//!   for `path.rs` or `path/mod.rs`. External crates (`std`, `tokio`, …) are
-//!   skipped — they can't appear in the world graph because they aren't
-//!   nodes.
-//!
-//! - For other extensions: a generic line-scanner picks up Python `from …
-//!   import`, JS/TS `import … from "…"`, and `require(…)`. Resolution falls
-//!   back to substring matching.
-//!
-//! This is **not** a real AST parser. The point is to ship something that
-//! already produces a useful starting graph end to end. Phase 2's model
-//! enrichment + a proper `syn`/`tree-sitter` parser will replace this behind
-//! the same `Scanner` trait.
+//! For every supported source file, the scanner extracts top-level symbols
+//! (functions, classes, methods) using language-aware regex patterns. Each
+//! symbol becomes a child node of the file node via a `Contains` edge, with
+//! `line_start`/`line_end` metadata for granular L2 loading.
 
 use crate::domain::Scanner;
 use crate::error::{HarnessError, Result};
-use crate::graph::{Edge, Graph, Node, NodeId, RelationType};
+use crate::graph::{Edge, Graph, Node, NodeId, NodeKind, RelationType};
 use async_trait::async_trait;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -129,8 +115,6 @@ impl Scanner for CodeScanner {
         }
 
         for ((source, target), raws) in edge_evidence {
-            // Cap evidence text length so a heavily-imported module doesn't
-            // generate an unbounded string.
             let n = raws.len();
             let shown = raws.iter().take(4).cloned().collect::<Vec<_>>().join(", ");
             let evidence = if n > 4 {
@@ -142,12 +126,64 @@ impl Scanner for CodeScanner {
                 source,
                 target,
                 RelationType::Imports,
-                0.6, // regex-grade: low confidence; Phase 2 model will revise
+                0.6,
                 evidence,
             ));
         }
 
+        // Pass 3: symbol extraction — Function/Class sub-nodes with Contains edges.
+        for f in &files {
+            let rel = relativize(&root, f);
+            let ext = f.extension().and_then(|s| s.to_str()).unwrap_or("");
+            let source_text = match std::fs::read_to_string(f) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let parent_id = NodeId::from(rel.as_str());
+            let symbols = extract_symbols_for_ext(&source_text, ext);
+            if symbols.is_empty() {
+                continue;
+            }
+            // Mark parent as expanded.
+            if let Some(parent) = graph.nodes.get_mut(&parent_id) {
+                parent.expanded = true;
+            }
+            for sym in &symbols {
+                let sym_id = NodeId::from(format!("{}:{}", rel, sym.name));
+                let kind = match sym.kind {
+                    SymbolKind::Function => NodeKind::Function,
+                    SymbolKind::Class | SymbolKind::Method => NodeKind::Class,
+                };
+                let summary = format!("{} (lines {}-{})", sym.name, sym.line_start, sym.line_end);
+                let mut node = Node::new(sym_id.clone(), kind, rel.clone(), summary);
+                node.metadata
+                    .insert("line_start".into(), serde_json::json!(sym.line_start));
+                node.metadata
+                    .insert("line_end".into(), serde_json::json!(sym.line_end));
+                graph.add_node(node);
+                graph
+                    .add_edge(Edge::new(
+                        parent_id.clone(),
+                        sym_id,
+                        RelationType::Contains,
+                        0.9,
+                        format!("{} definition", sym.kind.kind_str()),
+                    ))
+                    .ok();
+            }
+        }
+
         Ok(graph)
+    }
+}
+
+impl SymbolKind {
+    fn kind_str(&self) -> &str {
+        match self {
+            Self::Function => "function",
+            Self::Class => "class",
+            Self::Method => "method",
+        }
     }
 }
 
@@ -324,6 +360,186 @@ pub fn extract_generic_imports(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Symbol extraction (v2: fractal architecture)
+// ---------------------------------------------------------------------------
+
+/// A top-level symbol extracted from a source file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Symbol {
+    pub name: String,
+    pub kind: SymbolKind,
+    pub line_start: usize,
+    pub line_end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolKind {
+    Function,
+    Class,
+    Method,
+}
+
+/// Dispatch symbol extraction by extension.
+pub fn extract_symbols_for_ext(text: &str, ext: &str) -> Vec<Symbol> {
+    match ext {
+        "rs" => extract_rust_symbols(text),
+        "py" => extract_python_symbols(text),
+        "js" | "ts" | "jsx" | "tsx" => extract_js_ts_symbols(text),
+        "go" => extract_go_symbols(text),
+        "java" | "kt" | "scala" => extract_java_style_symbols(text),
+        _ => Vec::new(), // Other languages: only file-level for now
+    }
+}
+
+/// Rust: fn, pub fn, async fn, impl blocks, struct, enum, trait
+fn extract_rust_symbols(text: &str) -> Vec<Symbol> {
+    let re = Regex::new(
+        r"(?m)^\s*(?:pub(?:\s*\(\s*crate\s*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)"
+    ).unwrap();
+    let struct_re = Regex::new(r"(?m)^\s*(?:pub\s+)?struct\s+(\w+)").unwrap();
+    let impl_re = Regex::new(r"(?m)^\s*impl\s+(?:[\w:<>,& ]+\s+)?(?:for\s+)?(\w+)").unwrap();
+
+    let regions = find_symbol_regions(text);
+    let mut symbols = Vec::new();
+
+    for (re_name, kind) in &[
+        (&re, SymbolKind::Function),
+        (&struct_re, SymbolKind::Class),
+        (&impl_re, SymbolKind::Class),
+    ] {
+        for cap in re_name.captures_iter(text) {
+            if let Some(name) = cap.get(1) {
+                let name_str = name.as_str().to_string();
+                let line = text[..name.start()].lines().count() + 1;
+                let (start, end) = find_region(line, &regions);
+                symbols.push(Symbol { name: name_str, kind: kind.clone(), line_start: start, line_end: end });
+            }
+        }
+    }
+    symbols.dedup_by(|a, b| a.name == b.name && a.line_start == b.line_start);
+    symbols
+}
+
+/// Python: def and class
+fn extract_python_symbols(text: &str) -> Vec<Symbol> {
+    let re = Regex::new(r"(?m)^\s*(?:async\s+)?def\s+(\w+)").unwrap();
+    let class_re = Regex::new(r"(?m)^\s*class\s+(\w+)").unwrap();
+    let regions = find_symbol_regions(text);
+    let mut symbols = Vec::new();
+    for (r, kind) in &[(re, SymbolKind::Function), (class_re, SymbolKind::Class)] {
+        for cap in r.captures_iter(text) {
+            if let Some(name) = cap.get(1) {
+                let name_str = name.as_str().to_string();
+                let line = text[..name.start()].lines().count() + 1;
+                let (start, end) = find_region(line, &regions);
+                symbols.push(Symbol { name: name_str, kind: kind.clone(), line_start: start, line_end: end });
+            }
+        }
+    }
+    symbols.dedup_by(|a, b| a.name == b.name && a.line_start == b.line_start);
+    symbols
+}
+
+/// JS/TS: function, class, arrow functions, methods
+fn extract_js_ts_symbols(text: &str) -> Vec<Symbol> {
+    let re = Regex::new(
+        r"(?m)^\s*(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(|class\s+(\w+))"
+    ).unwrap();
+    let regions = find_symbol_regions(text);
+    let mut symbols = Vec::new();
+    for cap in re.captures_iter(text) {
+        let name = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3));
+        if let Some(name) = name {
+            let name_str = name.as_str().to_string();
+            let line = text[..name.start()].lines().count() + 1;
+            let kind = if cap.get(3).is_some() { SymbolKind::Class } else { SymbolKind::Function };
+            let (start, end) = find_region(line, &regions);
+            symbols.push(Symbol { name: name_str, kind, line_start: start, line_end: end });
+        }
+    }
+    symbols.dedup_by(|a, b| a.name == b.name && a.line_start == b.line_start);
+    symbols
+}
+
+/// Go: func
+fn extract_go_symbols(text: &str) -> Vec<Symbol> {
+    let re = Regex::new(r"(?m)^func\s+(?:\(\s*\w+\s+\*?\w+\s*\)\s+)?(\w+)").unwrap();
+    let regions = find_symbol_regions(text);
+    let mut symbols = Vec::new();
+    for cap in re.captures_iter(text) {
+        if let Some(name) = cap.get(1) {
+            let name_str = name.as_str().to_string();
+            let line = text[..name.start()].lines().count() + 1;
+            let (start, end) = find_region(line, &regions);
+            symbols.push(Symbol { name: name_str, kind: SymbolKind::Function, line_start: start, line_end: end });
+        }
+    }
+    symbols
+}
+
+/// Java/Kotlin/Scala: class, interface, fun, def
+fn extract_java_style_symbols(text: &str) -> Vec<Symbol> {
+    let re = Regex::new(
+        r"(?m)^\s*(?:public\s+|private\s+|protected\s+)?(?:static\s+)?(?:[\w<>\[\],\s]+\s+)?(\w+)\s*\([^)]*\)\s*(?:\{|throws)"
+    ).unwrap();
+    let class_re = Regex::new(r"(?m)^\s*(?:public\s+)?(?:class|interface|object|enum)\s+(\w+)").unwrap();
+    let regions = find_symbol_regions(text);
+    let mut symbols = Vec::new();
+    for (r, kind) in &[(class_re, SymbolKind::Class), (re, SymbolKind::Function)] {
+        for cap in r.captures_iter(text) {
+            if let Some(name) = cap.get(1) {
+                let name_str = name.as_str().to_string();
+                let line = text[..name.start()].lines().count() + 1;
+                let (start, end) = find_region(line, &regions);
+                symbols.push(Symbol { name: name_str, kind: kind.clone(), line_start: start, line_end: end });
+            }
+        }
+    }
+    symbols.dedup_by(|a, b| a.name == b.name && a.line_start == b.line_start);
+    symbols
+}
+
+/// Braces-based region detection: for each line number, find the enclosing
+/// `{...}` scope using a simple brace-counting algorithm.
+fn find_symbol_regions(text: &str) -> Vec<(usize, usize)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+
+    let mut depth = 0;
+    for (i, line) in lines.iter().enumerate() {
+        let open = line.chars().filter(|&c| c == '{' || c == '(' || c == '[').count();
+        let close = line.chars().filter(|&c| c == '}' || c == ')' || c == ']').count();
+        if depth == 0 && open > 0 {
+            stack.push(i + 1); // 1-based line number
+        }
+        depth = (depth + open).saturating_sub(close);
+        if depth == 0 && !stack.is_empty() {
+            regions.push((stack.pop().unwrap(), i + 1));
+            // Also close all pending scopes at depth 0
+            while !stack.is_empty() {
+                let s = stack.pop().unwrap();
+                regions.push((s, i + 1));
+            }
+        }
+    }
+    // Close any remaining open scopes at end of file
+    for s in stack {
+        regions.push((s, lines.len()));
+    }
+    regions.sort_by_key(|(s, _)| *s);
+    regions
+}
+
+fn find_region(line: usize, regions: &[(usize, usize)]) -> (usize, usize) {
+    regions
+        .iter()
+        .find(|(s, e)| *s <= line && line <= *e)
+        .copied()
+        .unwrap_or((line, line + 5))
 }
 
 // ---------------------------------------------------------------------------

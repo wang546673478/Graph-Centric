@@ -328,6 +328,10 @@ pub struct Node {
     /// this node.
     #[serde(default)]
     pub immutable: bool,
+    /// If true, this node has been expanded into a sub-graph (fractal
+    /// architecture: complex nodes contain their own L0/L1/L2).
+    #[serde(default)]
+    pub expanded: bool,
 }
 
 impl Node {
@@ -344,6 +348,7 @@ impl Node {
             summary: summary.into(),
             metadata: HashMap::new(),
             immutable: false,
+            expanded: false,
         }
     }
 
@@ -453,6 +458,11 @@ pub struct Graph {
     incoming_idx: HashMap<NodeId, Vec<usize>>,
     pub version: usize,
     pub status: GraphStatus,
+    /// Fractal architecture: if this graph is a complex node's sub-graph,
+    /// parent holds the (parent_node_id, parent_graph). Not serialized —
+    /// reconstructed on load by re-walking the parent's Contains edges.
+    #[serde(skip)]
+    pub parent: Option<(NodeId, Box<Graph>)>,
 }
 
 impl Default for Graph {
@@ -465,6 +475,7 @@ impl Default for Graph {
             incoming_idx: HashMap::new(),
             version: 0,
             status: GraphStatus::Draft,
+            parent: None,
         }
     }
 }

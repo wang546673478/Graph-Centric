@@ -125,6 +125,16 @@ impl ContextBudget {
 /// `domain` modules so this crate stays domain-agnostic.
 pub trait SourceLoader: Send + Sync {
     fn load(&self, node_id: &NodeId) -> Result<String>;
+
+    /// Load only a line range from the source. Default implementation falls
+    /// back to `load()` and slices lines — overridable for efficiency.
+    fn load_range(&self, node_id: &NodeId, start: usize, end: usize) -> Result<String> {
+        let full = self.load(node_id)?;
+        let lines: Vec<&str> = full.lines().collect();
+        let start_idx = start.saturating_sub(1).min(lines.len());
+        let end_idx = end.min(lines.len());
+        Ok(lines[start_idx..end_idx].join("\n"))
+    }
 }
 
 /// In-memory loader keyed by node id. Useful for tests and for cached
