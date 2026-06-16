@@ -1,10 +1,60 @@
-//! GET/POST /api/config — runtime engine configuration management.
+//! GET/POST /api/config + GET /api/models — runtime configuration + model discovery.
 
 use super::state::EngineConfig;
 use super::errors::ApiError;
 use super::WebState;
-use axum::{extract::State, Json};
+use axum::{extract::{Query, State}, Json};
+use serde::Deserialize;
 use std::sync::Arc;
+
+#[derive(Deserialize)]
+pub struct ModelsQuery {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// Fetch the list of available models from an OpenAI-compatible endpoint.
+pub async fn list_models(
+    Query(q): Query<ModelsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let url = format!("{}/models", q.base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("client error: {e}")))?;
+
+    let mut req = client.get(&url);
+    if !q.api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", q.api_key));
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        ApiError::Internal(format!("failed to reach {url}: {e}"))
+    })?;
+
+    let body = resp.text().await.unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({
+        "error": "invalid JSON response",
+        "raw": body.chars().take(200).collect::<String>(),
+    }));
+
+    // Extract just the model IDs for convenience.
+    let models: Vec<&str> = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "models": models,
+        "raw": json,
+    })))
+}
 
 pub async fn get_config(
     State(state): State<Arc<WebState>>,

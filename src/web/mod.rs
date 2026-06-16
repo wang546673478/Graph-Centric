@@ -78,6 +78,7 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/health", get(api_runs::health))
         .route("/usage", get(api_runs::get_usage))
         .route("/config", get(config_api::get_config).post(config_api::post_config))
+        .route("/models", get(config_api::list_models))
         .route("/runs", get(api_runs::list_runs).post(api_runs::create_run))
         .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))
         .route("/runs/:id/events", get(api_runs::run_events))

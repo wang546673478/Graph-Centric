@@ -7,8 +7,22 @@ const { t } = useI18n()
 const config = ref<any>({ model: {}, policy: {}, loop_tuning: {} })
 const saved = ref(false)
 const showKey = ref(false)
+const modelList = ref<string[]>([])
+const fetching = ref(false)
 
 onMounted(async () => { try { config.value = await api.get('/api/config') } catch { /* */ } })
+
+async function fetchModels() {
+  const baseUrl = config.value.model?.base_url?.trim()
+  if (!baseUrl) return
+  fetching.value = true
+  try {
+    const resp = await fetch(`/api/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(config.value.model?.api_key_masked || '')}`)
+    const data = await resp.json()
+    modelList.value = data.models || []
+  } catch (e) { alert(String(e)) }
+  finally { fetching.value = false }
+}
 
 async function save() {
   try { await api.post('/api/config', config.value); saved.value = true; setTimeout(() => saved.value = false, 2000) }
@@ -23,14 +37,30 @@ async function save() {
     <section>
       <h3>{{ t('settings.model') }}</h3>
       <label>{{ t('settings.baseUrl') }} <input v-model="config.model.base_url" placeholder="https://api.deepseek.com/v1" /></label>
+      <div class="fetch-row">
+        <button class="secondary" @click="fetchModels" :disabled="fetching">
+          {{ fetching ? 'Fetching…' : '🔍 Fetch Models' }}
+        </button>
+        <span v-if="modelList.length" class="hint">{{ modelList.length }} model(s) found</span>
+      </div>
       <label>API Key
         <div class="key-row">
           <input :type="showKey ? 'text' : 'password'" v-model="config.model.api_key_masked" placeholder="sk-…" />
           <button class="secondary" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button>
         </div>
       </label>
-      <label>{{ t('settings.fastModel') }} <input v-model="config.model.fast_model" placeholder="deepseek-v4-flash" /></label>
-      <label>{{ t('settings.deepModel') }} <input v-model="config.model.deep_model" placeholder="deepseek-v4-pro" /></label>
+      <label>{{ t('settings.fastModel') }}
+        <select v-if="modelList.length" v-model="config.model.fast_model">
+          <option v-for="m in modelList" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <input v-else v-model="config.model.fast_model" placeholder="deepseek-v4-flash" />
+      </label>
+      <label>{{ t('settings.deepModel') }}
+        <select v-if="modelList.length" v-model="config.model.deep_model">
+          <option v-for="m in modelList" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <input v-else v-model="config.model.deep_model" placeholder="deepseek-v4-pro" />
+      </label>
     </section>
 
     <section>
@@ -54,10 +84,14 @@ h2 { font-size: 1.3rem; font-weight: 700; margin-bottom: 24px; letter-spacing: -
 section { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; box-shadow: var(--shadow); }
 h3 { color: var(--text-muted); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; font-weight: 600; }
 label { display: block; margin: 10px 0; font-size: 0.82rem; color: var(--text); }
-label input { margin-top: 4px; }
+label input, label select { margin-top: 4px; }
+select { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font-size: 0.85rem; font-family: var(--font); }
 input[type="checkbox"] { width: auto; margin-right: 6px; }
 .key-row { display: flex; gap: 6px; margin-top: 4px; }
 .key-row input { flex: 1; }
 .key-row button { white-space: nowrap; font-size: 0.75rem; padding: 6px 10px; }
+.fetch-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.fetch-row button { font-size: 0.75rem; padding: 5px 12px; }
+.hint { font-size: 0.7rem; color: var(--accent); }
 button.primary { margin-top: 8px; padding: 10px 24px; }
 </style>
