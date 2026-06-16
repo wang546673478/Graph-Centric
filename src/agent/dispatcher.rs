@@ -109,7 +109,8 @@ impl SubAgentPool {
                         crate::tools::ScopeGuard::from_involved_nodes(
                             world_graph.as_ref(),
                             &sub_task.involved_nodes,
-                        ),
+                        )
+                        .restrict_reads(true),
                     );
                     agent.with_task_scope(guard)
                 } else {

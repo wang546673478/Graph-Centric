@@ -21,6 +21,18 @@ const edges = computed(() => store.value?.edges || [])
 const status = computed(() => store.value?.status || 'idle')
 const errorMsg = computed(() => store.value?.error || '')
 
+// Compute scope: nodes with edges in the graph are "in scope".
+const scopeNodeIds = computed(() => {
+  const ns = nodes.value
+  const es = edges.value
+  if (!ns.length || !es.length) return [] as string[]
+  const connected = new Set<string>()
+  for (const e of es) { connected.add(e.source); connected.add(e.target) }
+  // If some nodes have no connections, the graph is likely single-node focus.
+  if (connected.size === 0 && ns.length > 0) return ns.map(n => n.id)
+  return [...connected]
+})
+
 // Connect WS for an active (non-terminal) run.
 function connectToRun(id: string) {
   const s = getRunStore(id)
@@ -145,7 +157,7 @@ async function submitTask(task: string) {
         <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
-      <GraphPanel v-if="tab === 'graph'" :nodes="nodes" :edges="edges" />
+      <GraphPanel v-if="tab === 'graph'" :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
       <DebugTimeline v-else-if="tab === 'debug'" />
       <div v-else class="placeholder">{{ t('files.empty') }}</div>
     </div>
