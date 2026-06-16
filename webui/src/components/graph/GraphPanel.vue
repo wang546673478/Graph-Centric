@@ -4,83 +4,102 @@ import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
 const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[] }>()
 const container = ref<HTMLElement>()
 let cy: any = null
+const breadcrumb = ref<string[]>([])  // stack of node IDs: ['project', 'auth.rs', 'login']
+const selectedNode = ref<any>(null)
+
+// Compute which nodes have Contains children.
+const childMap = computed(() => {
+  const m = new Map<string, string[]>()
+  for (const e of props.edges) {
+    if (e.relation === 'Contains') {
+      if (!m.has(e.source)) m.set(e.source, [])
+      m.get(e.source)!.push(e.target)
+    }
+  }
+  return m
+})
+
+const parentMap = computed(() => {
+  const m = new Map<string, string>()
+  for (const e of props.edges) {
+    if (e.relation === 'Contains') m.set(e.target, e.source)
+  }
+  return m
+})
+
+const hasChildren = (id: string) => childMap.value.has(id)
+
+// Filter nodes/edges to current breadcrumb level.
+const visibleIds = computed(() => {
+  if (breadcrumb.value.length === 0) {
+    // Show only root-level nodes (no Contains parent)
+    const childSet = new Set<string>()
+    for (const ids of childMap.value.values()) {
+      for (const id of ids) childSet.add(id)
+    }
+    return new Set(props.nodes.filter(n => !childSet.has(n.id)).map(n => n.id))
+  }
+  const parentId = breadcrumb.value[breadcrumb.value.length - 1]
+  const children = childMap.value.get(parentId) || []
+  return new Set([parentId, ...children])
+})
+
+const visibleNodes = computed(() =>
+  props.nodes.filter(n => visibleIds.value.has(n.id))
+)
+const visibleEdges = computed(() =>
+  props.edges.filter(e =>
+    visibleIds.value.has(e.source) && visibleIds.value.has(e.target)
+  )
+)
 
 const scopeSet = computed(() => new Set(props.scopeNodeIds || []))
 
+function drillDown(nodeId: string) {
+  if (hasChildren(nodeId)) {
+    breadcrumb.value.push(nodeId)
+    cy?.center(cy.getElementById(nodeId))
+  }
+}
+
+function goToLevel(idx: number) {
+  breadcrumb.value = breadcrumb.value.slice(0, idx + 1)
+}
+
+function goRoot() {
+  breadcrumb.value = []
+  selectedNode.value = null
+}
+
+// ---- Cytoscape ----
 const NODE_COLOR = '#7c3aed'
-const NODE_COLOR_MUTED = '#c4b5e0'
+const COMPLEX_RING = '#f59e0b'
 const SCOPE_COLOR = '#059669'
-const SCOPE_BG = '#d1fae5'
 
 onMounted(() => {
   if (container.value && (window as any).cytoscape) {
     cy = (window as any).cytoscape({
       container: container.value,
       style: [
-        {
-          selector: 'node',
-          style: {
-            'background-color': NODE_COLOR,
-            'label': 'data(label)',
-            'color': '#1a1a2e',
-            'text-wrap': 'wrap',
-            'text-max-width': '110px',
-            'font-size': '9px',
-            'background-opacity': 0.9,
-            'border-width': 1,
-            'border-color': NODE_COLOR,
-          },
-        },
-        {
-          selector: 'node.in-scope',
-          style: {
-            'background-color': SCOPE_COLOR,
-            'border-color': SCOPE_COLOR,
-            'border-width': 2,
-            'text-outline-color': SCOPE_BG,
-            'text-outline-width': 3,
-          },
-        },
-        {
-          selector: 'node.muted',
-          style: {
-            'background-color': NODE_COLOR_MUTED,
-            'background-opacity': 0.4,
-            'border-color': NODE_COLOR_MUTED,
-            'color': '#94a3b8',
-          },
-        },
-        {
-          selector: 'edge',
-          style: {
-            'width': 1.5,
-            'line-color': '#c4b5e0',
-            'target-arrow-color': '#a78bda',
-            'target-arrow-shape': 'triangle',
-            'curve-style': 'bezier',
-            'label': 'data(label)',
-            'font-size': '7px',
-            'color': '#787878',
-          },
-        },
-        {
-          selector: 'edge.in-scope',
-          style: {
-            'line-color': SCOPE_COLOR,
-            'target-arrow-color': SCOPE_COLOR,
-            'width': 2,
-          },
-        },
-        {
-          selector: 'edge.muted',
-          style: {
-            'line-color': '#e0d8f0',
-            'target-arrow-color': '#e0d8f0',
-            'width': 0.8,
-          },
-        },
+        { selector: 'node', style: { 'background-color': NODE_COLOR, 'label': 'data(label)', 'color': '#1a1a2e', 'text-wrap': 'wrap', 'text-max-width': '100px', 'font-size': '9px', 'border-width': 1, 'border-color': NODE_COLOR } },
+        { selector: 'node.in-scope', style: { 'background-color': SCOPE_COLOR, 'border-color': SCOPE_COLOR, 'border-width': 3, 'text-outline-color': '#d1fae5', 'text-outline-width': 2 } },
+        { selector: 'node.complex', style: { 'border-width': 3, 'border-color': COMPLEX_RING, 'border-style': 'double' } },
+        { selector: 'node.selected', style: { 'border-color': '#fff', 'border-width': 3, 'text-outline-color': '#fff', 'text-outline-width': 2 } },
+        { selector: 'edge', style: { 'width': 1.5, 'line-color': '#c4b5e0', 'target-arrow-color': '#a78bda', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '7px', 'color': '#787878' } },
+        { selector: 'edge.in-scope', style: { 'line-color': SCOPE_COLOR, 'target-arrow-color': SCOPE_COLOR, 'width': 2 } },
+        { selector: 'edge.Contains', style: { 'line-style': 'dashed', 'line-color': COMPLEX_RING, 'target-arrow-color': COMPLEX_RING } },
       ],
-      layout: { name: 'cose', animate: false, idealEdgeLength: 80, nodeRepulsion: 4000 },
+      layout: { name: 'cose', animate: true, idealEdgeLength: 100, nodeRepulsion: 6000 },
+    })
+    // Click: drill down or show detail
+    cy.on('tap', 'node', (evt: any) => {
+      const node = evt.target
+      const id = node.id()
+      if (hasChildren(id)) {
+        drillDown(id)
+      } else {
+        selectedNode.value = props.nodes.find(n => n.id === id) || null
+      }
     })
     updateGraph()
   }
@@ -88,53 +107,98 @@ onMounted(() => {
 
 onUnmounted(() => { if (cy) cy.destroy() })
 
-watch(() => [props.nodes, props.edges, props.scopeNodeIds], updateGraph, { deep: true })
+watch(() => [props.nodes, props.edges, props.scopeNodeIds, breadcrumb.value], updateGraph, { deep: true })
 
 function updateGraph() {
   if (!cy) return
   cy.elements().remove()
-  const hasScope = scopeSet.value.size > 0
-
   cy.add([
-    ...props.nodes.map((n: any) => ({
-      data: {
-        id: n.id,
-        label: n.summary || n.id,
-      },
-      classes: hasScope
-        ? (scopeSet.value.has(n.id) ? 'in-scope' : 'muted')
-        : '',
+    ...visibleNodes.value.map((n: any) => ({
+      data: { id: n.id, label: n.summary || n.id },
+      classes: [
+        scopeSet.value.has(n.id) ? 'in-scope' : '',
+        hasChildren(n.id) ? 'complex' : '',
+        selectedNode.value?.id === n.id ? 'selected' : '',
+      ].filter(Boolean).join(' '),
     })),
-    ...props.edges.map((e: any, i: number) => ({
+    ...visibleEdges.value.map((e: any, i: number) => ({
       data: { id: `e${i}`, source: e.source, target: e.target, label: e.relation },
-      classes: hasScope
-        ? (scopeSet.value.has(e.source) && scopeSet.value.has(e.target) ? 'in-scope' : 'muted')
-        : '',
+      classes: [
+        scopeSet.value.has(e.source) && scopeSet.value.has(e.target) ? 'in-scope' : '',
+        e.relation === 'Contains' ? 'Contains' : '',
+      ].filter(Boolean).join(' '),
     })),
   ])
-  cy.layout({ name: 'cose', animate: false }).run()
+  cy.layout({ name: 'cose', animate: true, idealEdgeLength: 100, nodeRepulsion: 6000 }).run()
 }
 </script>
 
 <template>
-  <div class="graph-panel" ref="container">
-    <div v-if="scopeNodeIds && scopeNodeIds.length" class="scope-legend">
-      <span class="dot in"></span> in scope ({{ scopeNodeIds.length }})
-      <span class="dot out"></span> out of scope
+  <div class="graph-container">
+    <!-- Breadcrumb -->
+    <div class="breadcrumb">
+      <button class="bc-btn" @click="goRoot" :class="{ active: !breadcrumb.length }">⬡ Project</button>
+      <template v-for="(id, i) in breadcrumb" :key="id">
+        <span class="bc-sep">›</span>
+        <button class="bc-btn" :class="{ active: i === breadcrumb.length - 1 }" @click="goToLevel(i)">
+          {{ id.length > 24 ? id.slice(0, 24) + '…' : id }}
+        </button>
+      </template>
+      <span class="bc-hint" v-if="breadcrumb.length">
+        · {{ visibleNodes.length }} nodes · {{ visibleEdges.length }} edges
+      </span>
+    </div>
+    <!-- Legend -->
+    <div class="legend-bar">
+      <span class="dot complex"></span> drill-down
+      <span class="dot scope"></span> in scope ({{ scopeNodeIds?.length || 0 }})
+      <span class="dot normal"></span> file/function
+    </div>
+    <!-- Cytoscape canvas -->
+    <div class="graph-canvas" ref="container"></div>
+    <!-- Node detail popup -->
+    <div v-if="selectedNode" class="node-detail">
+      <div class="nd-header">
+        <strong>{{ selectedNode.summary || selectedNode.id }}</strong>
+        <button @click="selectedNode = null" class="nd-close">&times;</button>
+      </div>
+      <div class="nd-body">
+        <div v-if="selectedNode.l1"><b>L1:</b> {{ selectedNode.l1 }}</div>
+        <div v-if="selectedNode.kind"><b>Kind:</b> {{ selectedNode.kind }}</div>
+        <div v-if="hasChildren(selectedNode.id)">
+          <b>Children:</b> {{ childMap.get(selectedNode.id)!.length }} sub-nodes
+          <br><button class="primary" @click="drillDown(selectedNode.id); selectedNode = null">🔍 Drill down</button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-.graph-panel { flex: 1; min-height: 300px; background: var(--bg); border-radius: var(--radius); position: relative; }
-.scope-legend {
-  position: absolute; bottom: 8px; right: 8px; z-index: 10;
-  display: flex; gap: 12px; align-items: center;
-  font-size: 0.65rem; color: var(--text-muted);
-  background: var(--bg-panel); padding: 4px 8px; border-radius: 4px;
-  border: 1px solid var(--border);
+.graph-container { position: relative; flex: 1; display: flex; flex-direction: column; min-height: 0; }
+.breadcrumb {
+  display: flex; align-items: center; gap: 2px; padding: 4px 8px;
+  font-size: 0.7rem; background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  flex-wrap: wrap; min-height: 30px;
 }
-.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; }
-.dot.in { background: #059669; }
-.dot.out { background: #c4b5e0; }
+.bc-btn { background: none; color: var(--text-muted); padding: 2px 6px; font-size: 0.7rem; border-radius: 3px; }
+.bc-btn:hover { color: var(--text); }
+.bc-btn.active { color: var(--accent); font-weight: 600; }
+.bc-sep { color: var(--text-muted); }
+.bc-hint { color: var(--text-muted); font-size: 0.65rem; margin-left: 8px; }
+.legend-bar { display: flex; gap: 12px; align-items: center; padding: 2px 10px; font-size: 0.6rem; color: var(--text-muted); background: var(--bg); border-bottom: 1px solid var(--border); }
+.dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 3px; }
+.dot.complex { background: #f59e0b; border: 1px solid #f59e0b; }
+.dot.scope { background: #059669; }
+.dot.normal { background: #7c3aed; }
+.graph-canvas { flex: 1; min-height: 200px; }
+.node-detail {
+  position: absolute; bottom: 8px; right: 8px; width: 260px; max-height: 200px; overflow-y: auto;
+  background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px; box-shadow: var(--shadow-md); z-index: 20; font-size: 0.72rem;
+}
+.nd-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 6px; }
+.nd-close { background: none; color: var(--text-muted); font-size: 1rem; padding: 0 4px; line-height: 1; }
+.nd-body > div { margin: 3px 0; }
+.nd-body button { margin-top: 4px; font-size: 0.65rem; padding: 3px 8px; }
 </style>
