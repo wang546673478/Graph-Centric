@@ -1,5 +1,6 @@
 //! Per-run checkpoint store for conversation branching and history replay.
 
+use super::persistence::RunPersistence;
 use crate::graph::Graph;
 use crate::model::Message;
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,9 @@ pub struct CheckpointStore {
     checkpoints: Vec<Checkpoint>,
     /// checkpoint_index → [child_run_ids]
     branches: HashMap<usize, Vec<String>>,
+    /// Optional persistence — flushes to disk on push/create_branch.
+    pub persistence: Option<RunPersistence>,
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,7 +53,18 @@ pub struct CheckpointMeta {
 
 impl CheckpointStore {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            checkpoints: Vec::new(),
+            branches: HashMap::new(),
+            persistence: None,
+            run_id: String::new(),
+        }
+    }
+
+    pub fn with_persistence(mut self, p: &RunPersistence, run_id: &str) -> Self {
+        self.persistence = Some(p.clone());
+        self.run_id = run_id.to_string();
+        self
     }
 
     pub fn push(
@@ -66,6 +81,9 @@ impl CheckpointStore {
             graph_snapshot: graph.clone(),
             transcript: transcript.to_vec(),
         };
+        if let Some(ref p) = self.persistence {
+            let _ = p.save_checkpoint(&self.run_id, &cp);
+        }
         self.checkpoints.push(cp);
     }
 
@@ -91,6 +109,9 @@ impl CheckpointStore {
             .entry(from_index)
             .or_default()
             .push(child_run_id);
+        if let Some(ref p) = self.persistence {
+            let _ = p.save_branches(&self.run_id, &self.branches);
+        }
     }
 
     pub fn len(&self) -> usize {

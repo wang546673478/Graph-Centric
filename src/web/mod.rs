@@ -13,6 +13,7 @@ pub mod checkpoint;
 pub mod config_api;
 pub mod errors;
 pub mod events;
+pub mod persistence;
 pub mod run_session;
 pub mod state;
 pub mod ws;
@@ -29,14 +30,39 @@ pub struct WebState {
     pub runs: Arc<tokio::sync::RwLock<std::collections::HashMap<RunId, Arc<run_session::RunSession>>>>,
     pub skills: Arc<dyn SkillStorage>,
     pub config: state::WebConfig,
+    pub persistence: persistence::RunPersistence,
 }
 
 impl WebState {
     pub fn new(skills: Arc<dyn SkillStorage>, config: state::WebConfig) -> Self {
+        let persistence = persistence::RunPersistence::new(&config.project_root);
         Self {
             runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             skills,
             config,
+            persistence,
+        }
+    }
+
+    /// Restore completed runs from disk so the history survives restarts.
+    pub async fn restore_persisted_runs(&self) {
+        match self.persistence.load_all_runs() {
+            Ok(metas) => {
+                let mut runs = self.runs.write().await;
+                for meta in metas {
+                    if !runs.contains_key(&meta.id) {
+                        let session = Arc::new(run_session::RunSession::new(
+                            meta.id.clone(),
+                            meta.task.clone(),
+                        ));
+                        // Override status from persisted metadata.
+                        *session.status.write().await = meta.status.clone();
+                        runs.insert(meta.id.clone(), session);
+                    }
+                }
+                tracing::info!(count = runs.len(), "restored persisted runs");
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to load persisted runs"),
         }
     }
 }

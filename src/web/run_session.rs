@@ -148,7 +148,7 @@ impl RunSession {
 
 /// Public-facing run metadata returned by `GET /api/runs/{id}` and
 /// `GET /api/runs`.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunMetadata {
     pub id: String,
     pub task: String,
@@ -157,7 +157,7 @@ pub struct RunMetadata {
     pub captured_skill: Option<SkillRef>,
 }
 
-// RunStatus also needs Serialize for the API. Add it here.
+// RunStatus also needs Serialize/Deserialize for persistence. Add here.
 impl serde::Serialize for RunStatus {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
@@ -168,6 +168,24 @@ impl serde::Serialize for RunStatus {
             Self::Error(msg) => s.serialize_newtype_variant("RunStatus", 4, "Error", msg),
             Self::Cancelled => s.serialize_newtype_variant("RunStatus", 5, "Cancelled", &()),
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RunStatus {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        if let Some(obj) = v.as_object() {
+            if obj.contains_key("Running") { return Ok(RunStatus::Running); }
+            if obj.contains_key("Paused") { return Ok(RunStatus::Paused); }
+            if obj.contains_key("GraphInvalid") { return Ok(RunStatus::GraphInvalid); }
+            if obj.contains_key("Done") { return Ok(RunStatus::Done); }
+            if let Some(msg) = obj.get("Error").and_then(|v| v.as_str()) {
+                return Ok(RunStatus::Error(msg.to_string()));
+            }
+            if obj.contains_key("Cancelled") { return Ok(RunStatus::Cancelled); }
+        }
+        // Fallback: treat as Done (safe default for restored runs).
+        Ok(RunStatus::Done)
     }
 }
 

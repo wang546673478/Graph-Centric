@@ -329,6 +329,7 @@ async fn drive_run(
                 message: format!("config error: {e}"),
             });
             *session.status.write().await = RunStatus::Error(e.to_string());
+            let _ = state.persistence.save_run_meta(&session.metadata().await);
             return;
         }
     };
@@ -494,10 +495,20 @@ async fn drive_run(
     loop {
         if session.cancel.is_cancelled() {
             *session.status.write().await = RunStatus::Cancelled;
+            let _ = state.persistence.save_run_meta(&session.metadata().await);
             session.emit(RunEvent::Done {
                 final_result: serde_json::json!({"status": "cancelled"}),
             });
             return;
+        }
+
+        // Wire persistence on first access (lazy init).
+        {
+            let mut store = session.checkpoints.lock().await;
+            if store.persistence.is_none() {
+                store.persistence = Some(state.persistence.clone());
+                store.run_id = session.id.clone();
+            }
         }
 
         let state_clone = gl.step().await;
@@ -614,6 +625,8 @@ async fn drive_run(
             }
             LoopState::Done(final_result) => {
                 *session.status.write().await = RunStatus::Done;
+                // Persist run metadata so it survives restarts.
+                let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Done {
                     final_result: serde_json::to_value(&final_result).unwrap_or(serde_json::Value::Null),
                 });

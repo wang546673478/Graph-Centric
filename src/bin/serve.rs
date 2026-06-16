@@ -52,6 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build state.
     let state = Arc::new(WebState::new(skill_storage, config.clone()));
 
+    // Restore persisted runs from disk so history survives restart.
+    state.restore_persisted_runs().await;
+
     // Build router.
     let app = graph_harness::web::router((*state).clone(), &config.static_dir);
 
