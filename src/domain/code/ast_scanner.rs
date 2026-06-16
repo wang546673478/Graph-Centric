@@ -759,4 +759,46 @@ mod tests {
         let r = s.scan("/definitely/not/a/real/path/xyz").await;
         assert!(r.is_err());
     }
+
+    #[test]
+    fn extract_rust_symbols_from_real_file() {
+        let text = r#"
+pub struct GraphLoop {
+    pub proposer: GraphProposer,
+    pub verifier: Verifier,
+}
+
+impl GraphLoop {
+    pub fn new(task: impl Into<String>) -> Self {
+        Self { /* ... */ }
+    }
+
+    pub async fn step(&mut self) -> LoopState {
+        // advance one beat
+    }
+
+    fn build_final_result(&self) -> FinalResult {
+        FinalResult { /* ... */ }
+    }
+}
+
+async fn handle_task_phase_graph_errors(errors: Vec<GraphError>) -> LoopState {
+    // auto-replan
+}
+
+pub fn predecessors_of(node: &NodeId) -> Vec<(&Edge, &Node)> {
+    // walk inbound edges
+}
+"#;
+        let symbols = extract_rust_symbols(text);
+        println!("Extracted {} symbols:", symbols.len());
+        for s in &symbols {
+            println!("  {} {:?} lines {}-{}", s.name, s.kind, s.line_start, s.line_end);
+        }
+        assert!(symbols.iter().any(|s| s.name == "GraphLoop" && matches!(s.kind, SymbolKind::Class)));
+        assert!(symbols.iter().any(|s| s.name == "step"));
+        assert!(symbols.iter().any(|s| s.name == "new"));
+        assert!(symbols.iter().any(|s| s.name == "handle_task_phase_graph_errors"));
+        assert!(symbols.iter().any(|s| s.name == "predecessors_of"));
+    }
 }
