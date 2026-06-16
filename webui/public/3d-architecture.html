@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graph-Centric 递归 L0/L1/L2 分形架构 — 3D 演示</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0a14; overflow: hidden; font-family: system-ui, sans-serif; }
+  #info {
+    position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
+    color: #c4b5e0; font-size: 0.85rem; text-align: center;
+    pointer-events: none; z-index: 10;
+  }
+  #info h1 { font-size: 1.4rem; color: #a78bda; margin-bottom: 4px; }
+  #info p { opacity: 0.6; font-size: 0.75rem; }
+  #legend {
+    position: absolute; bottom: 20px; left: 20px;
+    display: flex; gap: 16px; font-size: 0.7rem; color: #94a3b8;
+  }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+  .dot.l0 { background: #7c3aed; }
+  .dot.l1 { background: #059669; }
+  .dot.l2 { background: #d97706; }
+  .dot.edge { background: #64748b; }
+  #hint {
+    position: absolute; bottom: 20px; right: 20px;
+    color: #64748b; font-size: 0.65rem;
+  }
+</style>
+</head>
+<body>
+<div id="info">
+  <h1>Graph-Centric: 递归 L0/L1/L2 分形架构</h1>
+  <p>每层同一套引擎 · 复杂节点递归展开 · Scope 天然收敛</p>
+</div>
+<div id="legend">
+  <span><span class="dot l0"></span> L0 骨架</span>
+  <span><span class="dot l1"></span> L1 语义</span>
+  <span><span class="dot l2"></span> L2 源码</span>
+  <span><span class="dot edge"></span> 依赖边</span>
+</div>
+<div id="hint">🖱 拖拽旋转 · 滚轮缩放 · 右键平移</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+const scene = new THREE.Scene();
+scene.fog = new THREE.Fog(0x0a0a14, 20, 80);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 1, 200);
+camera.position.set(12, 8, 18);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(window.innerWidth, window.innerHeight);
+labelRenderer.domElement.style.position = 'absolute';
+labelRenderer.domElement.style.top = '0';
+labelRenderer.domElement.style.pointerEvents = 'none';
+document.body.appendChild(labelRenderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.target.set(0, 0.5, 0);
+controls.update();
+
+// Lighting
+scene.add(new THREE.AmbientLight(0x2a2040, 3));
+const sun = new THREE.DirectionalLight(0xffffff, 4);
+sun.position.set(10, 20, 10);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0x7c3aed, 1.5);
+fill.position.set(-5, 0, -5);
+scene.add(fill);
+
+// Colors
+const L0 = 0x7c3aed, L1 = 0x059669, L2 = 0xd97706;
+const EDGE = 0x475569;
+const PLANE_BG = 0x1a1a2e;
+
+// Helper functions
+function nodeMesh(x, y, z, color, size = 0.3) {
+  const geo = new THREE.SphereGeometry(size, 32, 16);
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.3, metalness: 0.2 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return mesh;
+}
+
+function ringNode(x, y, z, color, size = 0.25) {
+  const geo = new THREE.TorusGeometry(size, 0.06, 16, 32);
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.2, metalness: 0.4, emissive: color, emissiveIntensity: 0.3 });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(x, y, z);
+  mesh.castShadow = true;
+  return mesh;
+}
+
+function label(text, x, y, z, color = '#c4b5e0', fontSize = '0.55rem') {
+  const div = document.createElement('div');
+  div.textContent = text;
+  div.style.color = color;
+  div.style.fontSize = fontSize;
+  div.style.fontWeight = '500';
+  div.style.textShadow = '0 0 8px rgba(0,0,0,0.8)';
+  div.style.whiteSpace = 'nowrap';
+  const obj = new CSS2DObject(div);
+  obj.position.set(x, y, z);
+  return obj;
+}
+
+function edgeLine(x1, y1, z1, x2, y2, z2, color = EDGE, dashed = false) {
+  const points = [new THREE.Vector3(x1, y1, z1), new THREE.Vector3(x2, y2, z2)];
+  const geo = new THREE.BufferGeometry().setFromPoints(points);
+  let mat;
+  if (dashed) {
+    mat = new THREE.LineDashedMaterial({ color, linewidth: 1, dashSize: 0.5, gapSize: 0.3 });
+  } else {
+    mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 });
+  }
+  const line = new THREE.Line(geo, mat);
+  if (dashed) line.computeLineDistances();
+  return line;
+}
+
+function plane(y, w, h, color = PLANE_BG, opacity = 0.15) {
+  const geo = new THREE.PlaneGeometry(w, h);
+  const mat = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.y = y;
+  mesh.rotation.x = -Math.PI / 2;
+  return mesh;
+}
+
+// =============================================================================
+// 层级 0: Project
+// =============================================================================
+const Y0 = 4;
+scene.add(plane(Y0 - 0.1, 14, 7, PLANE_BG, 0.12));
+
+const projectLabel = label('📦 Project (层级 0)', -5.5, Y0 + 1.5, 0, '#a78bda', '0.75rem');
+projectLabel.position.set(-5.5, Y0 + 1.5, 0);
+scene.add(projectLabel);
+
+// L0 nodes (file level)
+const auth = nodeMesh(-3, Y0, 0, L0, 0.35);
+scene.add(auth); scene.add(label('auth.rs', -3, Y0 + 0.55, 0, '#c4b5e0'));
+scene.add(ringNode(-3, Y0, 0, L0, 0.5)); // ring = has sub-graph
+
+const db = nodeMesh(0, Y0, -2, L0, 0.3);
+scene.add(db); scene.add(label('db.rs', 0, Y0 + 0.5, -2, '#c4b5e0'));
+
+const config = nodeMesh(2, Y0, 1, L0, 0.28);
+scene.add(config); scene.add(label('config.rs', 2, Y0 + 0.45, 1, '#c4b5e0'));
+
+const middleware = nodeMesh(4, Y0, -1, L0, 0.25);
+scene.add(middleware); scene.add(label('middleware.rs', 4, Y0 + 0.4, -1, '#c4b5e0'));
+
+// L1 dots for auth.rs
+const l1_auth = nodeMesh(-3.8, Y0 + 0.3, 0.3, L1, 0.12);
+scene.add(l1_auth);
+scene.add(label('L1: 认证逻辑', -4.5, Y0 + 0.6, 0.3, '#059669', '0.45rem'));
+
+// L2 dot for auth.rs
+const l2_auth = nodeMesh(-2.5, Y0 - 0.25, -0.3, L2, 0.12);
+scene.add(l2_auth);
+scene.add(label('L2: 10000行', -2.0, Y0 - 0.5, -0.3, '#d97706', '0.45rem'));
+
+// Edges
+scene.add(edgeLine(-3, Y0, 0, 0, Y0, -2, 0x64748b)); // auth → db
+scene.add(edgeLine(-3, Y0, 0, 2, Y0, 1, 0x64748b));  // auth → config
+scene.add(edgeLine(0, Y0, -2, 4, Y0, -1, 0x64748b)); // db → middleware
+scene.add(edgeLine(2, Y0, 1, 4, Y0, -1, 0x64748b)); // config → middleware
+
+// DependsOn labels
+scene.add(label('DependsOn', -1.5, Y0 + 0.25, -1, '#64748b', '0.4rem'));
+scene.add(label('DependsOn', -0.6, Y0 + 0.35, 0.6, '#64748b', '0.4rem'));
+
+// =============================================================================
+// 层级 1: auth.rs 内部
+// =============================================================================
+const Y1 = 0;
+scene.add(plane(Y1 - 0.1, 12, 6, PLANE_BG, 0.1));
+
+// Connector line: auth.rs node → sub-graph plane
+scene.add(edgeLine(-3, Y0 - 0.35, 0, -3, Y1 + 1.2, 0, 0x7c3aed, true));
+const downArrow = ringNode(-3, Y0 - 0.2, 0, 0x7c3aed, 0.15);
+scene.add(downArrow);
+
+const subLabel = label('🔽 auth.rs 内部 (层级 1)', -6, Y1 + 1.5, 0, '#059669', '0.7rem');
+scene.add(subLabel);
+
+// auth.rs sub-nodes (function level)
+const login = nodeMesh(-3, Y1, 0, 0x8b5cf6, 0.32);
+scene.add(login); scene.add(label('login()', -3, Y1 + 0.55, 0, '#c4b5e0'));
+scene.add(ringNode(-3, Y1, 0, 0x8b5cf6, 0.47)); // ring = further sub-graph
+
+const rateLimit = nodeMesh(-1, Y1, 1.5, L0, 0.25);
+scene.add(rateLimit); scene.add(label('rate_limit()', -1, Y1 + 0.45, 1.5, '#c4b5e0'));
+
+const logout = nodeMesh(0.5, Y1, -1.5, L0, 0.22);
+scene.add(logout); scene.add(label('logout()', 0.5, Y1 + 0.4, -1.5, '#c4b5e0'));
+
+const authConfig = nodeMesh(2.5, Y1, 0.5, L0, 0.2);
+scene.add(authConfig); scene.add(label('AuthConfig', 2.5, Y1 + 0.4, 0.5, '#c4b5e0'));
+
+// L1 for login()
+const l1_login = nodeMesh(-3.6, Y1 + 0.25, 0.25, L1, 0.1);
+scene.add(l1_login);
+scene.add(label('L1: 验证凭证', -4.2, Y1 + 0.5, 0.25, '#059669', '0.4rem'));
+
+// L2 for login()
+const l2_login = nodeMesh(-2.5, Y1 - 0.2, -0.25, L2, 0.1);
+scene.add(l2_login);
+scene.add(label('L2: 45-120行(75行)', -1.8, Y1 - 0.5, -0.25, '#d97706', '0.4rem'));
+
+// Internal edges
+scene.add(edgeLine(-3, Y1, 0, -1, Y1, 1.5, 0x64748b)); // login calls rate_limit
+scene.add(edgeLine(-3, Y1, 0, 0.5, Y1, -1.5, 0x64748b)); // login → logout
+scene.add(edgeLine(-3, Y1, 0, 2.5, Y1, 0.5, 0x64748b)); // login reads AuthConfig
+scene.add(label('Calls', -2, Y1 + 0.3, 0.8, '#64748b', '0.4rem'));
+
+// =============================================================================
+// 层级 2: login() 内部
+// =============================================================================
+const Y2 = -4;
+scene.add(plane(Y2 - 0.1, 10, 5, PLANE_BG, 0.08));
+
+// Connector
+scene.add(edgeLine(-3, Y1 - 0.32, 0, -3, Y2 + 1.0, 0, 0x8b5cf6, true));
+scene.add(ringNode(-3, Y1 - 0.15, 0, 0x8b5cf6, 0.12));
+
+const subLabel2 = label('🔽 login() 内部 (层级 2)', -5.5, Y2 + 1.2, 0, '#d97706', '0.65rem');
+scene.add(subLabel2);
+
+// login() sub-nodes (code block level)
+const validateEmail = nodeMesh(-3, Y2, 0, 0x6366f1, 0.22);
+scene.add(validateEmail); scene.add(label('validate_email()', -3, Y2 + 0.45, 0, '#c4b5e0'));
+
+const hashPw = nodeMesh(-1, Y2, 1, 0x6366f1, 0.2);
+scene.add(hashPw); scene.add(label('hash_pw()', -1, Y2 + 0.4, 1, '#c4b5e0'));
+
+const checkDb = nodeMesh(1, Y2, -0.5, 0x6366f1, 0.2);
+scene.add(checkDb); scene.add(label('check_db()', 1, Y2 + 0.4, -0.5, '#c4b5e0'));
+
+// L2 snippets (the actual 7-16 line code blocks)
+const l2_v = nodeMesh(-4, Y2 - 0.15, 0, L2, 0.08);
+scene.add(l2_v); scene.add(label('L2: 47-53行 (7行)', -5, Y2 - 0.4, 0, '#d97706', '0.38rem'));
+
+const l2_h = nodeMesh(-2, Y2 - 0.2, 1, L2, 0.08);
+scene.add(l2_h); scene.add(label('L2: 55-68行 (14行)', -2.5, Y2 - 0.45, 1, '#d97706', '0.38rem'));
+
+const l2_c = nodeMesh(0, Y2 - 0.2, -0.5, L2, 0.08);
+scene.add(l2_c); scene.add(label('L2: 70-85行 (16行)', -0.5, Y2 - 0.45, -0.5, '#d97706', '0.38rem'));
+
+// edges inside login()
+scene.add(edgeLine(-3, Y2, 0, -1, Y2, 1, 0x64748b));
+scene.add(edgeLine(-3, Y2, 0, 1, Y2, -0.5, 0x64748b));
+
+// =============================================================================
+// Side labels for the three planes
+// =============================================================================
+scene.add(label('L0 骨架', -7, Y0, -3.5, '#7c3aed', '0.6rem'));
+scene.add(label('L1 语义', -7, Y1, -3.5, '#059669', '0.6rem'));
+scene.add(label('L2 源码', -7, Y2, -3.5, '#d97706', '0.6rem'));
+
+// Vertical axis indicator
+scene.add(label('层级 0', -7.3, Y0, 0, '#fff', '0.5rem'));
+scene.add(label('层级 1', -7.3, Y1, 0, '#fff', '0.5rem'));
+scene.add(label('层级 2', -7.3, Y2, 0, '#fff', '0.5rem'));
+
+// Particles for atmosphere
+const particlesGeo = new THREE.BufferGeometry();
+const particlesCount = 200;
+const positions = new Float32Array(particlesCount * 3);
+for (let i = 0; i < particlesCount; i++) {
+  positions[i*3] = (Math.random() - 0.5) * 30;
+  positions[i*3+1] = (Math.random() - 0.5) * 20;
+  positions[i*3+2] = (Math.random() - 0.5) * 20;
+}
+particlesGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+const particlesMat = new THREE.PointsMaterial({ color: 0x7c3aed, size: 0.03, transparent: true, opacity: 0.5 });
+const particles = new THREE.Points(particlesGeo, particlesMat);
+scene.add(particles);
+
+// =============================================================================
+// Animation loop
+// =============================================================================
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  particles.rotation.y += 0.0003;
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+}
+
+animate();
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
