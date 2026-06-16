@@ -24,5 +24,5 @@ onMounted(() => { loadRuns() })
 <style scoped>
 .app-shell { display: flex; height: 100vh; overflow: hidden; }
 .main-area { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-.main-content { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.main-content { flex: 1; overflow-y: auto; display: flex; flex-direction: column; }
 </style>
