@@ -17,7 +17,8 @@ async function fetchModels() {
   if (!baseUrl) return
   fetching.value = true
   try {
-    const resp = await fetch(`/api/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(config.value.model?.api_key_masked || '')}`)
+    const key = config.value.model?.api_key || config.value.model?.api_key_masked || ''
+    const resp = await fetch(`/api/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(key)}`)
     const data = await resp.json()
     modelList.value = data.models || []
   } catch (e) { alert(String(e)) }
