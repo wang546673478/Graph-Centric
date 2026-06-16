@@ -55,6 +55,21 @@ impl OpenAICompatModel {
         }
     }
 
+    fn build_request_body(&self, request: &ModelRequest) -> OpenAIChatRequest {
+        OpenAIChatRequest {
+            model: self.model_name.clone(),
+            messages: request.messages.iter().map(|m| OpenAIMessage {
+                role: role_to_str(m.role).to_string(),
+                content: m.content.clone(),
+            }).collect(),
+            temperature: Some(request.temperature),
+            max_tokens: request.max_tokens,
+            stop: request.stop.clone(),
+            tools: request.tools.clone(),
+            stream: false,
+        }
+    }
+
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
@@ -111,6 +126,8 @@ struct OpenAIChatRequest {
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stream: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,6 +208,7 @@ impl Model for OpenAICompatModel {
             max_tokens: request.max_tokens,
             stop: request.stop,
             tools: request.tools,
+            stream: false,
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -286,6 +304,113 @@ impl Model for OpenAICompatModel {
         Ok(ModelResponse {
             content,
             tool_calls,
+            finish_reason,
+            usage,
+        })
+    }
+
+    /// Streaming implementation using SSE (`stream: true`).
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::model::StreamDelta>,
+    ) -> crate::error::Result<ModelResponse> {
+        use futures_util::StreamExt;
+
+        let mut body = self.build_request_body(&request);
+        body.stream = true;
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let mut req = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body);
+        if let Some(ref key) = self.api_key {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            crate::error::HarnessError::model(format!("stream request failed: {e}"))
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(crate::error::HarnessError::model(format!(
+                "stream HTTP {}: {}",
+                status.as_u16(),
+                body.chars().take(300).collect::<String>(),
+            )));
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut full_content = String::new();
+        let mut finish_reason = FinishReason::Stop;
+        let mut usage = Usage::default();
+        let mut buf = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "stream chunk error");
+                    break;
+                }
+            };
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete SSE lines.
+            while let Some(line_end) = buf.find('\n') {
+                let line = buf[..line_end].trim().to_string();
+                buf = buf[line_end + 1..].to_string();
+
+                let data = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"));
+                let Some(data) = data else { continue };
+                if data == "[DONE]" {
+                    let _ = tx.send(crate::model::StreamDelta::Done {
+                        finish_reason,
+                        usage: usage.clone(),
+                    });
+                    break;
+                }
+
+                let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                if let Some(choices) = chunk["choices"].as_array() {
+                    for choice in choices {
+                        if let Some(delta) = choice.get("delta") {
+                            if let Some(content) = delta["content"].as_str() {
+                                full_content.push_str(content);
+                                let _ = tx.send(crate::model::StreamDelta::Delta {
+                                    content: content.to_string(),
+                                });
+                            }
+                        }
+                        if let Some(fr) = choice["finish_reason"].as_str() {
+                            finish_reason = match fr {
+                                "stop" => FinishReason::Stop,
+                                "tool_calls" => FinishReason::ToolCalls,
+                                "length" => FinishReason::MaxTokens,
+                                _ => FinishReason::Stop,
+                            };
+                        }
+                    }
+                }
+                if let Some(u) = chunk.get("usage") {
+                    usage = Usage {
+                        prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as usize,
+                        completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as usize,
+                        total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as usize,
+                    };
+                }
+            }
+        }
+
+        Ok(ModelResponse {
+            content: full_content,
+            tool_calls: Vec::new(),
             finish_reason,
             usage,
         })

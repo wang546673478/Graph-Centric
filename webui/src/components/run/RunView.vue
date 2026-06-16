@@ -37,6 +37,22 @@ function connectToRun(id: string) {
       case 'cascade_step': if (detailMode.value) s.transcript.push({ role: 'cascade', content: `🔍 ${d.changed_node} ← ${d.predecessor}: ${d.verdict} — ${d.rationale}` }); break
       case 'model_call': if (detailMode.value) s.transcript.push({ role: 'model', content: `🤖 ${d.component} (${d.completion_tokens || 0}t, ${d.duration_ms || 0}ms): ${(d.response_content || '').slice(0, 200)}` }); break
       case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` }); break
+      case 'stream_chunk': {
+        const last = s.transcript[s.transcript.length - 1]
+        if (last && last.role === 'assistant_streaming') {
+          last.content += d.content || ''
+        } else {
+          s.transcript.push({ role: 'assistant_streaming', content: d.content || '' })
+        }
+        break
+      }
+      case 'stream_end': {
+        const last = s.transcript[s.transcript.length - 1]
+        if (last && last.role === 'assistant_streaming') {
+          last.role = 'assistant'
+        }
+        break
+      }
     }
   })
 

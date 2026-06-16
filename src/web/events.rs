@@ -34,6 +34,19 @@ pub enum RunEvent {
     Done { final_result: serde_json::Value },
     /// An error occurred.
     Error { message: String },
+    /// A streaming chunk from a model call — partial content as it's generated.
+    StreamChunk {
+        component: String,
+        content: String,
+        finish_reason: Option<String>,
+    },
+    /// A streaming model call has finished.
+    StreamEnd {
+        component: String,
+        finish_reason: String,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
     /// A model call's input and output. Verbose — only sent when detail_mode is on.
     ModelCall {
         component: String,
@@ -77,6 +90,8 @@ impl RunEvent {
             Self::Status { .. } => "status",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
+            Self::StreamChunk { .. } => "stream_chunk",
+            Self::StreamEnd { .. } => "stream_end",
             Self::ModelCall { .. } => "model_call",
             Self::CascadeStep { .. } => "cascade_step",
             Self::CheckpointCreated { .. } => "checkpoint",

@@ -68,8 +68,34 @@ pub struct Usage {
     pub total_tokens: usize,
 }
 
+/// A chunk of streaming output — either a content delta or a terminal done signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum StreamDelta {
+    Delta { content: String },
+    Done { finish_reason: FinishReason, usage: Usage },
+}
+
 #[async_trait]
 pub trait Model: Send + Sync {
     fn name(&self) -> &str;
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse>;
+
+    /// Streaming variant. Default implementation falls back to `complete()`
+    /// and emits one `Delta` followed by a `Done`. Override for true SSE streaming.
+    async fn complete_stream(
+        &self,
+        request: ModelRequest,
+        tx: tokio::sync::mpsc::UnboundedSender<StreamDelta>,
+    ) -> Result<ModelResponse> {
+        let resp = self.complete(request).await?;
+        let _ = tx.send(StreamDelta::Delta {
+            content: resp.content.clone(),
+        });
+        let _ = tx.send(StreamDelta::Done {
+            finish_reason: resp.finish_reason,
+            usage: resp.usage.clone(),
+        });
+        Ok(resp)
+    }
 }
