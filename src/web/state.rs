@@ -80,6 +80,12 @@ pub struct LoopTuningConfig {
     pub max_rounds: usize,
     pub max_repair_rounds: usize,
     pub cascade_backtrack: bool,
+    /// DeepSeek thinking mode: enabled/disabled.
+    #[serde(default)]
+    pub thinking_enabled: bool,
+    /// Reasoning effort: "high" or "max".
+    #[serde(default)]
+    pub reasoning_effort: String,
 }
 
 impl EngineConfig {
@@ -149,6 +155,8 @@ impl Default for EngineConfig {
                 max_rounds: 300,
                 max_repair_rounds: 4,
                 cascade_backtrack: true,
+                thinking_enabled: false,
+                reasoning_effort: "high".into(),
             },
         }
     }

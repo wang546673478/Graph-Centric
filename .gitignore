@@ -9,4 +9,5 @@ Cargo.lock
 /webui/.svelte-kit/
 /webui/build/
 /webui/dist/
+/data/
 .graph_harness_config.json

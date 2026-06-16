@@ -38,6 +38,7 @@ pub enum RunEvent {
     StreamChunk {
         component: String,
         content: String,
+        reasoning_content: Option<String>,
         finish_reason: Option<String>,
     },
     /// A streaming model call has finished.

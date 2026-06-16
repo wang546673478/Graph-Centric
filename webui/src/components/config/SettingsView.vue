@@ -73,6 +73,13 @@ async function save() {
       <h3>{{ t('settings.loopTuning') }}</h3>
       <label>{{ t('settings.maxRounds') }} <input type="number" v-model.number="config.loop_tuning.max_rounds" /></label>
       <label><input type="checkbox" v-model="config.loop_tuning.cascade_backtrack" /> {{ t('settings.cascadeBacktrack') }}</label>
+      <label><input type="checkbox" v-model="config.loop_tuning.thinking_enabled" /> Thinking Mode (DeepSeek)</label>
+      <label v-if="config.loop_tuning.thinking_enabled">Reasoning Effort
+        <select v-model="config.loop_tuning.reasoning_effort">
+          <option value="high">high</option>
+          <option value="max">max</option>
+        </select>
+      </label>
     </section>
 
     <button class="primary" @click="save">{{ saved ? t('settings.saved') : t('settings.save') }}</button>

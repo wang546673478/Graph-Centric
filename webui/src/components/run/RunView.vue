@@ -57,10 +57,22 @@ function connectToRun(id: string) {
       case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` }); break
       case 'stream_chunk': {
         const last = s.transcript[s.transcript.length - 1]
-        if (last && last.role === 'assistant_streaming') {
-          last.content += d.content || ''
-        } else {
-          s.transcript.push({ role: 'assistant_streaming', content: d.content || '' })
+        // Reasoning/thinking content: append as a separate collapsible message before the assistant.
+        if (d.reasoning_content) {
+          const thinkingRole = 'thinking'
+          const thinkingLast = s.transcript[s.transcript.length - 1]
+          if (thinkingLast && thinkingLast.role === 'thinking') {
+            thinkingLast.content += d.reasoning_content
+          } else {
+            s.transcript.push({ role: 'thinking', content: d.reasoning_content })
+          }
+        }
+        if (d.content) {
+          if (last && last.role === 'assistant_streaming') {
+            last.content += d.content
+          } else {
+            s.transcript.push({ role: 'assistant_streaming', content: d.content })
+          }
         }
         break
       }

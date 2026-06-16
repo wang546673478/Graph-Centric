@@ -348,6 +348,7 @@ impl Model for OpenAICompatModel {
 
         let mut stream = resp.bytes_stream();
         let mut full_content = String::new();
+        let mut full_reasoning = String::new();
         let mut finish_reason = FinishReason::Stop;
         let mut usage = Usage::default();
         let mut buf = String::new();
@@ -390,6 +391,13 @@ impl Model for OpenAICompatModel {
                                     reasoning_content: None,
                                 });
                             }
+                            if let Some(reasoning) = delta["reasoning_content"].as_str() {
+                                full_reasoning.push_str(reasoning);
+                                let _ = tx.send(crate::model::StreamDelta::Delta {
+                                    content: String::new(),
+                                    reasoning_content: Some(reasoning.to_string()),
+                                });
+                            }
                         }
                         if let Some(fr) = choice["finish_reason"].as_str() {
                             finish_reason = match fr {
@@ -413,9 +421,10 @@ impl Model for OpenAICompatModel {
             }
         }
 
+        let reasoning = if full_reasoning.is_empty() { None } else { Some(full_reasoning) };
         Ok(ModelResponse {
             content: full_content,
-            reasoning_content: None,
+            reasoning_content: reasoning,
             tool_calls: Vec::new(),
             finish_reason,
             usage,
