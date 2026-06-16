@@ -5,6 +5,7 @@ import { useI18n } from '../../composables/useI18n'
 import Transcript from './Transcript.vue'
 import Composer from './Composer.vue'
 import GraphPanel from '../graph/GraphPanel.vue'
+import DebugTimeline from './DebugTimeline.vue'
 
 const { t } = useI18n()
 const tab = ref('graph')
@@ -142,9 +143,10 @@ async function submitTask(task: string) {
     <div class="side-panel">
       <div class="tabs">
         <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
-        <button :class="{ active: tab === 'files' }" @click="tab = 'files'">{{ t('graph.filesTab') }}</button>
+        <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
       <GraphPanel v-if="tab === 'graph'" :nodes="nodes" :edges="edges" />
+      <DebugTimeline v-else-if="tab === 'debug'" />
       <div v-else class="placeholder">{{ t('files.empty') }}</div>
     </div>
   </div>

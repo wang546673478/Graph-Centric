@@ -573,20 +573,32 @@ async fn drive_run(
             payload: loop_state_payload(&state_clone),
         });
 
-        // Surface each Proposer step as a transcript event so the UI
-        // shows what the agent is "saying" / "doing" between graph
-        // updates — turns the chat from a black box into a real feed.
+        // Capture tool call info before consuming the steps.
+        let tool_info: Option<(String, String)> = gl.last_step.as_ref().and_then(|s| {
+            if let crate::agent::proposer::ProposerStep::CallTool { tool, args, .. } = s {
+                Some((tool.clone(), serde_json::to_string(args).unwrap_or_default()))
+            } else { None }
+        });
+
+        // Surface each Proposer step as a transcript event.
         if let Some(step) = gl.last_step.take() {
             for (role, content) in step_transcripts(&step) {
                 session.emit(RunEvent::Transcript { role, content });
             }
         }
-        // If the step was a call_tool, also emit the tool's result
-        // (truncated) so the chat shows what the tool actually
-        // returned. Sub-agent tool calls aren't visible here — they
-        // route through `SubAgent::execute` — but the main agent's
-        // tool calls are.
+
+        // Emit tool result + structured ToolUse event for the trace.
         if let Some((tool, summary)) = gl.last_tool_result.take() {
+            if let Some((tool_name, args_str)) = tool_info {
+                session.emit(RunEvent::ToolUse {
+                    component: "main_agent".into(),
+                    tool: tool_name,
+                    args: args_str,
+                    output: summary.clone(),
+                    exit_code: None,
+                    duration_ms: 0,
+                });
+            }
             session.emit(RunEvent::Transcript {
                 role: "tool_result".into(),
                 content: format!("📥 {tool} → {summary}"),

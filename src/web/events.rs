@@ -47,6 +47,15 @@ pub enum RunEvent {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// A tool was invoked by the main agent or a sub-agent.
+    ToolUse {
+        component: String,
+        tool: String,
+        args: String,
+        output: String,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    },
     /// A model call's input and output. Verbose — only sent when detail_mode is on.
     ModelCall {
         component: String,
@@ -92,6 +101,7 @@ impl RunEvent {
             Self::Error { .. } => "error",
             Self::StreamChunk { .. } => "stream_chunk",
             Self::StreamEnd { .. } => "stream_end",
+            Self::ToolUse { .. } => "tool_use",
             Self::ModelCall { .. } => "model_call",
             Self::CascadeStep { .. } => "cascade_step",
             Self::CheckpointCreated { .. } => "checkpoint",
