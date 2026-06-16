@@ -3,13 +3,14 @@
 //! See `docs/superpowers/specs/2026-06-03-skill-capture-and-reuse-design.md`
 //! for the design rationale.
 
-pub mod types;
-pub mod storage;
-pub mod storage_repo;
-pub mod storage_composite;
-pub mod slug;
 pub mod capture;
+pub mod compiler;
 pub mod retrieve;
+pub mod slug;
+pub mod storage;
+pub mod storage_composite;
+pub mod storage_repo;
+pub mod types;
 
 pub use types::{Skill, SkillError, SkillMeta, SkillRef};
 // Re-exports expanded in Tasks 4 (RepoSkillStorage) and 5 (CompositeSkillStorage).
