@@ -45,6 +45,11 @@ function connectToRun(id: string) {
       case 'transcript': s.transcript.push({ role: d.role || 'assistant', content: d.content || '' }); break
       case 'graph': case 'graph_snapshot': if (d.nodes) s.nodes = d.nodes; if (d.edges) s.edges = d.edges; break
       case 'status': if (d.phase) s.status = d.phase; s.tokensUsed = d.tokens_used || s.tokensUsed; break
+      case 'loop_state':
+        if (d.kind === 'Paused') s.status = 'paused'
+        else if (d.kind === 'GraphInvalid') s.status = 'graph_invalid'
+        else if (d.kind === 'Done') s.status = 'Done'
+        break
       case 'done': s.status = 'Done'; break
       case 'error': s.error = d.message || 'Unknown error'; s.status = 'Error'; break
       case 'cascade_step': if (detailMode.value) s.transcript.push({ role: 'cascade', content: `🔍 ${d.changed_node} ← ${d.predecessor}: ${d.verdict} — ${d.rationale}` }); break
@@ -100,7 +105,7 @@ async function submitTask(task: string) {
   // If viewing a paused run, send the answer to resume it.
   const curId = activeRunId.value
   const curStore = curId ? getRunStore(curId) : null
-  if (curId && curStore && curStore.status === 'Paused') {
+  if (curId && curStore && curStore.status.toLowerCase() === 'paused') {
     try {
       await fetch(`/api/runs/${curId}/answer`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
