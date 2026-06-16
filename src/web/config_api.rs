@@ -15,45 +15,64 @@ pub struct ModelsQuery {
 }
 
 /// Fetch the list of available models from an OpenAI-compatible endpoint.
+/// Tries `{base_url}/models` first, then strips `/v1` and retries for providers
+/// (like DeepSeek) that serve models at the root rather than under `/v1`.
 pub async fn list_models(
     Query(q): Query<ModelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let url = format!("{}/models", q.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| ApiError::Internal(format!("client error: {e}")))?;
 
-    let mut req = client.get(&url);
-    if !q.api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", q.api_key));
+    let base = q.base_url.trim_end_matches('/').to_string();
+
+    // Candidate URLs: {base}/models, then {base without /v1}/models
+    let mut urls = vec![format!("{base}/models")];
+    if let Some(stripped) = base.strip_suffix("/v1").or_else(|| base.strip_suffix("/V1")) {
+        urls.push(format!("{stripped}/models"));
     }
 
-    let resp = req.send().await.map_err(|e| {
-        ApiError::Internal(format!("failed to reach {url}: {e}"))
-    })?;
+    let mut last_err = String::new();
+    for url in &urls {
+        let mut req = client.get(url);
+        if !q.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", q.api_key));
+        }
 
-    let body = resp.text().await.unwrap_or_default();
-    let json: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({
-        "error": "invalid JSON response",
-        "raw": body.chars().take(200).collect::<String>(),
-    }));
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let body = resp.text().await.unwrap_or_default();
+                let json: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({
+                    "error": "invalid JSON response",
+                    "raw": body.chars().take(200).collect::<String>(),
+                }));
 
-    // Extract just the model IDs for convenience.
-    let models: Vec<&str> = json
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
-                .collect()
-        })
-        .unwrap_or_default();
+                let models: Vec<&str> = json
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-    Ok(Json(serde_json::json!({
-        "models": models,
-        "raw": json,
-    })))
+                return Ok(Json(serde_json::json!({
+                    "models": models,
+                    "raw": json,
+                })));
+            }
+            Ok(resp) => {
+                last_err = format!("HTTP {}", resp.status().as_u16());
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+            }
+        }
+    }
+
+    Err(ApiError::Internal(format!("failed to fetch models from any URL: {last_err}")))
 }
 
 pub async fn get_config(
