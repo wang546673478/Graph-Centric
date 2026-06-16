@@ -1,6 +1,6 @@
 //! GET/POST /api/config + GET /api/models — runtime configuration + model discovery.
 
-use super::state::EngineConfig;
+use super::state::{EngineConfig, ModelTierConfig};
 use super::errors::ApiError;
 use super::WebState;
 use axum::{extract::{Query, State}, Json};
@@ -116,6 +116,21 @@ pub async fn post_config(
             config.policy.max_concurrent_subagents = v as usize;
         }
     }
+    // Handle profile switching.
+    if let Some(prof) = update.get("active_profile").and_then(|v| v.as_str()) {
+        if !prof.is_empty() {
+            config.active_profile = prof.to_string();
+            if let Some(p) = config.profiles.get(prof) {
+                config.model = p.clone();
+            }
+        }
+    }
+    if let Some(profiles) = update.get("profiles") {
+        if let Ok(map) = serde_json::from_value::<std::collections::HashMap<String, ModelTierConfig>>(profiles.clone()) {
+            config.profiles = map;
+        }
+    }
+
     if let Some(tuning) = update.get("loop_tuning") {
         if let Some(v) = tuning.get("max_rounds").and_then(|v| v.as_u64()) {
             config.loop_tuning.max_rounds = v as usize;

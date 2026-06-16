@@ -51,6 +51,12 @@ pub struct EngineConfig {
     pub model: ModelTierConfig,
     pub policy: ToolPolicyConfig,
     pub loop_tuning: LoopTuningConfig,
+    /// Named model profiles for quick switching.
+    #[serde(default)]
+    pub profiles: std::collections::HashMap<String, ModelTierConfig>,
+    /// Currently active profile name (empty = use `model` directly).
+    #[serde(default)]
+    pub active_profile: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,6 +140,8 @@ impl EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            profiles: std::collections::HashMap::new(),
+            active_profile: String::new(),
             model: ModelTierConfig {
                 base_url: String::new(),
                 api_key: String::new(),

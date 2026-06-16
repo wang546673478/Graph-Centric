@@ -11,15 +11,45 @@ const modelList = ref<string[]>([])
 const fetching = ref(false)
 const keyDirty = ref(false)
 const origKey = ref('')
+const profileName = ref('')
+const profiles = ref<Record<string, any>>({})
 
 onMounted(async () => {
   try {
     config.value = await api.get('/api/config')
     origKey.value = config.value.model?.api_key_masked || ''
+    profiles.value = config.value.profiles || {}
   } catch { /* */ }
 })
 
 function onKeyInput() { keyDirty.value = true }
+
+function switchProfile(name: string) {
+  if (profiles.value[name]) {
+    config.value.model = { ...profiles.value[name] }
+    config.value.active_profile = name
+    origKey.value = config.value.model?.api_key_masked || ''
+    keyDirty.value = false
+  }
+}
+
+function saveProfile() {
+  const name = profileName.value.trim() || config.value.active_profile || 'default'
+  profiles.value[name] = { ...config.value.model }
+  config.value.profiles = profiles.value
+  config.value.active_profile = name
+  profileName.value = ''
+  save()
+}
+
+function deleteProfile(name: string) {
+  delete profiles.value[name]
+  config.value.profiles = profiles.value
+  if (config.value.active_profile === name) {
+    config.value.active_profile = ''
+  }
+  save()
+}
 
 async function fetchModels() {
   const baseUrl = config.value.model?.base_url?.trim()
@@ -51,6 +81,21 @@ async function save() {
 <template>
   <div class="settings">
     <h2>{{ t('settings.title') }}</h2>
+
+    <!-- Profile bar -->
+    <section>
+      <h3>Profiles</h3>
+      <div class="profile-bar">
+        <select v-model="config.active_profile" @change="switchProfile(config.active_profile)" class="profile-select">
+          <option value="">-- direct config --</option>
+          <option v-for="(v, k) in profiles" :key="k" :value="k">{{ k }}</option>
+        </select>
+        <input v-model="profileName" placeholder="profile name" class="profile-input" />
+        <button class="secondary" @click="saveProfile" :disabled="!profileName.trim() && !config.active_profile">💾 Save</button>
+        <button v-if="config.active_profile" class="danger" @click="deleteProfile(config.active_profile)">🗑 Delete</button>
+      </div>
+      <div v-if="config.active_profile" class="hint">Profile: <b>{{ config.active_profile }}</b></div>
+    </section>
 
     <section>
       <h3>{{ t('settings.model') }}</h3>
@@ -119,4 +164,8 @@ input[type="checkbox"] { width: auto; margin-right: 6px; }
 .fetch-row button { font-size: 0.75rem; padding: 5px 12px; }
 .hint { font-size: 0.7rem; color: var(--accent); }
 button.primary { margin-top: 8px; padding: 10px 24px; }
+.profile-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.profile-select { flex: 1; min-width: 120px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font-size: 0.8rem; font-family: var(--font); }
+.profile-input { width: 120px; flex: none; }
+.profile-bar button { font-size: 0.72rem; padding: 5px 8px; white-space: nowrap; }
 </style>
