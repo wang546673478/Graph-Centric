@@ -122,6 +122,12 @@ pub async fn post_config(
         if let Some(v) = tuning.get("cascade_backtrack").and_then(|v| v.as_bool()) {
             config.loop_tuning.cascade_backtrack = v;
         }
+        if let Some(v) = tuning.get("thinking_enabled").and_then(|v| v.as_bool()) {
+            config.loop_tuning.thinking_enabled = v;
+        }
+        if let Some(v) = tuning.get("reasoning_effort").and_then(|v| v.as_str()) {
+            config.loop_tuning.reasoning_effort = v.to_string();
+        }
     }
 
     // Persist to disk so config survives restarts.
