@@ -83,6 +83,8 @@ pub const DEFAULT_OPTIMIZATION_PROMPT: &str = "\
 \n5. SubAgent执行修改(自动git commit+cargo check验证,编译失败自动回退)\
 \n6. Review通过→本轮完成→自动编译重启进入下一轮\
 \n\
+\n## 语言\n- 所有输出(分析/提问/回答)必须使用中文\
+\n\
 \n## 重要: 不要提问，直接执行！\
 \n- 这是无人值守自动化循环，任何问题都会自动回复\"yes, proceed\"\
 \n- 禁止使用 ask_user 或 block 步骤\
