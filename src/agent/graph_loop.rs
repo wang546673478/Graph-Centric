@@ -464,37 +464,74 @@ pub struct GraphLoop {
 
 /// Extract file/function/class entities from Explore output text and produce
 /// a GraphPatch that adds them as L0 nodes with Contains edges from a scope node.
-fn extract_entities_to_patch(text: &str, scope: &str) -> crate::graph::GraphPatch {
+fn extract_entities_to_patch(text: &str, scope: &str, graph: &crate::graph::Graph) -> crate::graph::GraphPatch {
     use crate::graph::{Edge, GraphPatch, Node, NodeId, NodeKind, RelationType};
     use regex::Regex;
 
     let mut patch = GraphPatch::default();
 
+    // Find or create the scope (parent) node.
+    let scope_id = NodeId::from(scope.to_string());
+    let scope_exists = graph.contains_node(&scope_id);
+    if !scope_exists && !scope.is_empty() {
+        // Create a repo/directory node for the scope.
+        let kind = if scope.starts_with("http") { NodeKind::Other("repo".into()) } else { NodeKind::Module };
+        patch.add_nodes.push(Node::new(scope_id.clone(), kind, scope.to_string(), format!("{scope} (explore scope)")));
+        // Mark it to be created even if the edge addition fails later.
+    }
+    let parent_id = scope_id;
+
     // Extract file paths: /path/to/file.ext, src/file.rs, etc.
-    let file_re = Regex::new(r"([\w/\-._]+\.(rs|py|js|ts|tsx|go|java|kt|rb|md|toml|yaml|json|toml|css|html|vue))").unwrap();
+    let file_re = Regex::new(r"([\w/\-._]+\.(rs|py|js|ts|tsx|go|java|kt|rb|md|toml|yaml|json|css|html|vue))").unwrap();
     let mut seen = std::collections::HashSet::new();
 
     for cap in file_re.captures_iter(text) {
         let path = cap[0].to_string();
-        if seen.contains(&path) { continue; }
+        // Skip paths that look like URLs or contain no directory structure.
+        if seen.contains(&path) || path.len() < 3 { continue; }
         seen.insert(path.clone());
 
         let id = NodeId::from(path.clone());
-        patch.add_nodes.push(Node::file(path.clone(), format!("{path} (discovered by explore)")));
-        // Link to scope if scope looks like a parent.
-        if !scope.is_empty() && scope != path {
-            let scope_id = NodeId::from(scope.to_string());
+        let file_exists = graph.contains_node(&id) || patch.add_nodes.iter().any(|n| n.id == id);
+        if !file_exists {
+            patch.add_nodes.push(Node::file(path.clone(), format!("{path} (from explore)")));
+        }
+        // Edge from scope to file.
+        if parent_id.as_str() != path {
             patch.add_edges.push(Edge::new(
-                scope_id, id.clone(),
+                parent_id.clone(), id,
                 RelationType::Contains, 0.7,
-                "extracted from explore output",
+                "from explore output",
             ));
         }
     }
 
-    // Extract function/class names: `fn login`, `def process`, `class Auth`
-    let sym_re = Regex::new(r"(fn|def|func|class|struct|enum|interface)\s+(\w+)").unwrap();
+    // Extract function/class names and link to their file.
+    let sym_re = Regex::new(r"([\w/\-._]+\.(rs|py|js|ts|go|java)):?\s*.*?(fn|def|func|class|struct|enum|interface)\s+(\w+)").unwrap();
     for cap in sym_re.captures_iter(text) {
+        let file_path = &cap[1];
+        let sym_name = cap[4].to_string();
+        if seen.contains(&sym_name) { continue; }
+        seen.insert(sym_name.clone());
+
+        let sym_id = NodeId::from(sym_name.clone());
+        let kind = match &cap[3] {
+            "class" | "struct" | "enum" | "interface" => NodeKind::Class,
+            _ => NodeKind::Function,
+        };
+        patch.add_nodes.push(Node::new(sym_id.clone(), kind, file_path.to_string(), sym_name));
+        // Edge from file to symbol.
+        let file_id = NodeId::from(file_path.to_string());
+        patch.add_edges.push(Edge::new(
+            file_id, sym_id,
+            RelationType::Contains, 0.7,
+            "from explore output",
+        ));
+    }
+
+    // Bare function/class mentions without file context.
+    let bare_re = Regex::new(r"(fn|def|func|class|struct|enum|interface)\s+(\w+)").unwrap();
+    for cap in bare_re.captures_iter(text) {
         let name = cap[2].to_string();
         if seen.contains(&name) { continue; }
         seen.insert(name.clone());
@@ -504,7 +541,7 @@ fn extract_entities_to_patch(text: &str, scope: &str) -> crate::graph::GraphPatc
             "class" | "struct" | "enum" | "interface" => NodeKind::Class,
             _ => NodeKind::Function,
         };
-        patch.add_nodes.push(Node::new(id.clone(), kind, String::new(), name));
+        patch.add_nodes.push(Node::new(id, kind, String::new(), name));
     }
 
     patch
@@ -1649,7 +1686,7 @@ impl GraphLoop {
         for (i, (item, res)) in items.iter().zip(results.iter()).enumerate() {
             if let Ok(r) = res {
                 if r.success {
-                    let patch = extract_entities_to_patch(&r.output, &item.scope);
+                    let patch = extract_entities_to_patch(&r.output, &item.scope, &self.graph);
                     if patch.add_nodes.len() > 0 || patch.add_edges.len() > 0 {
                         let _ = self.graph.apply_patch(patch);
                     }
