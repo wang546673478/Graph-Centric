@@ -13,7 +13,49 @@ const keyDirty = ref(false)
 const origKey = ref('')
 const profileName = ref('')
 const profiles = ref<Record<string, any>>({})
+const DEFAULTS = {
+  max_rounds: 10,
+  prompt: `对 Graph-Centric Agent 进行10轮自我优化。每轮选一个具体优化点，改完通过编译后自动重启进入下一轮。
+优化范围包括后端Rust代码(src/)和前端Vue3界面(webui/src/)。
+
+## 优化方向
+### 后端 (src/)
+- 降低unwrap/unsafe密度，提升代码健壮性
+- 优化模块边界，减少大文件(>500行)
+- 改善错误处理，用结构化错误替代字符串
+- 参考 openclaw/opencode/CodeWhale 中的模式但不照搬
+
+### 前端 (webui/src/)
+- 参考 GitHub 上优秀AI agent项目的Web界面设计
+- 优化现有Vue3组件的排版、配色、交互体验
+- 改进对话区域的视觉层次感和可读性
+- 增强3D关系图面板的可用性(标签、动画、布局)
+- 设置页面和信息页面的信息架构优化
+
+## 搜索外部项目 (Explore + WebSearch)
+- 用 Explore 派子代理去 GitHub 搜索关键词
+- 子代理有 web_search 工具可直接搜索
+
+## 每轮工作流 (A→D)
+1. 创建 A(当前问题)和 D(优化目标)
+2. Explore 扫描 src/ 或 webui/src/ 找出具体问题点
+3. 如果本轮需要外部参考: Explore + web_search 搜索 GitHub
+4. ProposePatch: 仅修改1-3个相关文件
+5. SubAgent执行修改(自动git commit+cargo check验证)
+6. Review通过→本轮完成→自动编译重启进入下一轮
+
+## 约束
+- 每轮只改1-3个文件，必须编译通过
+- 禁止引入新unwrap/unsafe，禁止删除测试
+- 不改graph/mod.rs和graph/l1.rs(核心图结构)
+- 外部项目只参考设计模式，不照搬代码
+- 前端改动不引入新依赖(保持轻量)
+- 第10轮结束自动停止`
+}
+
 const heartbeat = ref<any>(null)
+const hbPrompt = ref(DEFAULTS.prompt)
+const hbRounds = ref(DEFAULTS.max_rounds)
 
 onMounted(async () => {
   try {
@@ -21,25 +63,24 @@ onMounted(async () => {
     origKey.value = config.value.model?.api_key_masked || ''
     profiles.value = config.value.profiles || {}
     heartbeat.value = await api.get('/api/heartbeat')
+    if (heartbeat.value?.prompt) hbPrompt.value = heartbeat.value.prompt
   } catch { /* */ }
 })
 
 async function startHeartbeat() {
-  try { heartbeat.value = await api.post('/api/heartbeat/default'); await api.get('/api/heartbeat') } catch { /* */ }
-  heartbeat.value = { active: true, max_rounds: 10, completed_rounds: 0 }
+  try {
+    const body = { prompt: hbPrompt.value, max_rounds: hbRounds.value }
+    heartbeat.value = await api.post('/api/heartbeat', body)
+    heartbeat.value = { active: true, max_rounds: hbRounds.value, completed_rounds: 0, prompt: hbPrompt.value }
+  } catch(e) { alert(String(e)) }
 }
 async function cancelHeartbeat() {
   try { heartbeat.value = await api.post('/api/heartbeat/cancel') } catch { /* */ }
   heartbeat.value = { active: false }
+  hbPrompt.value = DEFAULTS.prompt
 }
 async function refreshHeartbeat() {
   try { heartbeat.value = await api.get('/api/heartbeat') } catch { /* */ }
-}
-const editingPrompt = ref(false)
-async function savePrompt() {
-  if (!heartbeat.value) return
-  try { await api.post('/api/heartbeat/prompt', { prompt: heartbeat.value.prompt }) } catch { /* */ }
-  editingPrompt.value = false
 }
 
 function onKeyInput() { keyDirty.value = true }
@@ -111,12 +152,7 @@ async function save() {
       <h3>🫀 自优化循环 (HeartBeat)</h3>
       <div v-if="heartbeat && heartbeat.active" class="hb-active">
         <div><b>状态:</b> 🔄 运行中 · 第 {{ heartbeat.completed_rounds || 0 }}/{{ heartbeat.max_rounds }} 轮</div>
-        <textarea v-if="editingPrompt" v-model="heartbeat.prompt" rows="12" class="hb-textarea"></textarea>
-        <div v-else class="hb-prompt" @click="editingPrompt = true" title="Click to edit">{{ heartbeat.prompt?.slice(0, 300) }}…</div>
-        <div v-if="editingPrompt" class="hb-actions">
-          <button class="primary" @click="savePrompt">💾 保存提示词</button>
-          <button class="secondary" @click="editingPrompt = false">取消</button>
-        </div>
+        <div class="hb-prompt-ro">{{ heartbeat.prompt?.slice(0, 400) }}{{ (heartbeat.prompt?.length || 0) > 400 ? '…' : '' }}</div>
         <div v-if="heartbeat.current_run_id" class="hb-run-link">
           📋 <router-link :to="'/'">查看当前任务</router-link> ({{ heartbeat.current_run_id?.slice(0,8) }}…)
         </div>
@@ -127,8 +163,10 @@ async function save() {
       </div>
       <div v-else class="hb-idle">
         <div><b>状态:</b> ⏸ 未启动</div>
-        <p class="hint">启动后每次 Review 通过自动提交代码、编译、重启，继续下一轮优化。后端 Rust + 前端 Vue3 都在优化范围内。</p>
-        <button class="primary" @click="startHeartbeat">▶ 启动 10 轮自优化</button>
+        <label>轮数 <input type="number" v-model.number="hbRounds" min="1" max="50" class="rounds-input" /></label>
+        <textarea v-model="hbPrompt" rows="12" class="hb-textarea"></textarea>
+        <p class="hint">提示词可自由修改。启动后不可改。</p>
+        <button class="primary" @click="startHeartbeat">▶ 启动 {{ hbRounds }} 轮自优化</button>
       </div>
     </section>
 
@@ -222,7 +260,9 @@ button.primary { margin-top: 8px; padding: 10px 24px; }
 .hb-active { display: flex; flex-direction: column; gap: 8px; }
 .hb-prompt { font-size: 0.7rem; color: var(--text-muted); max-height: 60px; overflow: hidden; cursor: pointer; }
 .hb-textarea { width: 100%; font-size: 0.72rem; font-family: var(--font-mono); margin: 4px 0; }
+.hb-prompt-ro { font-size: 0.72rem; color: var(--text-muted); max-height: 80px; overflow-y: auto; background: var(--bg); padding: 6px 8px; border-radius: 4px; white-space: pre-wrap; }
 .hb-actions { display: flex; gap: 6px; margin-top: 4px; }
 .hb-idle { display: flex; flex-direction: column; gap: 8px; }
 .hb-idle .hint { font-size: 0.72rem; color: var(--text-muted); line-height: 1.5; }
+.rounds-input { width: 60px; padding: 4px 6px; }
 </style>
