@@ -88,15 +88,33 @@ function makeEdgeGroup(from: THREE.Vector3, to: THREE.Vector3, inScope: boolean,
   return g
 }
 
+function disposeGroup(g: THREE.Group) {
+  g.traverse((obj: any) => {
+    if (obj.geometry) obj.geometry.dispose()
+    if (obj.material) {
+      if (Array.isArray(obj.material)) obj.material.forEach((m: any) => m.dispose())
+      else obj.material.dispose()
+    }
+  })
+}
+
+function clearAll() {
+  for (const [, g] of nodeGroups) { scene.remove(g); disposeGroup(g) }
+  for (const [, g] of edgeGroups) { scene.remove(g); disposeGroup(g) }
+  nodeGroups.clear(); edgeGroups.clear()
+}
+
 function updateGraph() {
   if (!scene) return
   const ns = props.nodes, es = props.edges
+  // Full clear when switching to empty graph (new chat)
+  if (ns.length === 0) { clearAll(); return }
   const newIds = new Set(ns.map((n: any) => n.id))
   // Remove stale
-  for (const [id, g] of nodeGroups) { if (!newIds.has(id)) { scene.remove(g); nodeGroups.delete(id) } }
+  for (const [id, g] of nodeGroups) { if (!newIds.has(id)) { scene.remove(g); disposeGroup(g); nodeGroups.delete(id) } }
   for (const [k, g] of edgeGroups) {
     const [s, t] = k.split('->')
-    if (!newIds.has(s) || !newIds.has(t)) { scene.remove(g); edgeGroups.delete(k) }
+    if (!newIds.has(s) || !newIds.has(t)) { scene.remove(g); disposeGroup(g); edgeGroups.delete(k) }
   }
   // Add new nodes
   ns.forEach((n: any, i: number) => {
