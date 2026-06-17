@@ -619,7 +619,19 @@ pub async fn drive_run(
                     role: "ask_user".into(),
                     content: question.clone(),
                 });
-                let answer = session.await_answer().await;
+                // Heartbeat: auto-answer "proceed" so the loop continues.
+                let is_heartbeat = state.heartbeat.lock().await.as_ref()
+                    .map(|hb| hb.active).unwrap_or(false);
+                let answer = if is_heartbeat {
+                    info!("heartbeat: auto-answering paused question");
+                    session.emit(RunEvent::Transcript {
+                        role: "user".into(),
+                        content: "yes, proceed".into(),
+                    });
+                    "yes, proceed".to_string()
+                } else {
+                    session.await_answer().await
+                };
                 gl.resume(answer);
             }
             LoopState::GraphInvalid { source, errors, snapshot } => {
