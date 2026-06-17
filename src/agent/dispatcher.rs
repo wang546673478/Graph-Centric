@@ -330,7 +330,17 @@ impl Dispatcher {
                     .and_then(|v| serde_json::from_value::<CheckContract>(v.clone()).ok())
                     .unwrap_or_default();
                 match contract.check(&r.output) {
-                    ContractOutcome::Satisfied => {}
+                    ContractOutcome::Satisfied => {
+                        // Also check tool-call contracts (MustEdit).
+                        match contract.check_tool_calls(r.tool_calls_made) {
+                            ContractOutcome::Satisfied => {}
+                            ContractOutcome::Failed(reason) => {
+                                r.success = false;
+                                r.error = Some(format!("contract violated: {reason}"));
+                                ok = false;
+                            }
+                        }
+                    }
                     ContractOutcome::Failed(reason) => {
                         r.success = false;
                         r.error = Some(format!("contract violated: {reason}"));

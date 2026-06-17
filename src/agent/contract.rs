@@ -31,31 +31,19 @@ pub enum CheckContract {
     /// Know-how mode: result must mention at least one of the
     /// expected evidence phrases, and meet a minimum length.
     KnowHow {
-        /// Substrings; the result must contain at least one
-        /// (case-insensitive match).
         must_mention_any: Vec<String>,
-        /// Minimum character length of the result string. Filters
-        /// out trivial "I don't know" answers.
         min_length: usize,
     },
-    /// Exploratory mode: per-step contract. Result must mention
-    /// the scope, not exceed `max_items` reported graph items, and
-    /// stay within `region` (the region field is for the system
-    /// prompt; this function only checks scope-mention + item count).
+    /// Exploratory mode: per-step contract.
     Exploratory {
-        /// The graph region this item is supposed to explore. Stored
-        /// on the contract for the prompt and for audit, not checked
-        /// here (region validation is the main agent's job at
-        /// propose_patch time).
         #[serde(default)]
         region: Vec<crate::graph::NodeId>,
-        /// Max reported items in the result. Items are counted as
-        /// lines that look like `id=...` or `- id=...`.
         max_items: usize,
-        /// Substrings; the result must contain at least one
-        /// (typically the scope path or anchor node id).
         must_mention_any: Vec<String>,
     },
+    /// Must-edit mode: sub-agent MUST make at least one tool call
+    /// (i.e., actually do work, not just report). Fails if tool_calls_made == 0.
+    MustEdit,
 }
 
 /// Result of evaluating a `CheckContract` against a `SubAgentResult`.
@@ -74,10 +62,14 @@ impl ContractOutcome {
 }
 
 impl CheckContract {
-    /// Evaluate this contract against the given `output` string
-    /// (the sub-agent's `final_answer`).
+    /// Evaluate this contract against the given `output` string.
     pub fn check(&self, output: &str) -> ContractOutcome {
         match self {
+            Self::MustEdit => {
+                // MustEdit is checked via check_tool_calls, not text output.
+                ContractOutcome::Satisfied
+            }
+            // ... existing variants unchanged ...
             CheckContract::None => ContractOutcome::Satisfied,
             CheckContract::KnowHow { must_mention_any, min_length } => {
                 if output.len() < *min_length {
@@ -115,6 +107,23 @@ impl CheckContract {
                     )),
                 }
             }
+        }
+    }
+
+    /// Check a contract that depends on tool execution, not text output.
+    /// MustEdit: requires at least one tool call.
+    pub fn check_tool_calls(&self, tool_calls_made: usize) -> ContractOutcome {
+        match self {
+            Self::MustEdit => {
+                if tool_calls_made > 0 {
+                    ContractOutcome::Satisfied
+                } else {
+                    ContractOutcome::Failed(
+                        "MustEdit: sub-agent made 0 tool calls — must actually edit code, not just report".into()
+                    )
+                }
+            }
+            _ => ContractOutcome::Satisfied, // other contracts don't care about tool calls
         }
     }
 }

@@ -368,7 +368,10 @@ impl SubAgent {
 
             match parse_action(&resp.content) {
                 Action::FinalAnswer { answer, .. } => {
-                    let outcome = task.contract.check(&answer);
+                    let mut outcome = task.contract.check(&answer);
+                    if outcome.is_satisfied() {
+                        outcome = task.contract.check_tool_calls(tool_calls_made);
+                    }
                     if !outcome.is_satisfied() {
                         // Contract failed. Feed the failure back as a user
                         // message so the model can retry. This counts as a
