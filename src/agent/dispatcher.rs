@@ -117,25 +117,25 @@ impl SubAgentPool {
                     agent.as_ref().clone()
                 };
                 let result = agent.execute(&sub_task, &world_graph, loader.as_ref()).await;
-                // Git isolation: commit on success, revert on failure.
+                // Git safety: commit on success, reset on failure.
                 match &result {
                     Ok(r) if r.success => {
-                        let branch = format!("task-{}", task_id.as_str().chars().take(12).collect::<String>());
-                        let _ = std::process::Command::new("git").args(["checkout", "-b", &branch]).output();
-                        let _ = std::process::Command::new("git").args(["add", "-A"]).output();
-                        let msg = format!("subagent: {}", sub_task.description.chars().take(80).collect::<String>());
-                        let _ = std::process::Command::new("git").args(["commit", "-m", &msg]).output();
-                        // Verify it builds.
-                        let check = std::process::Command::new("cargo").args(["check", "--lib"]).output();
-                        if let Ok(out) = check {
-                            if out.status.success() {
-                                let _ = std::process::Command::new("git").args(["checkout", "main"]).output();
-                                let _ = std::process::Command::new("git").args(["merge", &branch]).output();
-                            } else {
-                                // Build failed — discard the task's changes.
-                                let _ = std::process::Command::new("git").args(["checkout", "main"]).output();
-                                let _ = std::process::Command::new("git").args(["branch", "-D", &branch]).output();
-                                tracing::warn!(task = %task_id, "subagent changes failed cargo check; discarded");
+                        let add = std::process::Command::new("git").args(["add", "-A"]).output();
+                        let diff = std::process::Command::new("git").args(["diff", "--cached", "--stat"]).output();
+                        // Only commit if there are actual changes.
+                        if let Ok(ref d) = diff {
+                            if !String::from_utf8_lossy(&d.stdout).trim().is_empty() {
+                                let msg = format!("🤖 subagent: {}", sub_task.description.chars().take(80).collect::<String>());
+                                let _ = std::process::Command::new("git").args(["commit", "-m", &msg]).output();
+                                // Verify it compiles.
+                                let check = std::process::Command::new("cargo").args(["check", "--lib"]).output();
+                                if let Ok(out) = check {
+                                    if !out.status.success() {
+                                        // Build failed — revert this commit.
+                                        let _ = std::process::Command::new("git").args(["reset", "--hard", "HEAD~1"]).output();
+                                        tracing::warn!(task = %task_id, "subagent changes failed cargo check; reverted");
+                                    }
+                                }
                             }
                         }
                     }
