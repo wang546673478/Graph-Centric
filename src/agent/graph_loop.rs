@@ -355,7 +355,7 @@ impl GraphLoopConfig {
             max_rounds: 300,
             max_repair_rounds: 4,
             tool_cwd: cwd.into(),
-            tool_output_cap: 32_000,
+            tool_output_cap: 100_000,
             tool_policy: Arc::new(crate::tools::AllowAll),
         }
     }
