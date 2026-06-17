@@ -246,7 +246,8 @@ The `ReadOnly` policy permits only commands that classify as read-only.
 | 2 (framework) | done | Model trait + OpenAI-compat, Conversation, Tool layer, Proposer, Verifier, LocalRepairer, GraphLoop |
 | 2.5 (three-layer) | done | L1Description, L1Store, L1Enricher, Verifier L1 sampling, Repairer L0/L1/Scope split, ContextBuilder L1 rendering, GraphLoop L1 auto-enrich |
 | 3 (task phase) | done | Decomposer, SubAgent + tool-calling loop, Dispatcher, SubAgentPool |
-| 4 (review + bubble + auto-repair + validator) | done | Reviewer (det. + LLM judge), sub-agent `report_graph_error` action, Demo A auto-repair, extended ReadOnly whitelist, PostExecutionValidator + `BashCheckValidator` |
+| 4 (review + bubble + auto-repair + validator) | done | Reviewer (det. + LLM judge), sub-agent `report_graph_error` action, Demo A auto-repair, PostExecutionValidator + `BashCheckValidator` |
+| 5 (v2) | done | Cascade backtracking, WebSocket, Vue 3 frontend, checkpoint persistence, multi-profile config, skill-to-graph compiler, 3D graph panel, streaming output, git workflow, heartbeat self-improvement loop, Hook system, quality metrics scanner, fractal L0/L1/L2 architecture |
 
 ## What's runnable now
 

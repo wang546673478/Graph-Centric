@@ -11,22 +11,32 @@ first if you haven't.
 
 ## Recent changes
 
-- **v1.1 (2026-06-03) — IMPLICIT_CWD_WRITE_VERBS.** The `ScopeGuard` now
-  recognizes 12 common build tools (`cargo`, `rustc`, `go`, `node`,
-  `npm`, `yarn`, `pnpm`, `python`, `python3`, `pip`, `pip3`, `make`) as
-  "implicit cwd writes": when the command has no explicit out-of-scope
-  path argument, the scope check is skipped. Verb list is
-  runtime-configurable via `with_implicit_cwd_verb` /
-  `without_implicit_cwd_verb` / `reset_implicit_cwd_verbs`. The bash
-  algorithm grew from 7 steps to 10 (compound check now runs before
-  the "unrecognized" check; new "empty + implicit_cwd → Ok" branch).
-  See §5, §10, §13.
-- **v1 (2026-06-03) — Tool System Rework.** New `DangerousCommandDeny`
-  policy (default-allow, deny on a 20-pattern high-risk command list) and
-  `ScopeGuard` (write-scope derived from `task.involved_nodes`). The
-  SubAgent default policy switched from `AllowAll` to
-  `DangerousCommandDeny`; the dispatcher auto-derives a `ScopeGuard`
-  per task. See §10, §7.
+- **v2.3 (2026-06-17) — HeartBeat Self-Improvement Loop.** Autonomous
+  multi-round agent optimization that survives process restarts. On startup,
+  if a heartbeat task is stored, a new run is created automatically. After
+  each successful Review, the round counter increments, changes are committed,
+  the binary is rebuilt, and the process exits — the external launcher
+  restarts it to continue the next round. Managed via `POST /api/heartbeat` or
+  the Settings page. See `docs/implementation-plan-fractal-graph.md`.
+
+- **v2.2 (2026-06-17) — Hook System.** `PreToolUse`/`PostToolUse` lifecycle
+  callbacks around every tool invocation. Ships with `LoggingHook` (tracing),
+  `StatsHook` (per-tool call count/duration/bytes), and `SafetyHook` (deny
+  patterns). Integrated into SubAgent's `ToolContext`. See `src/tools/mod.rs`.
+
+- **v2.1 (2026-06-16) — Fractal Architecture.** L0/L1/L2 is recursive:
+  complex nodes (files, functions) expand into their own sub-graph with the
+  same three layers. AST scanner extracts function/class-level symbols with
+  line ranges as child nodes via `Contains` edges. Quality metrics (LOC,
+  unwrap/unsafe/TODO counts) computed per file. 3D graph panel with Three.js.
+  See `docs/recursive-l0-l1-l2-architecture.md`.
+
+- **v2.0 (2026-06-15) — Cascade Backtracking.** When a downstream node fails,
+  main agent auto-replans and cascaded verification walks all predecessor
+  edges toward the immutable anchor. See `docs/design-v2-cascade-backtrack.md`.
+
+- **v1.1 (2026-06-03) — IMPLICIT_CWD_WRITE_VERBS.** See §5, §10, §13.
+- **v1 (2026-06-03) — Tool System Rework.** See §10, §7.
 
 ---
 
