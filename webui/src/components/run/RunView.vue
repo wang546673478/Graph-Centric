@@ -4,7 +4,7 @@ import { activeRunId, runs, findRun, createRun, useRunSocket, detailMode, WSEven
 import { useI18n } from '../../composables/useI18n'
 import Transcript from './Transcript.vue'
 import Composer from './Composer.vue'
-import GraphPanel from '../graph/GraphPanel.vue'
+import GraphPanel3D from '../graph/GraphPanel3D.vue'
 import DebugTimeline from './DebugTimeline.vue'
 
 const { t } = useI18n()
@@ -176,7 +176,7 @@ async function submitTask(task: string) {
         <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
-      <GraphPanel v-if="tab === 'graph'" :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
+      <GraphPanel3D v-if="tab === 'graph'" :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
       <DebugTimeline v-else-if="tab === 'debug'" />
       <div v-else class="placeholder">{{ t('files.empty') }}</div>
     </div>
