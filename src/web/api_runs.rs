@@ -23,7 +23,7 @@ use crate::agent::validator::{BashCheckValidator, PostExecutionValidator};
 use crate::agent::verifier::Verifier;
 use crate::graph::Graph;
 use crate::model::ModelConfig;
-use crate::tools::{BashTool, DangerousCommandDeny, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool};
+use crate::tools::{BashTool, DangerousCommandDeny, EditFileTool, ReadFileTool, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool};
 use axum::{
     extract::{Path, State},
     response::{
@@ -395,6 +395,9 @@ pub async fn drive_run(
     let subagent_tool_registry = Arc::new({
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(BashTool::new()));
+        reg.register(Arc::new(ReadFileTool::default()));
+        reg.register(Arc::new(WriteFileTool::default()));
+        reg.register(Arc::new(EditFileTool::default()));
         reg.register(Arc::new(WebSearchTool::new()));
         reg.register(Arc::new(WebFetchTool::new()));
         reg
