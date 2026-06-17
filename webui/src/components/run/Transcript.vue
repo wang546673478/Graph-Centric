@@ -17,6 +17,17 @@ function roleClass(r: string) {
   if (r === 'cascade' || r === 'model' || r === 'checkpoint') return 'detail'
   return ''
 }
+
+function roleLabel(r: string): string {
+  const zh: Record<string, string> = {
+    user: '用户', assistant: '助手', agent: '代理',
+    tool_result: '工具结果', error: '错误',
+    ask_user: '询问用户', block: '阻塞', explore: '探索',
+    cascade: '级联回溯', model: '模型调用', checkpoint: '检查点',
+    thinking: '思考', assistant_streaming: '流式生成',
+  }
+  return zh[r] || r
+}
 </script>
 
 <template>
@@ -30,7 +41,7 @@ function roleClass(r: string) {
         <pre v-if="thinkingExpanded" class="thinking-body">{{ m.content }}</pre>
       </div>
       <div v-else class="msg" :class="roleClass(m.role)">
-        <span class="role-tag">{{ m.role }}</span>
+        <span class="role-tag">{{ roleLabel(m.role) }}</span>
         <pre class="body">{{ m.content }}</pre>
       </div>
     </template>
