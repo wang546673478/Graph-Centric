@@ -304,6 +304,33 @@ pub async fn create_branch(
 
 // --- Run driver ---
 
+/// Spawn the next heartbeat run immediately.
+fn spawn_heartbeat_continuation(state: Arc<WebState>) {
+    let (prompt, label, do_it) = {
+        let rt = tokio::runtime::Handle::current();
+        let hb_guard = rt.block_on(state.heartbeat.lock());
+        match &*hb_guard {
+            Some(hb) if hb.active && hb.current_run_id.is_none() =>
+                (hb.prompt.clone(), format!("🫀 Round {}/{}", hb.completed_rounds + 1, hb.max_rounds), true),
+            _ => (String::new(), String::new(), false),
+        }
+    };
+    if !do_it { return; }
+    info!("heartbeat: spawning next run immediately");
+    let id = uuid::Uuid::new_v4().to_string();
+    let session = Arc::new(RunSession::new(id.clone(), label));
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(state.runs.write()).insert(id.clone(), session.clone());
+    {
+        let mut hb_guard = rt.block_on(state.heartbeat.lock());
+        if let Some(ref mut hb) = *hb_guard {
+            hb.current_run_id = Some(id.clone()); hb.save();
+        }
+    }
+    session.emit(RunEvent::Transcript { role: "user".into(), content: format!("Task: {}", prompt) });
+    tokio::spawn(async move { drive_run(state, id, None, None).await; });
+}
+
 /// The actual agent loop. Spawned as a tokio task by `create_run`. Maps
 /// each `LoopState` to events and broadcasts them on the session's
 /// channel. Resolves `Paused` and `GraphInvalid` via the session's
@@ -724,20 +751,13 @@ pub async fn drive_run(
                     }
                 }
                 // Heartbeat: round completed successfully.
-                let mut hb_guard = state.heartbeat.lock().await;
-                if let Some(ref mut hb) = *hb_guard {
-                    if hb.active {
-                        let more = hb.round_complete();
-                        drop(hb_guard);
-                        if more {
-                            // Build new binary and exit so external launcher restarts.
-                            info!("heartbeat: rebuilding for next round...");
-                            let _ = std::process::Command::new("cargo").args(["build", "--bin", "serve"]).status();
-                            info!("heartbeat: exiting for restart");
-                            std::process::exit(0);
-                        }
-                    }
-                }
+                let do_spawn = {
+                    let mut hb_guard = state.heartbeat.lock().await;
+                    if let Some(ref mut hb) = *hb_guard {
+                        if hb.active { hb.round_complete() } else { false }
+                    } else { false }
+                };
+                if do_spawn { spawn_heartbeat_continuation(state.clone()); }
                 return;
             }
             LoopState::Error(msg) => {
@@ -745,10 +765,13 @@ pub async fn drive_run(
                 let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Error { message: msg });
                 // Heartbeat: error counts as learning — advance to next round.
-                let mut hb_guard = state.heartbeat.lock().await;
-                if let Some(ref mut hb) = *hb_guard {
-                    if hb.active { hb.round_complete(); }
-                }
+                let do_spawn = {
+                    let mut hb_guard = state.heartbeat.lock().await;
+                    if let Some(ref mut hb) = *hb_guard {
+                        if hb.active { hb.round_complete() } else { false }
+                    } else { false }
+                };
+                if do_spawn { spawn_heartbeat_continuation(state.clone()); }
                 return;
             }
             LoopState::TaskFailed { failures } => {
@@ -758,11 +781,13 @@ pub async fn drive_run(
                 session.emit(RunEvent::Error {
                     message: format!("task failed: {failures:?}"),
                 });
-                // Heartbeat: task failure counts as learning.
-                let mut hb_guard = state.heartbeat.lock().await;
-                if let Some(ref mut hb) = *hb_guard {
-                    if hb.active { hb.round_complete(); }
-                }
+                let do_spawn = {
+                    let mut hb_guard = state.heartbeat.lock().await;
+                    if let Some(ref mut hb) = *hb_guard {
+                        if hb.active { hb.round_complete() } else { false }
+                    } else { false }
+                };
+                if do_spawn { spawn_heartbeat_continuation(state.clone()); }
                 return;
             }
             LoopState::Running => {
