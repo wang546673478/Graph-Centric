@@ -462,6 +462,54 @@ pub struct GraphLoop {
     pending: Pending,
 }
 
+/// Extract file/function/class entities from Explore output text and produce
+/// a GraphPatch that adds them as L0 nodes with Contains edges from a scope node.
+fn extract_entities_to_patch(text: &str, scope: &str) -> crate::graph::GraphPatch {
+    use crate::graph::{Edge, GraphPatch, Node, NodeId, NodeKind, RelationType};
+    use regex::Regex;
+
+    let mut patch = GraphPatch::default();
+
+    // Extract file paths: /path/to/file.ext, src/file.rs, etc.
+    let file_re = Regex::new(r"([\w/\-._]+\.(rs|py|js|ts|tsx|go|java|kt|rb|md|toml|yaml|json|toml|css|html|vue))").unwrap();
+    let mut seen = std::collections::HashSet::new();
+
+    for cap in file_re.captures_iter(text) {
+        let path = cap[0].to_string();
+        if seen.contains(&path) { continue; }
+        seen.insert(path.clone());
+
+        let id = NodeId::from(path.clone());
+        patch.add_nodes.push(Node::file(path.clone(), format!("{path} (discovered by explore)")));
+        // Link to scope if scope looks like a parent.
+        if !scope.is_empty() && scope != path {
+            let scope_id = NodeId::from(scope.to_string());
+            patch.add_edges.push(Edge::new(
+                scope_id, id.clone(),
+                RelationType::Contains, 0.7,
+                "extracted from explore output",
+            ));
+        }
+    }
+
+    // Extract function/class names: `fn login`, `def process`, `class Auth`
+    let sym_re = Regex::new(r"(fn|def|func|class|struct|enum|interface)\s+(\w+)").unwrap();
+    for cap in sym_re.captures_iter(text) {
+        let name = cap[2].to_string();
+        if seen.contains(&name) { continue; }
+        seen.insert(name.clone());
+
+        let id = NodeId::from(name.clone());
+        let kind = match &cap[1] {
+            "class" | "struct" | "enum" | "interface" => NodeKind::Class,
+            _ => NodeKind::Function,
+        };
+        patch.add_nodes.push(Node::new(id.clone(), kind, String::new(), name));
+    }
+
+    patch
+}
+
 /// Summarize long subagent output into a concise report for the main agent.
 async fn summarize_for_main_agent(model: &(dyn crate::model::Model), text: &str) -> String {
     if text.len() <= 3000 {
@@ -1595,6 +1643,19 @@ impl GraphLoop {
             }
         }
         let elapsed_ms = started.elapsed().as_millis() as u64;
+
+        // Auto-extract entities from Explore results and add to graph
+        // so the model sees them without re-exploring.
+        for (i, (item, res)) in items.iter().zip(results.iter()).enumerate() {
+            if let Ok(r) = res {
+                if r.success {
+                    let patch = extract_entities_to_patch(&r.output, &item.scope);
+                    if patch.add_nodes.len() > 0 || patch.add_edges.len() > 0 {
+                        let _ = self.graph.apply_patch(patch);
+                    }
+                }
+            }
+        }
 
         // Combine all results into a single user message
         // for the main agent. Item-by-item, success or
