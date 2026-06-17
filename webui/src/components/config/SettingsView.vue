@@ -13,14 +13,28 @@ const keyDirty = ref(false)
 const origKey = ref('')
 const profileName = ref('')
 const profiles = ref<Record<string, any>>({})
+const heartbeat = ref<any>(null)
 
 onMounted(async () => {
   try {
     config.value = await api.get('/api/config')
     origKey.value = config.value.model?.api_key_masked || ''
     profiles.value = config.value.profiles || {}
+    heartbeat.value = await api.get('/api/heartbeat')
   } catch { /* */ }
 })
+
+async function startHeartbeat() {
+  try { heartbeat.value = await api.post('/api/heartbeat/default'); await api.get('/api/heartbeat') } catch { /* */ }
+  heartbeat.value = { active: true, max_rounds: 10, completed_rounds: 0 }
+}
+async function cancelHeartbeat() {
+  try { heartbeat.value = await api.post('/api/heartbeat/cancel') } catch { /* */ }
+  heartbeat.value = { active: false }
+}
+async function refreshHeartbeat() {
+  try { heartbeat.value = await api.get('/api/heartbeat') } catch { /* */ }
+}
 
 function onKeyInput() { keyDirty.value = true }
 
@@ -85,6 +99,24 @@ async function save() {
 <template>
   <div class="settings">
     <h2>{{ t('settings.title') }}</h2>
+
+    <!-- Heartbeat -->
+    <section class="heartbeat-section">
+      <h3>🫀 自优化循环 (HeartBeat)</h3>
+      <div v-if="heartbeat && heartbeat.active" class="hb-active">
+        <div><b>状态:</b> 🔄 运行中 · 第 {{ heartbeat.completed_rounds || 0 }}/{{ heartbeat.max_rounds }} 轮</div>
+        <div class="hb-prompt">{{ heartbeat.prompt?.slice(0, 200) }}…</div>
+        <div class="hb-actions">
+          <button class="secondary" @click="refreshHeartbeat">🔄 刷新状态</button>
+          <button class="danger" @click="cancelHeartbeat">⏹ 停止</button>
+        </div>
+      </div>
+      <div v-else class="hb-idle">
+        <div><b>状态:</b> ⏸ 未启动</div>
+        <p class="hint">启动后每次 Review 通过自动提交代码、编译、重启，继续下一轮优化。后端 Rust + 前端 Vue3 都在优化范围内。</p>
+        <button class="primary" @click="startHeartbeat">▶ 启动 10 轮自优化</button>
+      </div>
+    </section>
 
     <!-- Profile bar -->
     <section>
@@ -172,4 +204,10 @@ button.primary { margin-top: 8px; padding: 10px 24px; }
 .profile-select { flex: 1; min-width: 120px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); color: var(--text); font-size: 0.8rem; font-family: var(--font); }
 .profile-input { width: 120px; flex: none; }
 .profile-bar button { font-size: 0.72rem; padding: 5px 8px; white-space: nowrap; }
+.heartbeat-section { border-color: #a78bda; }
+.hb-active { display: flex; flex-direction: column; gap: 8px; }
+.hb-prompt { font-size: 0.7rem; color: var(--text-muted); max-height: 50px; overflow: hidden; }
+.hb-actions { display: flex; gap: 6px; margin-top: 4px; }
+.hb-idle { display: flex; flex-direction: column; gap: 8px; }
+.hb-idle .hint { font-size: 0.72rem; color: var(--text-muted); line-height: 1.5; }
 </style>

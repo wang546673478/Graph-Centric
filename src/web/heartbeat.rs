@@ -54,20 +54,36 @@ pub struct HeartBeat {
 /// Default 10-round self-optimization prompt.
 pub const DEFAULT_OPTIMIZATION_PROMPT: &str = "\
 对 Graph-Centric Agent 进行10轮自我优化。每轮选一个具体优化点，改完通过编译后自动重启进入下一轮。\
+\n优化范围包括后端Rust代码(src/)和前端Vue3界面(webui/src/)。\
+\n\
+\n## 优化方向\
+\n### 后端 (src/)\
+\n- 降低unwrap/unsafe密度，提升代码健壮性\
+\n- 优化模块边界，减少大文件(>500行)\
+\n- 改善错误处理，用结构化错误替代字符串\
+\n- 参考 openclaw/opencode/CodeWhale 中的模式但不照搬\
+\n\
+\n### 前端 (webui/src/)\
+\n- 参考 GitHub 上优秀AI agent项目(OpenCode/CrewAI/AutoGPT/Langflow)的Web界面设计\
+\n- 优化现有Vue3组件的排版、配色、交互体验\
+\n- 改进对话区域的视觉层次感和可读性\
+\n- 增强3D关系图面板的可用性(标签、动画、布局)\
+\n- 设置页面和信息页面的信息架构优化\
 \n\
 \n## 每轮工作流 (A→D)\
-\n1. 创建 A(当前问题)和 D(优化目标)，例如 A=\"graph_loop.rs unwrap密度过高\" D=\"用Result传播替代.unwrap()\"\
-\n2. Explore 扫描 src/ 找出 ⚠️ 质量标记的节点(节点metadata含loc/unwrap_count/unsafe_count/quality_score)\
-\n3. 可选: Explore 搜索外部优秀项目(openclaw/opencode/CodeWhale)的对应模块实现\
-\n4. ProposePatch: 仅修改1-3个相关文件，按DependsOn建中间节点\
+\n1. 创建 A(当前问题)和 D(优化目标)\
+\n2. Explore 扫描 src/ 或 webui/src/ 找出具体问题点\
+\n3. 可选: Explore 搜索外部项目的对应实现作为参考\
+\n4. ProposePatch: 仅修改1-3个相关文件\
 \n5. SubAgent执行修改(自动git branch+commit+cargo check验证)\
 \n6. Review通过→本轮完成→自动编译重启进入下一轮\
 \n\
 \n## 约束\
-\n- 每轮只改1-3个文件，必须cargo check通过\
+\n- 每轮只改1-3个文件，必须编译通过\
 \n- 禁止引入新unwrap/unsafe，禁止删除测试\
 \n- 不改graph/mod.rs和graph/l1.rs(核心图结构)\
-\n- 外部项目参考模式不照搬代码\
+\n- 外部项目只参考设计模式，不照搬代码\
+\n- 前端改动不引入新依赖(保持轻量)\
 \n- 第10轮结束自动停止";
 
 impl HeartBeat {
