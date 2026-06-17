@@ -529,7 +529,7 @@ fn extract_entities_to_patch(text: &str, scope: &str, graph: &crate::graph::Grap
         ));
     }
 
-    // Bare function/class mentions without file context.
+    // Bare function/class mentions without file context — link to scope.
     let bare_re = Regex::new(r"(fn|def|func|class|struct|enum|interface)\s+(\w+)").unwrap();
     for cap in bare_re.captures_iter(text) {
         let name = cap[2].to_string();
@@ -541,7 +541,14 @@ fn extract_entities_to_patch(text: &str, scope: &str, graph: &crate::graph::Grap
             "class" | "struct" | "enum" | "interface" => NodeKind::Class,
             _ => NodeKind::Function,
         };
-        patch.add_nodes.push(Node::new(id, kind, String::new(), name));
+        patch.add_nodes.push(Node::new(id.clone(), kind, String::new(), name));
+        if !scope.is_empty() {
+            patch.add_edges.push(Edge::new(
+                parent_id.clone(), id,
+                RelationType::Contains, 0.5,
+                "bare symbol from explore",
+            ));
+        }
     }
 
     patch
@@ -1688,7 +1695,9 @@ impl GraphLoop {
                 if r.success {
                     let patch = extract_entities_to_patch(&r.output, &item.scope, &self.graph);
                     if patch.add_nodes.len() > 0 || patch.add_edges.len() > 0 {
-                        let _ = self.graph.apply_patch(patch);
+                        if let Err(e) = self.graph.apply_patch(patch) {
+                            tracing::warn!(error = %e, "explore entity extraction: patch rejected");
+                        }
                     }
                 }
             }
