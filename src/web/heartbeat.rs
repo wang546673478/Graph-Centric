@@ -64,18 +64,23 @@ pub const DEFAULT_OPTIMIZATION_PROMPT: &str = "\
 \n- 参考 openclaw/opencode/CodeWhale 中的模式但不照搬\
 \n\
 \n### 前端 (webui/src/)\
-\n- 参考 GitHub 上优秀AI agent项目(OpenCode/CrewAI/AutoGPT/Langflow)的Web界面设计\
+\n- 参考 GitHub 上优秀AI agent项目的Web界面设计\
 \n- 优化现有Vue3组件的排版、配色、交互体验\
 \n- 改进对话区域的视觉层次感和可读性\
 \n- 增强3D关系图面板的可用性(标签、动画、布局)\
 \n- 设置页面和信息页面的信息架构优化\
 \n\
+\n## 搜索外部项目 (Explore + WebSearch)\
+\n- 用 Explore 派子代理去 GitHub 搜索关键词,如: \"openclaw agent harness architecture\" \"CodeWhale persistence implementation\" \"OpenCode UI design patterns\" \"CrewAI web interface\" \"Langflow frontend\"\
+\n- 子代理有 web_search 工具可直接搜索 GitHub,然后用 bash cat/grep 读返回的代码文件\
+\n- 搜索目标: 找到具体实现模式(不是概念描述),带回文件路径和代码片段\
+\n\
 \n## 每轮工作流 (A→D)\
-\n1. 创建 A(当前问题)和 D(优化目标)\
-\n2. Explore 扫描 src/ 或 webui/src/ 找出具体问题点\
-\n3. 可选: Explore 搜索外部项目的对应实现作为参考\
-\n4. ProposePatch: 仅修改1-3个相关文件\
-\n5. SubAgent执行修改(自动git branch+commit+cargo check验证)\
+\n1. 创建 A(当前问题)和 D(优化目标),比如 A=\"graph_loop.rs:1655 处 unwrap 会 panic\" D=\"用 proper error propagation 替换\"\
+\n2. Explore 扫描 src/ 或 webui/src/ 找出具体问题点,用节点 metadata 的 quality_score/unwrap_count 定位\
+\n3. 如果本轮需要外部参考: Explore + web_search 搜索 GitHub 找到具体实现模式\
+\n4. ProposePatch: 仅修改1-3个相关文件,用 DependsOn 建中间节点\
+\n5. SubAgent执行修改(自动git commit+cargo check验证,编译失败自动回退)\
 \n6. Review通过→本轮完成→自动编译重启进入下一轮\
 \n\
 \n## 约束\
