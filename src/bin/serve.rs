@@ -58,6 +58,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Restore persisted runs from disk so history survives restart.
     state.restore_persisted_runs().await;
 
+    // Heartbeat: auto-resume pending optimization task.
+    {
+        let mut hb = state.heartbeat.lock().await;
+        if let Some(ref mut hb) = *hb {
+            if hb.active && hb.current_run_id.is_none() {
+                info!(prompt = %hb.prompt, "heartbeat: starting/continuing optimization");
+                let id = uuid::Uuid::new_v4().to_string();
+                let session = Arc::new(graph_harness::web::run_session::RunSession::new(
+                    id.clone(),
+                    hb.prompt.clone(),
+                ));
+                state.runs.write().await.insert(id.clone(), session.clone());
+                hb.current_run_id = Some(id.clone());
+                hb.save();
+                let state2 = state.clone();
+                let id2 = id.clone();
+                tokio::spawn(async move {
+                    graph_harness::web::api_runs::drive_run(state2, id2, None, None).await;
+                });
+            }
+        }
+    }
+
     // Build router.
     let app = graph_harness::web::router((*state).clone(), &config.static_dir);
 

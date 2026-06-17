@@ -36,6 +36,7 @@ use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::info;
 use tokio_stream::StreamExt;
 
 type AppState = State<Arc<WebState>>;
@@ -307,7 +308,7 @@ pub async fn create_branch(
 /// each `LoopState` to events and broadcasts them on the session's
 /// channel. Resolves `Paused` and `GraphInvalid` via the session's
 /// `Notify` machinery.
-async fn drive_run(
+pub async fn drive_run(
     state: Arc<WebState>,
     id: RunId,
     initial_graph: Option<super::events::InitialGraphDto>,
@@ -702,6 +703,21 @@ async fn drive_run(
                                 }
                             }
                         });
+                    }
+                }
+                // Heartbeat: round completed successfully.
+                let mut hb_guard = state.heartbeat.lock().await;
+                if let Some(ref mut hb) = *hb_guard {
+                    if hb.active {
+                        let more = hb.round_complete();
+                        drop(hb_guard);
+                        if more {
+                            // Build new binary and exit so external launcher restarts.
+                            info!("heartbeat: rebuilding for next round...");
+                            let _ = std::process::Command::new("cargo").args(["build", "--bin", "serve"]).status();
+                            info!("heartbeat: exiting for restart");
+                            std::process::exit(0);
+                        }
                     }
                 }
                 return;

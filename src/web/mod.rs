@@ -13,6 +13,7 @@ pub mod checkpoint;
 pub mod config_api;
 pub mod errors;
 pub mod events;
+pub mod heartbeat;
 pub mod persistence;
 pub mod run_session;
 pub mod state;
@@ -31,16 +32,19 @@ pub struct WebState {
     pub skills: Arc<dyn SkillStorage>,
     pub config: state::WebConfig,
     pub persistence: persistence::RunPersistence,
+    pub heartbeat: Arc<tokio::sync::Mutex<Option<heartbeat::HeartBeat>>>,
 }
 
 impl WebState {
     pub fn new(skills: Arc<dyn SkillStorage>, config: state::WebConfig) -> Self {
         let persistence = persistence::RunPersistence::new(&config.project_root);
+        let hb = heartbeat::HeartBeat::load();
         Self {
             runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             skills,
             config,
             persistence,
+            heartbeat: Arc::new(tokio::sync::Mutex::new(hb)),
         }
     }
 
@@ -81,6 +85,8 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/usage", get(api_runs::get_usage))
         .route("/config", get(config_api::get_config).post(config_api::post_config))
         .route("/models", get(config_api::list_models))
+        .route("/heartbeat", get(config_api::get_heartbeat).post(config_api::start_heartbeat))
+        .route("/heartbeat/cancel", post(config_api::cancel_heartbeat))
         .route("/runs", get(api_runs::list_runs).post(api_runs::create_run))
         .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))
         .route("/runs/:id/events", get(api_runs::run_events))

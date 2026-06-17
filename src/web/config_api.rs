@@ -2,10 +2,46 @@
 
 use super::state::{EngineConfig, ModelTierConfig};
 use super::errors::ApiError;
+use super::heartbeat::HeartBeat;
 use super::WebState;
 use axum::{extract::{Query, State}, Json};
 use serde::Deserialize;
 use std::sync::Arc;
+
+#[derive(Deserialize)]
+pub struct HeartBeatBody {
+    pub prompt: String,
+    pub max_rounds: usize,
+}
+
+pub async fn start_heartbeat(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<HeartBeatBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hb = HeartBeat::start(body.prompt, body.max_rounds);
+    let mut guard = state.heartbeat.lock().await;
+    *guard = Some(hb.clone());
+    Ok(Json(serde_json::json!({"started": true, "max_rounds": hb.max_rounds, "prompt": hb.prompt})))
+}
+
+pub async fn get_heartbeat(
+    State(state): State<Arc<WebState>>,
+) -> Json<serde_json::Value> {
+    let guard = state.heartbeat.lock().await;
+    if let Some(ref hb) = *guard {
+        Json(serde_json::json!({"active": hb.active, "prompt": hb.prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds}))
+    } else {
+        Json(serde_json::json!({"active": false}))
+    }
+}
+
+pub async fn cancel_heartbeat(
+    State(state): State<Arc<WebState>>,
+) -> Json<serde_json::Value> {
+    let mut guard = state.heartbeat.lock().await;
+    if let Some(ref mut hb) = *guard { hb.cancel(); }
+    Json(serde_json::json!({"cancelled": true}))
+}
 
 #[derive(Deserialize)]
 pub struct ModelsQuery {
