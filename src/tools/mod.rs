@@ -164,6 +164,61 @@ impl Hook for CollectingHook {
     }
 }
 
+/// Aggregated per-tool statistics.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ToolStats {
+    pub call_count: u64,
+    pub total_duration_ms: u64,
+    pub total_output_bytes: u64,
+    pub avg_duration_ms: f64,
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A hook that aggregates performance/usage stats per tool.
+pub struct StatsHook {
+    pub stats: std::sync::Arc<std::sync::Mutex<HashMap<String, ToolStats>>>,
+}
+
+impl Default for StatsHook {
+    fn default() -> Self {
+        Self { stats: Default::default() }
+    }
+}
+
+impl Hook for StatsHook {
+    fn post_tool_use(&self, name: &str, output: &str, ms: u64) {
+        let mut map = self.stats.lock().unwrap();
+        let entry = map.entry(name.to_string()).or_default();
+        entry.call_count += 1;
+        entry.total_duration_ms += ms;
+        entry.total_output_bytes += output.len() as u64;
+        entry.avg_duration_ms = entry.total_duration_ms as f64 / entry.call_count as f64;
+    }
+}
+
+/// A safety hook that blocks commands matching dangerous patterns.
+pub struct SafetyHook {
+    pub deny_patterns: Vec<String>,
+}
+
+impl SafetyHook {
+    pub fn new(patterns: Vec<String>) -> Self { Self { deny_patterns: patterns } }
+}
+
+impl Hook for SafetyHook {
+    fn pre_tool_use(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+        if name != "bash" { return Ok(()); }
+        let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        for pat in &self.deny_patterns {
+            if cmd.contains(pat) {
+                return Err(format!("safety hook: matched deny pattern '{pat}'"));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Policy gate
 // ---------------------------------------------------------------------------

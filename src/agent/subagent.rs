@@ -331,6 +331,7 @@ impl SubAgent {
             .with_policy(self.policy.clone())
             .with_max_output(self.tool_output_cap);
         tool_ctx.add_hook(Arc::new(crate::tools::LoggingHook::default()));
+        tool_ctx.add_hook(Arc::new(crate::tools::StatsHook::default()));
 
         let mut tokens_used = 0usize;
         let mut tool_calls_made = 0usize;

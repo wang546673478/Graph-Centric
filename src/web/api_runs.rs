@@ -889,6 +889,7 @@ pub struct UsageStats {
     total_runs: usize,
     model_breakdown: std::collections::HashMap<String, ModelUsage>,
     runs: Vec<RunUsage>,
+    tool_stats: std::collections::HashMap<String, crate::tools::ToolStats>,
 }
 
 #[derive(serde::Serialize)]
@@ -938,6 +939,7 @@ pub async fn get_usage(
         total_runs: runs.len(),
         model_breakdown,
         runs: run_list,
+        tool_stats: std::collections::HashMap::new(),
     }))
 }
 
