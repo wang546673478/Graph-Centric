@@ -150,6 +150,12 @@ impl ScopeGuard {
         // Deduplicate (paths may repeat when multiple nodes share a parent).
         paths.sort();
         paths.dedup();
+        // If no file paths were found (all Task-kind nodes, e.g. self-optimization),
+        // allow the project root so the agent can work on the full codebase.
+        if paths.is_empty() {
+            return Self::new(vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))])
+                .restrict_reads(false);
+        }
         Self::new(paths)
     }
 
