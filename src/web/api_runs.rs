@@ -651,6 +651,7 @@ pub async fn drive_run(
                     .map(|hb| hb.active).unwrap_or(false);
                 let answer = if is_heartbeat {
                     info!("heartbeat: auto-answering paused question");
+                    *session.status.write().await = RunStatus::Running;
                     session.emit(RunEvent::Transcript {
                         role: "user".into(),
                         content: "yes, proceed".into(),
