@@ -116,7 +116,35 @@ impl SubAgentPool {
                 } else {
                     agent.as_ref().clone()
                 };
-                agent.execute(&sub_task, &world_graph, loader.as_ref()).await
+                let result = agent.execute(&sub_task, &world_graph, loader.as_ref()).await;
+                // Git isolation: commit on success, revert on failure.
+                match &result {
+                    Ok(r) if r.success => {
+                        let branch = format!("task-{}", task_id.as_str().chars().take(12).collect::<String>());
+                        let _ = std::process::Command::new("git").args(["checkout", "-b", &branch]).output();
+                        let _ = std::process::Command::new("git").args(["add", "-A"]).output();
+                        let msg = format!("subagent: {}", sub_task.description.chars().take(80).collect::<String>());
+                        let _ = std::process::Command::new("git").args(["commit", "-m", &msg]).output();
+                        // Verify it builds.
+                        let check = std::process::Command::new("cargo").args(["check", "--lib"]).output();
+                        if let Ok(out) = check {
+                            if out.status.success() {
+                                let _ = std::process::Command::new("git").args(["checkout", "main"]).output();
+                                let _ = std::process::Command::new("git").args(["merge", &branch]).output();
+                            } else {
+                                // Build failed — discard the task's changes.
+                                let _ = std::process::Command::new("git").args(["checkout", "main"]).output();
+                                let _ = std::process::Command::new("git").args(["branch", "-D", &branch]).output();
+                                tracing::warn!(task = %task_id, "subagent changes failed cargo check; discarded");
+                            }
+                        }
+                    }
+                    _ => {
+                        // Failed task — discard any uncommitted changes.
+                        let _ = std::process::Command::new("git").args(["checkout", "--", "."]).output();
+                    }
+                }
+                result
             });
             handles.push(handle);
         }
