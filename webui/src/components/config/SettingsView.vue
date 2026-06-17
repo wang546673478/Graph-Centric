@@ -24,12 +24,14 @@ onMounted(async () => {
 
 function onKeyInput() { keyDirty.value = true }
 
-function switchProfile(name: string) {
+async function switchProfile(name: string) {
   if (profiles.value[name]) {
     config.value.model = { ...profiles.value[name] }
     config.value.active_profile = name
     origKey.value = config.value.model?.api_key_masked || ''
     keyDirty.value = false
+    // Auto-save on profile switch so env vars are set immediately.
+    await save()
   }
 }
 
