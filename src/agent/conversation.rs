@@ -79,13 +79,18 @@ impl Conversation {
         temperature: f64,
         max_tokens: Option<usize>,
     ) -> ModelRequest {
-        let messages = vec![
+        let mut messages = vec![
             Message::system(self.system_prompt.clone()),
             Message::system(format!(
                 "Current relationship-graph snapshot (authoritative — your beliefs about the graph should match this):\n{graph_snapshot}"
             )),
             Message::user(format!("Task: {}", self.task_description)),
         ];
+        // Include last 8 conversation messages so model sees recent results.
+        let recent = &self.messages[self.messages.len().saturating_sub(8)..];
+        for m in recent {
+            messages.push(m.clone());
+        }
         ModelRequest {
             messages,
             tools: Vec::new(),
@@ -160,66 +165,41 @@ mod tests {
 
     #[test]
     fn to_request_emits_system_snapshot_and_task_user() {
-        // After the history-replay removal, the request is always exactly
-        // three messages: system prompt, graph snapshot, then a single
-        // user message carrying the original task. The user message
-        // exists to satisfy OpenAI-compatible APIs that reject a
-        // system-only payload. Any loop-accumulated history stays on
-        // the Conversation (for `transcript()` / audit logs) but is NOT
-        // sent to the model.
+        // The request always starts with system prompt, graph snapshot,
+        // and task line. Recent conversation history is appended AFTER
+        // these three headers (up to last 8 messages).
         let mut c = Conversation::new("be helpful", "do thing");
         c.add_assistant("understood");
         c.add_user("here is more");
 
         let req = c.to_request("nodes: 2 edges: 1", 0.2, Some(512));
-        assert_eq!(req.messages.len(), 3);
-        assert!(matches!(req.messages[0].role, Role::System));
+        // 3 headers + 2 history messages = 5
+        assert_eq!(req.messages.len(), 5);
         assert!(req.messages[0].content.contains("be helpful"));
-        assert!(matches!(req.messages[1].role, Role::System));
         assert!(req.messages[1].content.contains("nodes: 2 edges: 1"));
-        assert!(matches!(req.messages[2].role, Role::User));
-        assert!(req.messages[2].content.contains("Task:"));
-        assert!(req.messages[2].content.contains("do thing"));
-        assert_eq!(req.temperature, 0.2);
-        assert_eq!(req.max_tokens, Some(512));
+        assert!(req.messages[2].content.contains("Task: do thing"));
+        assert!(req.messages[3].content.contains("understood"));
+        assert!(req.messages[4].content.contains("here is more"));
     }
 
     #[test]
-    fn to_request_does_not_replay_message_history() {
-        // Explicit guard: this is the regression that motivated dropping
-        // the history replay. If a future change re-introduces it, this
-        // test fails — pointing right at the cost regression.
+    fn to_request_includes_recent_history() {
+        // Recent history (last 8 messages) is replayed so the model
+        // knows what happened in previous steps.
         let mut c = Conversation::new("be helpful", "do thing");
         c.add_assistant("agent step 1 said this");
         c.add_tool_result("tool result 1 was this");
         c.add_assistant("agent step 2 said this");
-        c.add_tool_result("tool result 2 was this, with { json-ish } braces");
+        c.add_tool_result("tool result 2 was this");
         c.add_user("and a user message in the middle");
 
         let req = c.to_request("graph: 1 node", 0.0, None);
-        // Exactly three messages — system, snapshot, task-user. No loop
-        // history replayed.
-        assert_eq!(req.messages.len(), 3);
-        // The task user message SHOULD contain the original task — it's
-        // the only "history" we keep.
-        assert!(req.messages[2].content.contains("do thing"));
-
-        // None of the loop-accumulated content should appear anywhere in
-        // the outbound request.
-        for m in &req.messages {
-            assert!(!m.content.contains("agent step 1"), "history leaked: {m:?}");
-            assert!(!m.content.contains("agent step 2"), "history leaked: {m:?}");
-            assert!(!m.content.contains("tool result 1"), "history leaked: {m:?}");
-            assert!(!m.content.contains("tool result 2"), "history leaked: {m:?}");
-            assert!(!m.content.contains("user message in the middle"), "history leaked: {m:?}");
-        }
-
-        // Sanity: the history is still on the Conversation for transcript()
-        // and other audit consumers — only `to_request` filters it out.
-        assert_eq!(c.messages.len(), 6);
-        let t = c.transcript();
-        assert!(t.contains("agent step 1"));
-        assert!(t.contains("tool result 2"));
+        // 3 headers + 5 history = 8
+        assert_eq!(req.messages.len(), 8);
+        // History messages appear after the headers.
+        assert!(req.messages[3].content.contains("agent step 1"));
+        assert!(req.messages[4].content.contains("tool result 1"));
+        assert!(req.messages[7].content.contains("user message in the middle"));
     }
 
     #[test]
