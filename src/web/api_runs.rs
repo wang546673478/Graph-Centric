@@ -321,6 +321,9 @@ async fn drive_run(
         }
     };
 
+    // Save run.json immediately so the run survives process kill.
+    let _ = state.persistence.save_run_meta(&session.metadata().await);
+
     // Build the GraphLoop. This mirrors what bin/agent_a does.
     let cfg = match ModelConfig::load() {
         Ok(c) => c,
