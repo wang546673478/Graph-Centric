@@ -83,6 +83,12 @@ pub const DEFAULT_OPTIMIZATION_PROMPT: &str = "\
 \n5. SubAgent执行修改(自动git commit+cargo check验证,编译失败自动回退)\
 \n6. Review通过→本轮完成→自动编译重启进入下一轮\
 \n\
+\n## 重要: 不要提问，直接执行！\
+\n- 这是无人值守自动化循环，任何问题都会自动回复\"yes, proceed\"\
+\n- 禁止使用 ask_user 或 block 步骤\
+\n- 直接 Explore→ProposePatch→SubAgent 执行，跳过确认\
+\n- 不确定就选最合理方案直接执行\
+\n\
 \n## 约束\
 \n- 每轮只改1-3个文件，必须编译通过\
 \n- 禁止引入新unwrap/unsafe，禁止删除测试\
