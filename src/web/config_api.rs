@@ -67,6 +67,23 @@ pub async fn start_default_heartbeat(
     Ok(Json(serde_json::json!({"started": true, "max_rounds": 10, "run_id": run_id})))
 }
 
+#[derive(Deserialize)]
+pub struct PromptBody { pub prompt: String }
+
+pub async fn update_heartbeat_prompt(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<PromptBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut guard = state.heartbeat.lock().await;
+    if let Some(ref mut hb) = *guard {
+        hb.prompt = body.prompt;
+        hb.save();
+        Ok(Json(serde_json::json!({"updated": true})))
+    } else {
+        Err(ApiError::NotFound("no active heartbeat".into()))
+    }
+}
+
 pub async fn cancel_heartbeat(
     State(state): State<Arc<WebState>>,
 ) -> Json<serde_json::Value> {

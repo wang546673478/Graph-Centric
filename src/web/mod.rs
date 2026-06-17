@@ -87,6 +87,7 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/models", get(config_api::list_models))
         .route("/heartbeat", get(config_api::get_heartbeat).post(config_api::start_heartbeat))
         .route("/heartbeat/default", post(config_api::start_default_heartbeat))
+        .route("/heartbeat/prompt", post(config_api::update_heartbeat_prompt))
         .route("/heartbeat/cancel", post(config_api::cancel_heartbeat))
         .route("/runs", get(api_runs::list_runs).post(api_runs::create_run))
         .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))

@@ -35,6 +35,12 @@ async function cancelHeartbeat() {
 async function refreshHeartbeat() {
   try { heartbeat.value = await api.get('/api/heartbeat') } catch { /* */ }
 }
+const editingPrompt = ref(false)
+async function savePrompt() {
+  if (!heartbeat.value) return
+  try { await api.post('/api/heartbeat/prompt', { prompt: heartbeat.value.prompt }) } catch { /* */ }
+  editingPrompt.value = false
+}
 
 function onKeyInput() { keyDirty.value = true }
 
@@ -105,7 +111,12 @@ async function save() {
       <h3>🫀 自优化循环 (HeartBeat)</h3>
       <div v-if="heartbeat && heartbeat.active" class="hb-active">
         <div><b>状态:</b> 🔄 运行中 · 第 {{ heartbeat.completed_rounds || 0 }}/{{ heartbeat.max_rounds }} 轮</div>
-        <div class="hb-prompt">{{ heartbeat.prompt?.slice(0, 200) }}…</div>
+        <textarea v-if="editingPrompt" v-model="heartbeat.prompt" rows="12" class="hb-textarea"></textarea>
+        <div v-else class="hb-prompt" @click="editingPrompt = true" title="Click to edit">{{ heartbeat.prompt?.slice(0, 300) }}…</div>
+        <div v-if="editingPrompt" class="hb-actions">
+          <button class="primary" @click="savePrompt">💾 保存提示词</button>
+          <button class="secondary" @click="editingPrompt = false">取消</button>
+        </div>
         <div v-if="heartbeat.current_run_id" class="hb-run-link">
           📋 <router-link :to="'/'">查看当前任务</router-link> ({{ heartbeat.current_run_id?.slice(0,8) }}…)
         </div>
@@ -209,7 +220,8 @@ button.primary { margin-top: 8px; padding: 10px 24px; }
 .profile-bar button { font-size: 0.72rem; padding: 5px 8px; white-space: nowrap; }
 .heartbeat-section { border-color: #a78bda; }
 .hb-active { display: flex; flex-direction: column; gap: 8px; }
-.hb-prompt { font-size: 0.7rem; color: var(--text-muted); max-height: 50px; overflow: hidden; }
+.hb-prompt { font-size: 0.7rem; color: var(--text-muted); max-height: 60px; overflow: hidden; cursor: pointer; }
+.hb-textarea { width: 100%; font-size: 0.72rem; font-family: var(--font-mono); margin: 4px 0; }
 .hb-actions { display: flex; gap: 6px; margin-top: 4px; }
 .hb-idle { display: flex; flex-direction: column; gap: 8px; }
 .hb-idle .hint { font-size: 0.72rem; color: var(--text-muted); line-height: 1.5; }

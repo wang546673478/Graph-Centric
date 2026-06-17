@@ -736,15 +736,27 @@ pub async fn drive_run(
             }
             LoopState::Error(msg) => {
                 *session.status.write().await = RunStatus::Error(msg.clone());
+                let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Error { message: msg });
+                // Heartbeat: error counts as learning — advance to next round.
+                let mut hb_guard = state.heartbeat.lock().await;
+                if let Some(ref mut hb) = *hb_guard {
+                    if hb.active { hb.round_complete(); }
+                }
                 return;
             }
             LoopState::TaskFailed { failures } => {
                 *session.status.write().await =
                     RunStatus::Error(format!("task failed: {failures:?}"));
+                let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Error {
                     message: format!("task failed: {failures:?}"),
                 });
+                // Heartbeat: task failure counts as learning.
+                let mut hb_guard = state.heartbeat.lock().await;
+                if let Some(ref mut hb) = *hb_guard {
+                    if hb.active { hb.round_complete(); }
+                }
                 return;
             }
             LoopState::Running => {
