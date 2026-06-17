@@ -327,8 +327,8 @@ fn spawn_heartbeat_continuation(state: Arc<WebState>) {
             hb.current_run_id = Some(id.clone()); hb.save();
         }
     }
-    session.emit(RunEvent::Transcript { role: "user".into(), content: format!("Task: {}", prompt) });
-    tokio::spawn(async move { drive_run(state, id, None, None).await; });
+    let initial = vec![InitialMessage { role: "user".into(), content: prompt }];
+    tokio::spawn(async move { drive_run(state, id, None, Some(initial)).await; });
 }
 
 /// The actual agent loop. Spawned as a tokio task by `create_run`. Maps

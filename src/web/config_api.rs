@@ -20,16 +20,17 @@ async fn spawn_heartbeat_run(state: &Arc<WebState>, hb: &mut super::heartbeat::H
     let prompt = hb.prompt.clone();
     let session = Arc::new(super::run_session::RunSession::new(id.clone(), label));
     state.runs.write().await.insert(id.clone(), session.clone());
-    session.emit(super::events::RunEvent::Transcript {
+    // Feed the full optimization prompt as the initial conversation.
+    let initial_transcript = vec![super::api_runs::InitialMessage {
         role: "user".into(),
-        content: format!("Task: {}", prompt),
-    });
+        content: prompt,
+    }];
     hb.current_run_id = Some(id.clone());
     hb.save();
     let state2 = state.clone();
     let id2 = id.clone();
     tokio::spawn(async move {
-        super::api_runs::drive_run(state2, id2, None, None).await;
+        super::api_runs::drive_run(state2, id2, None, Some(initial_transcript)).await;
     });
     id
 }

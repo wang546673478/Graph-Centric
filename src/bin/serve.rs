@@ -85,17 +85,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => true,
                 };
                 if need_new {
-                    info!(prompt = %hb.prompt, round = hb.completed_rounds + 1, "heartbeat: starting new run");
+                    info!(round = hb.completed_rounds + 1, "heartbeat: starting new run");
                     let id = uuid::Uuid::new_v4().to_string();
-                    let label = format!("🫀 Round {}/10: {}", hb.completed_rounds + 1, &hb.prompt[..hb.prompt.len().min(80)]);
+                    let label = format!("🫀 Round {}/10", hb.completed_rounds + 1);
+                    let prompt = hb.prompt.clone();
                     let session = Arc::new(graph_harness::web::run_session::RunSession::new(id.clone(), label));
                     state.runs.write().await.insert(id.clone(), session.clone());
                     hb.current_run_id = Some(id.clone());
                     hb.save();
                     drop(hb_guard);
+                    let initial = vec![graph_harness::web::api_runs::InitialMessage { role: "user".into(), content: prompt }];
                     let state2 = state.clone();
                     tokio::spawn(async move {
-                        graph_harness::web::api_runs::drive_run(state2, id, None, None).await;
+                        graph_harness::web::api_runs::drive_run(state2, id, None, Some(initial)).await;
                     });
                 }
             }
