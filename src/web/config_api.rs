@@ -14,14 +14,36 @@ pub struct HeartBeatBody {
     pub max_rounds: usize,
 }
 
+async fn spawn_heartbeat_run(state: &Arc<WebState>, hb: &mut super::heartbeat::HeartBeat) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let label = format!("🫀 Round {}/{}", hb.completed_rounds + 1, hb.max_rounds);
+    let prompt = hb.prompt.clone();
+    let session = Arc::new(super::run_session::RunSession::new(id.clone(), label));
+    state.runs.write().await.insert(id.clone(), session.clone());
+    session.emit(super::events::RunEvent::Transcript {
+        role: "user".into(),
+        content: format!("Task: {}", prompt),
+    });
+    hb.current_run_id = Some(id.clone());
+    hb.save();
+    let state2 = state.clone();
+    let id2 = id.clone();
+    tokio::spawn(async move {
+        super::api_runs::drive_run(state2, id2, None, None).await;
+    });
+    id
+}
+
 pub async fn start_heartbeat(
     State(state): State<Arc<WebState>>,
     Json(body): Json<HeartBeatBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let hb = HeartBeat::start(body.prompt, body.max_rounds);
+    let mut hb = HeartBeat::start(body.prompt, body.max_rounds);
+    let run_id = spawn_heartbeat_run(&state, &mut hb).await;
+    let rounds = hb.max_rounds;
     let mut guard = state.heartbeat.lock().await;
-    *guard = Some(hb.clone());
-    Ok(Json(serde_json::json!({"started": true, "max_rounds": hb.max_rounds, "prompt": hb.prompt})))
+    *guard = Some(hb);
+    Ok(Json(serde_json::json!({"started": true, "max_rounds": rounds, "run_id": run_id})))
 }
 
 pub async fn get_heartbeat(
@@ -38,10 +60,11 @@ pub async fn get_heartbeat(
 pub async fn start_default_heartbeat(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let hb = HeartBeat::start(super::heartbeat::DEFAULT_OPTIMIZATION_PROMPT.to_string(), 10);
+    let mut hb = HeartBeat::start(super::heartbeat::DEFAULT_OPTIMIZATION_PROMPT.to_string(), 10);
+    let run_id = spawn_heartbeat_run(&state, &mut hb).await;
     let mut guard = state.heartbeat.lock().await;
-    *guard = Some(hb.clone());
-    Ok(Json(serde_json::json!({"started": true, "max_rounds": 10, "prompt": "[default 10-round optimization]"})))
+    *guard = Some(hb);
+    Ok(Json(serde_json::json!({"started": true, "max_rounds": 10, "run_id": run_id})))
 }
 
 pub async fn cancel_heartbeat(
