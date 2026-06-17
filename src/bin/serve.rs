@@ -52,6 +52,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build state.
     let state = Arc::new(WebState::new(skill_storage, config.clone()));
 
+    // Sync model config to env vars so new runs pick it up.
+    state.config.engine.sync_env();
+
     // Restore persisted runs from disk so history survives restart.
     state.restore_persisted_runs().await;
 

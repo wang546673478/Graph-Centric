@@ -128,6 +128,20 @@ impl EngineConfig {
         }
     }
 
+    /// Sync model config to env vars so ModelConfig::load() picks them up.
+    pub fn sync_env(&self) {
+        if !self.model.base_url.is_empty() {
+            unsafe { std::env::set_var("MODEL_BASE_URL", &self.model.base_url); }
+        }
+        if !self.model.api_key.is_empty() {
+            unsafe { std::env::set_var("MODEL_API_KEY", &self.model.api_key); }
+        }
+        unsafe {
+            std::env::set_var("MODEL_NAME_FAST", &self.model.fast_model);
+            std::env::set_var("MODEL_NAME_DEEP", &self.model.deep_model);
+        }
+    }
+
     /// Persist config to disk.
     pub fn save(&self) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
