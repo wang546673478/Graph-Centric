@@ -173,6 +173,27 @@ impl Scanner for CodeScanner {
             }
         }
 
+        // Pass 4: quality metrics — add per-file stats to metadata.
+        for f in &files {
+            let rel = relativize(&root, f);
+            let source_text = match std::fs::read_to_string(f) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let metrics = compute_quality_metrics(&source_text);
+            if let Some(node) = graph.nodes.get_mut(&NodeId::from(rel.as_str())) {
+                node.metadata.insert("loc".into(), serde_json::json!(metrics.loc));
+                node.metadata.insert("unwrap_count".into(), serde_json::json!(metrics.unwrap_count));
+                node.metadata.insert("expect_count".into(), serde_json::json!(metrics.expect_count));
+                node.metadata.insert("unsafe_count".into(), serde_json::json!(metrics.unsafe_count));
+                node.metadata.insert("todo_count".into(), serde_json::json!(metrics.todo_count));
+                node.metadata.insert("quality_score".into(), serde_json::json!(metrics.quality_score()));
+                if metrics.needs_attention() {
+                    node.summary = format!("{} ⚠️", node.summary);
+                }
+            }
+        }
+
         Ok(graph)
     }
 }
@@ -626,6 +647,48 @@ pub fn resolve_rust_target(from: &str, raw: &str, graph: &Graph) -> Option<NodeI
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Quality metrics — code health indicators for the model to act on.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct QualityMetrics {
+    loc: usize,
+    unwrap_count: usize,
+    expect_count: usize,
+    unsafe_count: usize,
+    todo_count: usize,
+}
+
+impl QualityMetrics {
+    /// 0.0 (poor) to 1.0 (clean). Penalizes unwrap-heavy files.
+    fn quality_score(&self) -> f64 {
+        if self.loc == 0 { return 1.0; }
+        let density = (self.unwrap_count + self.unsafe_count) as f64 / self.loc as f64 * 1000.0;
+        (1.0 - density.min(1.0)).max(0.0)
+    }
+
+    fn needs_attention(&self) -> bool {
+        self.quality_score() < 0.7 || self.todo_count > 3 || self.unwrap_count > 5
+    }
+}
+
+fn compute_quality_metrics(text: &str) -> QualityMetrics {
+    let loc = text.lines().count();
+    let re_unwrap = regex::Regex::new(r"\.unwrap\s*\(").unwrap();
+    let re_expect = regex::Regex::new(r"\.expect\s*\(").unwrap();
+    let re_unsafe = regex::Regex::new(r"\bunsafe\b").unwrap();
+    let re_todo = regex::Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX)\b").unwrap();
+
+    QualityMetrics {
+        loc,
+        unwrap_count: re_unwrap.find_iter(text).count(),
+        expect_count: re_expect.find_iter(text).count(),
+        unsafe_count: re_unsafe.find_iter(text).count(),
+        todo_count: re_todo.find_iter(text).count(),
+    }
 }
 
 // ---------------------------------------------------------------------------
