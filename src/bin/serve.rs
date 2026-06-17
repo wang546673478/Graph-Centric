@@ -65,9 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if hb.active && hb.current_run_id.is_none() {
                 info!(prompt = %hb.prompt, "heartbeat: starting/continuing optimization");
                 let id = uuid::Uuid::new_v4().to_string();
+                let label = format!("🫀 Round {}/10: {}", hb.completed_rounds + 1, &hb.prompt[..hb.prompt.len().min(80)]);
                 let session = Arc::new(graph_harness::web::run_session::RunSession::new(
                     id.clone(),
-                    hb.prompt.clone(),
+                    label,
                 ));
                 state.runs.write().await.insert(id.clone(), session.clone());
                 hb.current_run_id = Some(id.clone());

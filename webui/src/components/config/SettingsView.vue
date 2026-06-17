@@ -106,8 +106,11 @@ async function save() {
       <div v-if="heartbeat && heartbeat.active" class="hb-active">
         <div><b>状态:</b> 🔄 运行中 · 第 {{ heartbeat.completed_rounds || 0 }}/{{ heartbeat.max_rounds }} 轮</div>
         <div class="hb-prompt">{{ heartbeat.prompt?.slice(0, 200) }}…</div>
+        <div v-if="heartbeat.current_run_id" class="hb-run-link">
+          📋 <router-link :to="'/'">查看当前任务</router-link> ({{ heartbeat.current_run_id?.slice(0,8) }}…)
+        </div>
         <div class="hb-actions">
-          <button class="secondary" @click="refreshHeartbeat">🔄 刷新状态</button>
+          <button class="secondary" @click="refreshHeartbeat">🔄 刷新</button>
           <button class="danger" @click="cancelHeartbeat">⏹ 停止</button>
         </div>
       </div>

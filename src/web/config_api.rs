@@ -29,7 +29,7 @@ pub async fn get_heartbeat(
 ) -> Json<serde_json::Value> {
     let guard = state.heartbeat.lock().await;
     if let Some(ref hb) = *guard {
-        Json(serde_json::json!({"active": hb.active, "prompt": hb.prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds}))
+        Json(serde_json::json!({"active": hb.active, "prompt": hb.prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds, "current_run_id": hb.current_run_id}))
     } else {
         Json(serde_json::json!({"active": false}))
     }
