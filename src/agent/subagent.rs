@@ -327,9 +327,10 @@ impl SubAgent {
             Message::user(user_prompt),
         ];
 
-        let tool_ctx = ToolContext::new(self.tool_cwd.clone())
+        let mut tool_ctx = ToolContext::new(self.tool_cwd.clone())
             .with_policy(self.policy.clone())
             .with_max_output(self.tool_output_cap);
+        tool_ctx.add_hook(Arc::new(crate::tools::LoggingHook::default()));
 
         let mut tokens_used = 0usize;
         let mut tool_calls_made = 0usize;

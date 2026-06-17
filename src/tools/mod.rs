@@ -18,6 +18,9 @@
 //! - [`Policy`] — decides whether a call may proceed. `AllowAll` and
 //!   `ReadOnly` are stock implementations; downstream wiring (Phase 3) can
 //!   produce policies that ask the user for confirmation.
+//! - [`Hook`] — lifecycle callbacks around tool execution (`pre_tool_use`,
+//!   `post_tool_use`). Hook into every tool call for observability, safety
+//!   nets, and self-improvement feedback loops.
 //! - [`ToolRegistry`] — name → `Arc<dyn Tool>` lookup. All invocations go
 //!   through the registry so the policy gate is the single entry point.
 //! - [`truncate_tail`] — when output exceeds the cap, keep the **tail** with
@@ -102,6 +105,62 @@ impl ToolOutput {
             interrupted: true,
             duration_ms: 0,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hook system — lifecycle callbacks around tool execution
+// ---------------------------------------------------------------------------
+
+/// Tool execution hook. Called before/after every tool invocation.
+/// Use for logging, safety nets, metrics, and self-improvement feedback.
+pub trait Hook: Send + Sync {
+    /// Called before a tool executes. Return Err to deny the call.
+    fn pre_tool_use(&self, _tool_name: &str, _args: &serde_json::Value) -> std::result::Result<(), String> {
+        Ok(())
+    }
+    /// Called after a tool executes. `output` is the tool's text output.
+    fn post_tool_use(&self, _tool_name: &str, _output: &str, _duration_ms: u64) {}
+}
+
+/// A hook that logs every tool call.
+#[derive(Clone, Default)]
+pub struct LoggingHook;
+
+impl Hook for LoggingHook {
+    fn pre_tool_use(&self, name: &str, args: &serde_json::Value) -> std::result::Result<(), String> {
+        tracing::info!(tool = name, args = %args, "tool call");
+        Ok(())
+    }
+    fn post_tool_use(&self, name: &str, output: &str, ms: u64) {
+        tracing::info!(tool = name, duration_ms = ms, output_len = output.len(), "tool result");
+    }
+}
+
+/// A hook that collects tool call data for the heartbeat/debug timeline.
+#[derive(Clone, Default)]
+pub struct CollectingHook {
+    pub calls: std::sync::Arc<std::sync::Mutex<Vec<ToolCallRecord>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCallRecord {
+    pub tool: String,
+    pub args_summary: String,
+    pub output_summary: String,
+    pub duration_ms: u64,
+    pub success: bool,
+}
+
+impl Hook for CollectingHook {
+    fn post_tool_use(&self, name: &str, output: &str, ms: u64) {
+        self.calls.lock().unwrap().push(ToolCallRecord {
+            tool: name.to_string(),
+            args_summary: String::new(),
+            output_summary: output.chars().take(200).collect(),
+            duration_ms: ms,
+            success: true,
+        });
     }
 }
 
@@ -280,6 +339,7 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     pub policy: Arc<dyn Policy>,
     pub max_output_chars: usize,
+    pub hooks: Vec<Arc<dyn Hook>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -297,6 +357,7 @@ impl ToolContext {
             cwd: cwd.into(),
             policy: Arc::new(AllowAll),
             max_output_chars: 30_000,
+            hooks: Vec::new(),
         }
     }
 
@@ -308,6 +369,10 @@ impl ToolContext {
     pub fn with_max_output(mut self, n: usize) -> Self {
         self.max_output_chars = n;
         self
+    }
+
+    pub fn add_hook(&mut self, hook: Arc<dyn Hook>) {
+        self.hooks.push(hook);
     }
 }
 
@@ -401,7 +466,23 @@ impl ToolRegistry {
             .ok_or_else(|| HarnessError::domain(format!("unknown tool: {name}")))?;
         let is_ro = tool.is_read_only(&input);
         match ctx.policy.decide(name, &input, is_ro) {
-            PolicyDecision::Allow => tool.call(input, ctx).await,
+            PolicyDecision::Allow => {
+                // Pre-tool hooks.
+                for h in &ctx.hooks {
+                    if let Err(reason) = h.pre_tool_use(name, &input) {
+                        return Err(HarnessError::domain(format!("hook denied {name}: {reason}")));
+                    }
+                }
+                let started = std::time::Instant::now();
+                let result = tool.call(input, ctx).await;
+                let ms = started.elapsed().as_millis() as u64;
+                // Post-tool hooks.
+                let output_text = result.as_ref().map(|o| o.content.as_str()).unwrap_or("");
+                for h in &ctx.hooks {
+                    h.post_tool_use(name, output_text, ms);
+                }
+                result
+            }
             PolicyDecision::Deny(reason) => Err(HarnessError::domain(format!(
                 "policy denied {name}: {reason}"
             ))),
