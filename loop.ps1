@@ -7,6 +7,10 @@ Write-Host "Press Ctrl+C to stop" -ForegroundColor DarkGray
 
 $round = 0
 while ($true) {
+    # Kill any lingering server process before building.
+    Get-Process -Name "serve","graph_harness" -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep 1
+
     $round++
     Write-Host "`n=== Round $round starting ===" -ForegroundColor Cyan
     cargo run --bin serve
