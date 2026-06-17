@@ -11,3 +11,4 @@ Cargo.lock
 /webui/dist/
 /data/
 .graph_harness_config.json
+.graph_harness_heartbeat.json
