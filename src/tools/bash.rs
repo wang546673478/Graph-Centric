@@ -259,8 +259,19 @@ impl Tool for BashTool {
 
         let start = Instant::now();
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c").arg(&parsed.command);
+        // Auto-detect shell: bash on Unix, cmd on Windows.
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new("cmd");
+            c.arg("/c").arg(&parsed.command);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new("bash");
+            c.arg("-c").arg(&parsed.command);
+            c
+        };
         cmd.current_dir(&ctx.cwd);
         // Defang interactive helpers — see module doc.
         cmd.env("GIT_EDITOR", "true");
