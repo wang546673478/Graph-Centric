@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue'
 import { api } from '../../composables/useRunSocket'
+import { useI18n } from '../../composables/useI18n'
+const { t } = useI18n()
 
 interface RunUsage {
   id: string; task: string; status: string; tokens: number; duration_ms: number
@@ -33,31 +35,29 @@ function modelKeys(obj: Record<string, any>) {
 
 <template>
   <div class="usage-page">
-    <h2>Usage Statistics</h2>
+    <h2>{{ t('usage.title') }}</h2>
 
-    <div v-if="!stats" class="loading">Loading…</div>
+    <div v-if="!stats" class="loading">{{ t('usage.loading') }}</div>
     <template v-else>
-      <!-- Summary cards -->
       <div class="cards">
         <div class="card">
           <div class="card-value">{{ stats.total_runs }}</div>
-          <div class="card-label">Total Runs</div>
+          <div class="card-label">{{ t('usage.totalRuns') }}</div>
         </div>
         <div class="card">
           <div class="card-value">{{ fmtTokens(stats.total_tokens) }}</div>
-          <div class="card-label">Total Tokens</div>
+          <div class="card-label">{{ t('usage.totalTokens') }}</div>
         </div>
         <div class="card" v-for="(v, k) in stats.model_breakdown" :key="k">
           <div class="card-value small">{{ k.slice(0, 40) }}</div>
-          <div class="card-label">{{ fmtTokens(v.tokens) }} tokens</div>
+          <div class="card-label">{{ fmtTokens(v.tokens) }} {{ t('usage.tokens') }}</div>
         </div>
       </div>
 
-      <!-- Run table -->
       <section>
-        <h3>Run Detail</h3>
+        <h3>{{ t('usage.runDetail') }}</h3>
         <table class="run-table">
-          <thead><tr><th>ID</th><th>Task</th><th>Status</th><th>Tokens</th><th>Duration</th></tr></thead>
+          <thead><tr><th>ID</th><th>{{ t('usage.task') }}</th><th>{{ t('usage.status') }}</th><th>{{ t('usage.tokens') }}</th><th>{{ t('usage.duration') }}</th></tr></thead>
           <tbody>
             <tr v-for="r in sortedRuns" :key="r.id">
               <td class="mono">{{ r.id.slice(0, 8) }}…</td>

@@ -25,4 +25,9 @@ export default {
   skills: { title: 'Skills', empty: 'Captured skills will appear here.' },
   files: { title: 'Files', empty: 'Changed files will appear here.' },
   graph: { tab: 'Graph', filesTab: 'Files' },
+  usage: {
+    title: 'Usage Statistics', loading: 'Loading…',
+    totalRuns: 'Total Runs', totalTokens: 'Total Tokens', tokens: 'tokens',
+    runDetail: 'Run Detail', task: 'Task', status: 'Status', duration: 'Duration',
+  },
 }

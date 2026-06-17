@@ -25,4 +25,9 @@ export default {
   skills: { title: '技能', empty: '捕获的技能将显示在这里。' },
   files: { title: '文件', empty: '变更的文件将显示在这里。' },
   graph: { tab: '图谱', filesTab: '文件' },
+  usage: {
+    title: '用量统计', loading: '加载中…',
+    totalRuns: '总运行数', totalTokens: '总 Token 数', tokens: 'tokens',
+    runDetail: '运行详情', task: '任务', status: '状态', duration: '耗时',
+  },
 }
