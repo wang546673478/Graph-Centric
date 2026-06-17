@@ -35,6 +35,15 @@ pub async fn get_heartbeat(
     }
 }
 
+pub async fn start_default_heartbeat(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let hb = HeartBeat::start(super::heartbeat::DEFAULT_OPTIMIZATION_PROMPT.to_string(), 10);
+    let mut guard = state.heartbeat.lock().await;
+    *guard = Some(hb.clone());
+    Ok(Json(serde_json::json!({"started": true, "max_rounds": 10, "prompt": "[default 10-round optimization]"})))
+}
+
 pub async fn cancel_heartbeat(
     State(state): State<Arc<WebState>>,
 ) -> Json<serde_json::Value> {
