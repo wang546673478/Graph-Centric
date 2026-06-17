@@ -1688,21 +1688,6 @@ impl GraphLoop {
         }
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        // Auto-extract entities from Explore results and add to graph
-        // so the model sees them without re-exploring.
-        for (i, (item, res)) in items.iter().zip(results.iter()).enumerate() {
-            if let Ok(r) = res {
-                if r.success {
-                    let patch = extract_entities_to_patch(&r.output, &item.scope, &self.graph);
-                    if patch.add_nodes.len() > 0 || patch.add_edges.len() > 0 {
-                        if let Err(e) = self.graph.apply_patch(patch) {
-                            tracing::warn!(error = %e, "explore entity extraction: patch rejected");
-                        }
-                    }
-                }
-            }
-        }
-
         // Combine all results into a single user message
         // for the main agent. Item-by-item, success or
         // failure — the main agent sees what each subagent
@@ -1741,6 +1726,28 @@ impl GraphLoop {
                 }
                 Err(e) => {
                     body.push_str(&format!("**Error**: {e}\n"));
+                }
+            }
+        }
+        // Suggest extracted entities for the model to propose as nodes.
+        for (_, (item, res)) in items.iter().zip(results.iter()).enumerate() {
+            if let Ok(r) = res {
+                if r.success {
+                    let patch = extract_entities_to_patch(&r.output, &item.scope, &self.graph);
+                    if patch.add_nodes.len() > 0 || patch.add_edges.len() > 0 {
+                        body.push_str(&format!(
+                            "\n\n> 💡 **Suggested patch**: the following entities were auto-extracted from the explore output. \
+                            Consider issuing `propose_patch` to add them to the graph at the right place. \
+                            You may modify or reject any part.\n\
+                            {} node(s) to add, {} edge(s) to add.\n\
+                            Example nodes: {}\n\
+                            Example edges: {}\n",
+                            patch.add_nodes.len(),
+                            patch.add_edges.len(),
+                            patch.add_nodes.iter().map(|n| n.id.as_str()).take(5).collect::<Vec<_>>().join(", "),
+                            patch.add_edges.iter().map(|e| format!("{}→{}", e.source, e.target)).take(5).collect::<Vec<_>>().join(", "),
+                        ));
+                    }
                 }
             }
         }
