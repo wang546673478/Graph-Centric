@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { api } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 const { t } = useI18n()
@@ -63,9 +63,21 @@ onMounted(async () => {
     origKey.value = config.value.model?.api_key_masked || ''
     profiles.value = config.value.profiles || {}
     heartbeat.value = await api.get('/api/heartbeat')
-    if (heartbeat.value?.prompt) hbPrompt.value = heartbeat.value.prompt
+    if (heartbeat.value?.active && heartbeat.value?.prompt) {
+      hbPrompt.value = heartbeat.value.prompt
+    } else if (!heartbeat.value?.active) {
+      // Load saved prompt from localStorage (edits survive refresh)
+      const saved = localStorage.getItem('hb-prompt')
+      if (saved) hbPrompt.value = saved
+      const savedRounds = localStorage.getItem('hb-rounds')
+      if (savedRounds) hbRounds.value = parseInt(savedRounds) || 10
+    }
   } catch { /* */ }
 })
+
+// Persist prompt edits to localStorage on every keystroke.
+watch(hbPrompt, (v) => localStorage.setItem('hb-prompt', v))
+watch(hbRounds, (v) => localStorage.setItem('hb-rounds', String(v)))
 
 async function startHeartbeat() {
   try {
