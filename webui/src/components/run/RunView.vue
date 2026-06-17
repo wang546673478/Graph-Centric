@@ -176,7 +176,7 @@ async function submitTask(task: string) {
         <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
-      <GraphPanel3D v-if="tab === 'graph'" :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
+      <GraphPanel3D v-if="tab === 'graph'" :key="activeRunId || 'empty'" :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
       <DebugTimeline v-else-if="tab === 'debug'" />
       <div v-else class="placeholder">{{ t('files.empty') }}</div>
     </div>
