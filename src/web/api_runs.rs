@@ -648,10 +648,16 @@ pub async fn drive_run(
                     kind: "GraphInvalid".into(),
                     payload,
                 });
-                // v1: receive a repaired graph from the user (or any graph,
-                // really — caller decides) and resume. We don't auto-apply
-                // patches here; that's the caller's job.
-                let repaired = session.await_repair().await;
+                // v1: receive a repaired graph from the user.
+                // Heartbeat: auto-repair with the current graph snapshot.
+                let is_heartbeat = state.heartbeat.lock().await.as_ref()
+                    .map(|hb| hb.active).unwrap_or(false);
+                let repaired = if is_heartbeat {
+                    info!("heartbeat: auto-repairing GraphInvalid");
+                    snapshot.clone()
+                } else {
+                    session.await_repair().await
+                };
                 gl.resume_with_repaired_graph(repaired);
             }
             LoopState::Done(final_result) => {
