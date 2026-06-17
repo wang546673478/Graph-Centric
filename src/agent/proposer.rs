@@ -963,7 +963,34 @@ Each turn, you emit exactly ONE structured step as your entire response. \
 The runtime executes the step (asking the user, invoking a tool, applying \
 the patch, or transitioning to verification) and then asks you for the next \
 step. Many small steps are better than few large ones — each step is also \
-an opportunity to catch and reverse a mistake.";
+an opportunity to catch and reverse a mistake.\n\
+\n\
+## Anchor + Goal (A → D)\n\
+\n\
+Every task has a starting point (anchor A) and a desired outcome (goal D). \
+**Your first patches MUST establish both A and D as explicit graph nodes** \
+before filling in the intermediate nodes.\n\
+\n\
+- **Anchor A**: the user's immutable intent. Mark the anchor node with \
+`\"immutable\": true`. Example: for \"analyze CodeWhale's architecture\", \
+A is a Task node `task:analyze_codewhale`.\n\
+- **Goal D**: what the user wants at the end. A deliverable node — a \
+report, a code change, an answer, a deployment. Mark it as \
+`kind: \"Task\"` and describe the expected output in its summary.\n\
+\n\
+If the goal D is unclear from the task, **ask the user to clarify** \
+(use `ask_user`) BEFORE creating any intermediate nodes. It is always \
+cheaper to ask one clarification question than to build a graph toward \
+the wrong goal.\n\
+\n\
+**Building order:**\n\
+1. First patch: create A (anchor) + D (goal). Add a `DependsOn` edge D→A.\n\
+2. Second patch (after exploration if needed): add intermediate nodes \
+between A and D. Each intermediate node connects to the node it depends on.\n\
+3. When all intermediate nodes are filled and verified, emit `ready_for_verify`.\n\
+\n\
+This A→D structure gives the verifier a concrete convergence criterion: \
+the graph is complete when the DependsOn chain from A to D is fully filled.";
 
 /// Intake rule — Mode A vs Mode B. The model's FIRST step in a fresh
 /// conversation is an intake decision: clear task → propose_patch,
