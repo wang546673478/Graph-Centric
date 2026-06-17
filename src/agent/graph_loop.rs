@@ -355,7 +355,7 @@ impl GraphLoopConfig {
             max_rounds: 300,
             max_repair_rounds: 4,
             tool_cwd: cwd.into(),
-            tool_output_cap: 12_000,
+            tool_output_cap: 32_000,
             tool_policy: Arc::new(crate::tools::AllowAll),
         }
     }
@@ -460,6 +460,27 @@ pub struct GraphLoop {
 
     phase: Phase,
     pending: Pending,
+}
+
+/// Summarize long subagent output into a concise report for the main agent.
+async fn summarize_for_main_agent(model: &(dyn crate::model::Model), text: &str) -> String {
+    if text.len() <= 3000 {
+        return text.to_string();
+    }
+    let prompt = format!(
+        "Summarize the following agent output into a concise report. Keep all file paths, key findings, and code snippets. Max 500 words.\n\n{text}"
+    );
+    let req = crate::model::ModelRequest {
+        messages: vec![crate::model::Message::user(prompt)],
+        tools: vec![],
+        temperature: 0.0,
+        max_tokens: Some(1024),
+        stop: vec![],
+    };
+    match model.complete(req).await {
+        Ok(resp) => resp.content,
+        Err(_) => text.to_string(),
+    }
 }
 
 impl GraphLoop {
@@ -1594,9 +1615,15 @@ impl GraphLoop {
             ));
             match res {
                 Ok(r) if r.success => {
+                    // Summarize long subagent output to keep main context lean.
+                    let summary = if r.output.len() > 3000 {
+                        summarize_for_main_agent(&*self.proposer.model, &r.output).await
+                    } else {
+                        r.output.clone()
+                    };
                     body.push_str(&format!(
                         "**Result** ({} tool calls, {}ms):\n{}\n",
-                        r.tool_calls_made, r.duration_ms, r.output
+                        r.tool_calls_made, r.duration_ms, summary
                     ));
                 }
                 Ok(r) => {
