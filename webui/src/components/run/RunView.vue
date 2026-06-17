@@ -134,7 +134,9 @@ async function submitTask(task: string) {
   try {
     const body: any = { task }
     if (curId && curStore && curStore.transcript.length) {
-      body.initial_transcript = curStore.transcript.map(m => ({ role: m.role, content: m.content }))
+      // Only send user + assistant messages as context (filter debug events).
+      const ctx = curStore.transcript.filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'assistant_streaming' || m.role === 'thinking')
+      if (ctx.length) body.initial_transcript = ctx.map(m => ({ role: m.role.replace('assistant_streaming', 'assistant').replace('thinking', 'assistant'), content: m.content }))
       if (curStore.nodes.length || curStore.edges.length) {
         body.initial_graph = { nodes: curStore.nodes, edges: curStore.edges }
       }
