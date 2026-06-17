@@ -332,7 +332,7 @@ impl Dispatcher {
                 match contract.check(&r.output) {
                     ContractOutcome::Satisfied => {
                         // Also check tool-call contracts (MustEdit).
-                        match contract.check_tool_calls(r.tool_calls_made) {
+                        match contract.check_tool_calls(r.tool_calls_made, r.write_calls_made) {
                             ContractOutcome::Satisfied => {}
                             ContractOutcome::Failed(reason) => {
                                 r.success = false;

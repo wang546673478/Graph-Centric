@@ -111,15 +111,15 @@ impl CheckContract {
     }
 
     /// Check a contract that depends on tool execution, not text output.
-    /// MustEdit: requires at least one tool call.
-    pub fn check_tool_calls(&self, tool_calls_made: usize) -> ContractOutcome {
+    /// Check tool-call contracts. MustEdit: requires at least one WRITE call.
+    pub fn check_tool_calls(&self, _tool_calls_made: usize, write_calls_made: usize) -> ContractOutcome {
         match self {
             Self::MustEdit => {
-                if tool_calls_made > 0 {
+                if write_calls_made > 0 {
                     ContractOutcome::Satisfied
                 } else {
                     ContractOutcome::Failed(
-                        "MustEdit: sub-agent made 0 tool calls — must actually edit code, not just report".into()
+                        "MustEdit: sub-agent made 0 write/edit tool calls — must actually modify code, not just read/report".into()
                     )
                 }
             }

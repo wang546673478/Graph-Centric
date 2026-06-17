@@ -141,11 +141,12 @@ pub struct SubAgentResult {
     pub error: Option<String>,
     pub duration_ms: u64,
     pub tokens_used: usize,
-    /// How many tools the sub-agent invoked during this run. Useful for
-    /// budgeting (set `max_steps` lower if this stays high) and for
-    /// understanding execution patterns.
+    /// How many tools the sub-agent invoked during this run.
     #[serde(default)]
     pub tool_calls_made: usize,
+    /// How many of those tool calls were write/modify operations.
+    #[serde(default)]
+    pub write_calls_made: usize,
     /// Graph-level errors the sub-agent discovered while reading L2 — e.g.
     /// "graph says A calls B but A's source doesn't call B". Empty for
     /// normal results. When non-empty, the dispatcher aggregates these
@@ -165,6 +166,7 @@ impl SubAgentResult {
             duration_ms,
             tokens_used,
             tool_calls_made: 0,
+            write_calls_made: 0,
             graph_errors: Vec::new(),
         }
     }
@@ -178,6 +180,7 @@ impl SubAgentResult {
             duration_ms,
             tokens_used: 0,
             tool_calls_made: 0,
+            write_calls_made: 0,
             graph_errors: Vec::new(),
         }
     }
@@ -335,6 +338,7 @@ impl SubAgent {
 
         let mut tokens_used = 0usize;
         let mut tool_calls_made = 0usize;
+        let mut write_calls_made = 0usize;
 
         for step in 0..self.max_steps {
             let req = ModelRequest {
@@ -358,6 +362,7 @@ impl SubAgent {
                         duration_ms,
                         tokens_used,
                         tool_calls_made,
+                        write_calls_made,
                         graph_errors: Vec::new(),
                     });
                 }
@@ -370,7 +375,7 @@ impl SubAgent {
                 Action::FinalAnswer { answer, .. } => {
                     let mut outcome = task.contract.check(&answer);
                     if outcome.is_satisfied() {
-                        outcome = task.contract.check_tool_calls(tool_calls_made);
+                        outcome = task.contract.check_tool_calls(tool_calls_made, write_calls_made);
                     }
                     if !outcome.is_satisfied() {
                         // Contract failed. Feed the failure back as a user
@@ -399,6 +404,7 @@ impl SubAgent {
                         task_id = %task.id,
                         step,
                         tool_calls_made,
+                        write_calls_made,
                         tokens_used,
                         duration_ms,
                         "sub-agent emitted final_answer (contract satisfied)"
@@ -411,6 +417,7 @@ impl SubAgent {
                         duration_ms,
                         tokens_used,
                         tool_calls_made,
+                        write_calls_made,
                         graph_errors: Vec::new(),
                     });
                 }
@@ -440,11 +447,16 @@ impl SubAgent {
                         duration_ms,
                         tokens_used,
                         tool_calls_made,
+                        write_calls_made,
                         graph_errors: tagged,
                     });
                 }
                 Action::UseTool { tool, args, .. } => {
                     tool_calls_made += 1;
+                    // Track write calls for MustEdit contracts.
+                    if let Some(t) = self.tools.get(&tool) {
+                        if !t.is_read_only(&args) { write_calls_made += 1; }
+                    }
                     debug!(task_id = %task.id, step, tool = %tool, "sub-agent calling tool");
                     // Scope check (only if a guard is attached).
                     if let Some(sg) = &self.scope_guard {
@@ -501,6 +513,7 @@ impl SubAgent {
                         duration_ms,
                         tokens_used,
                         tool_calls_made,
+                        write_calls_made,
                         graph_errors: Vec::new(),
                     });
                 }
@@ -533,6 +546,7 @@ impl SubAgent {
             duration_ms,
             tokens_used,
             tool_calls_made,
+                        write_calls_made,
             graph_errors: Vec::new(),
         })
     }
