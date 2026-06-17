@@ -17,10 +17,13 @@ pub struct HeartBeatBody {
 async fn spawn_heartbeat_run(state: &Arc<WebState>, hb: &mut super::heartbeat::HeartBeat) -> String {
     let id = uuid::Uuid::new_v4().to_string();
     let label = format!("🫀 Round {}/{}", hb.completed_rounds + 1, hb.max_rounds);
-    let prompt = hb.prompt.clone();
+    let prompt = format!(
+        "You are working in the project at: {}\n\n{}",
+        state.config.project_root.display(),
+        hb.prompt
+    );
     let session = Arc::new(super::run_session::RunSession::new(id.clone(), label));
     state.runs.write().await.insert(id.clone(), session.clone());
-    // Feed the full optimization prompt as the initial conversation.
     let initial_transcript = vec![super::api_runs::InitialMessage {
         role: "user".into(),
         content: prompt,

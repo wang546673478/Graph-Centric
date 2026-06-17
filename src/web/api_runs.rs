@@ -317,6 +317,8 @@ fn spawn_heartbeat_continuation(state: Arc<WebState>) {
     };
     if !do_it { return; }
     info!("heartbeat: spawning next run immediately");
+    let root = state.config.project_root.display().to_string();
+    let full_prompt = format!("You are working in the project at: {root}\n\n{prompt}");
     let id = uuid::Uuid::new_v4().to_string();
     let session = Arc::new(RunSession::new(id.clone(), label));
     let rt = tokio::runtime::Handle::current();
@@ -327,7 +329,7 @@ fn spawn_heartbeat_continuation(state: Arc<WebState>) {
             hb.current_run_id = Some(id.clone()); hb.save();
         }
     }
-    let initial = vec![InitialMessage { role: "user".into(), content: prompt }];
+    let initial = vec![InitialMessage { role: "user".into(), content: full_prompt }];
     tokio::spawn(async move { drive_run(state, id, None, Some(initial)).await; });
 }
 
