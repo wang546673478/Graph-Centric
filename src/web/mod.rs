@@ -55,8 +55,10 @@ impl WebState {
                             meta.id.clone(),
                             meta.task.clone(),
                         ));
-                        // Override status from persisted metadata.
+                        // Override status + duration from persisted metadata.
                         *session.status.write().await = meta.status.clone();
+                        *session.persisted_duration_ms.lock().await = meta.duration_ms;
+                        *session.tokens_used.lock().await = meta.tokens_used;
                         runs.insert(meta.id.clone(), session);
                     }
                 }

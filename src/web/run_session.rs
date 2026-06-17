@@ -38,6 +38,8 @@ pub struct RunSession {
     pub checkpoints: tokio::sync::Mutex<CheckpointStore>,
     /// Cumulative tokens used across all model calls in this run.
     pub tokens_used: tokio::sync::Mutex<u64>,
+    /// Frozen duration for restored runs (0 = use live elapsed).
+    pub persisted_duration_ms: tokio::sync::Mutex<u64>,
 }
 
 /// Run state visible to the API and the UI.
@@ -76,6 +78,7 @@ impl RunSession {
             captured_skill: tokio::sync::RwLock::new(None),
             checkpoints: tokio::sync::Mutex::new(CheckpointStore::new()),
             tokens_used: tokio::sync::Mutex::new(0),
+            persisted_duration_ms: tokio::sync::Mutex::new(0),
         }
     }
 
@@ -138,7 +141,8 @@ impl RunSession {
     /// Snapshot of the run for the `GET /api/runs/{id}` endpoint.
     pub async fn metadata(&self) -> RunMetadata {
         let status = self.status.read().await.clone();
-        let duration_ms = self.started_at.elapsed().as_millis() as u64;
+        let persisted = *self.persisted_duration_ms.lock().await;
+        let duration_ms = if persisted > 0 { persisted } else { self.started_at.elapsed().as_millis() as u64 };
         let tokens_used = *self.tokens_used.lock().await;
         RunMetadata {
             id: self.id.clone(),
