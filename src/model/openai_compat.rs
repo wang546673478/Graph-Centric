@@ -373,8 +373,10 @@ impl Model for OpenAICompatModel {
             )));
         }
 
-        // Stream is flowing — no retry from here.
+        // Stream is flowing — no retry from here, but enforce a read timeout.
         let mut stream = resp.bytes_stream();
+        let stream_start = std::time::Instant::now();
+        let stream_timeout = std::time::Duration::from_secs(120);
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
         let mut finish_reason = FinishReason::Stop;
@@ -395,6 +397,14 @@ impl Model for OpenAICompatModel {
                     break;
                 }
             };
+            // If we haven't received any data within the timeout, abort.
+            if full_content.is_empty() && full_reasoning.is_empty()
+                && stream_start.elapsed() > stream_timeout
+            {
+                return Err(crate::error::HarnessError::model(
+                    "stream timed out: no content received within 120s"
+                ));
+            }
             buf.push_str(&String::from_utf8_lossy(&chunk));
 
             // Process complete SSE lines.
@@ -409,7 +419,18 @@ impl Model for OpenAICompatModel {
                         finish_reason,
                         usage: usage.clone(),
                     });
-                    break;
+                    // Break both loops — stream is finished.
+                    return Ok(ModelResponse {
+                        content: full_content,
+                        reasoning_content: if full_reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(full_reasoning)
+                        },
+                        tool_calls: tool_calls_from_buf(&mut tool_call_buf),
+                        finish_reason,
+                        usage,
+                    });
                 }
 
                 let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) else {
@@ -477,30 +498,36 @@ impl Model for OpenAICompatModel {
             }
         }
 
-        // Convert accumulated streaming tool_calls to Vec<ToolCall>.
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut indices: Vec<usize> = tool_call_buf.keys().copied().collect();
-        indices.sort();
-        for idx in indices {
-            if let Some((id, name, arguments)) = tool_call_buf.remove(&idx) {
-                if name.is_empty() {
-                    continue;
-                }
-                let args = serde_json::from_str(&arguments)
-                    .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()));
-                tool_calls.push(ToolCall { id, name, arguments: args });
-            }
-        }
-
+        // Stream ended without [DONE] — return what we have.
         let reasoning = if full_reasoning.is_empty() { None } else { Some(full_reasoning) };
         Ok(ModelResponse {
             content: full_content,
             reasoning_content: reasoning,
-            tool_calls,
+            tool_calls: tool_calls_from_buf(&mut tool_call_buf),
             finish_reason,
             usage,
         })
     }
+}
+
+/// Convert accumulated streaming tool_call fragments into Vec<ToolCall>.
+fn tool_calls_from_buf(
+    buf: &mut std::collections::HashMap<usize, (String, String, String)>,
+) -> Vec<ToolCall> {
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut indices: Vec<usize> = buf.keys().copied().collect();
+    indices.sort();
+    for idx in indices {
+        if let Some((id, name, arguments)) = buf.remove(&idx) {
+            if name.is_empty() {
+                continue;
+            }
+            let args = serde_json::from_str(&arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()));
+            tool_calls.push(ToolCall { id, name, arguments: args });
+        }
+    }
+    tool_calls
 }
 
 fn role_to_str(role: Role) -> &'static str {
