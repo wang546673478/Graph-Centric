@@ -11,23 +11,25 @@ watch(() => props.messages.length, async () => { await nextTick(); if (el.value)
 
 function roleClass(r: string) {
   if (r === 'user') return 'user'
-  if (r === 'assistant' || r === 'agent' || r === 'assistant_streaming') return 'assistant'
+  if (r === 'assistant' || r === 'agent' || r.startsWith('stream:')) return 'assistant'
   if (r === 'tool_result') return 'tool'
   if (r === 'error') return 'error'
   if (r === 'cascade' || r === 'model' || r === 'checkpoint') return 'detail'
   return ''
 }
 function showRoleTag(r: string): boolean {
-  return r !== 'assistant_streaming'
+  return !r.startsWith('stream:') && !r.startsWith('thinking:')
 }
 
 function roleLabel(r: string): string {
+  if (r.startsWith('stream:')) { const c = r.slice(7); return `流式:${c}` }
+  if (r.startsWith('thinking:')) { const c = r.slice(9); return `思考:${c}` }
   const zh: Record<string, string> = {
     user: '用户', assistant: '助手', agent: '代理',
     tool_result: '工具结果', error: '错误',
     ask_user: '询问用户', block: '阻塞', explore: '探索',
     cascade: '级联回溯', model: '模型调用', checkpoint: '检查点',
-    thinking: '思考', assistant_streaming: '流式生成',
+    thinking: '思考',
   }
   return zh[r] || r
 }

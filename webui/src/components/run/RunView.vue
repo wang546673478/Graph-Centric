@@ -56,30 +56,42 @@ function connectToRun(id: string) {
       case 'model_call': s.transcript.push({ role: 'model', content: `🤖 ${d.component} (${d.completion_tokens || 0}t, ${d.duration_ms || 0}ms): ${(d.response_content || '').slice(0, 200)}` }); break
       case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` }); break
       case 'stream_chunk': {
-        const last = s.transcript[s.transcript.length - 1]
-        // Reasoning/thinking content: append as a separate collapsible message before the assistant.
+        const comp = d.component || 'model'
+        const streamRole = 'stream:' + comp
+        const thinkRole = 'thinking:' + comp
+        // Reasoning/thinking: per-component buffer.
         if (d.reasoning_content) {
-          const thinkingRole = 'thinking'
-          const thinkingLast = s.transcript[s.transcript.length - 1]
-          if (thinkingLast && thinkingLast.role === 'thinking') {
-            thinkingLast.content += d.reasoning_content
+          const thinkLast = s.transcript[s.transcript.length - 1]
+          if (thinkLast && thinkLast.role === thinkRole) {
+            thinkLast.content += d.reasoning_content
           } else {
-            s.transcript.push({ role: 'thinking', content: d.reasoning_content })
+            s.transcript.push({ role: thinkRole, content: d.reasoning_content })
           }
         }
+        // Content: per-component buffer.
         if (d.content) {
-          if (last && last.role === 'assistant_streaming') {
+          const last = s.transcript[s.transcript.length - 1]
+          if (last && last.role === streamRole) {
             last.content += d.content
           } else {
-            s.transcript.push({ role: 'assistant_streaming', content: d.content })
+            s.transcript.push({ role: streamRole, content: d.content })
           }
         }
         break
       }
       case 'stream_end': {
+        const comp = d.component || 'model'
+        const streamRole = 'stream:' + comp
+        const thinkRole = 'thinking:' + comp
+        // Lock streaming content to assistant.
         const last = s.transcript[s.transcript.length - 1]
-        if (last && last.role === 'assistant_streaming') {
+        if (last && last.role === streamRole) {
           last.role = 'assistant'
+        }
+        // Lock thinking content.
+        const thinkLast = s.transcript[s.transcript.length - 1]
+        if (thinkLast && thinkLast.role === thinkRole) {
+          thinkLast.role = 'thinking'
         }
         break
       }
