@@ -58,18 +58,20 @@ pub async fn get_heartbeat(
     State(state): State<Arc<WebState>>,
 ) -> Json<serde_json::Value> {
     let guard = state.heartbeat.lock().await;
+    // Always load the canonical prompt from the .md file if it exists.
+    let prompt_path = state.config.project_root.join(".graph_harness_heartbeat_prompt.md");
+    let file_prompt = if prompt_path.exists() {
+        std::fs::read_to_string(&prompt_path).ok()
+    } else {
+        None
+    };
     if let Some(ref hb) = *guard {
-        // If the .md prompt file exists, use it as the canonical prompt.
-        // The JSON state's prompt field may be stale (from an old save).
-        let prompt_path = state.config.project_root.join(".graph_harness_heartbeat_prompt.md");
-        let prompt = if prompt_path.exists() {
-            std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| hb.prompt.clone())
-        } else {
-            hb.prompt.clone()
-        };
+        let prompt = file_prompt.unwrap_or_else(|| hb.prompt.clone());
         Json(serde_json::json!({"active": hb.active, "prompt": prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds, "current_run_id": hb.current_run_id}))
     } else {
-        Json(serde_json::json!({"active": false}))
+        // Inactive: still return the prompt so the settings page can show it.
+        let prompt = file_prompt.unwrap_or_default();
+        Json(serde_json::json!({"active": false, "prompt": prompt, "max_rounds": 10, "completed_rounds": 0, "current_run_id": null}))
     }
 }
 
