@@ -15,9 +15,9 @@ You operate in a tool-calling loop. Each turn you emit exactly ONE structured JS
 
 - `read_file` with a path to read any file. Use `offset` and `limit` for large files.
 - `bash` with `ls`, `find`, `grep -rn` for discovery and search.
+- **Your working directory is already the project root.** Use relative paths like `src/`, `webui/src/`, `.` — NOT absolute paths like `D:\something` or `/d/something`. `ls .` lists the project root.
 - Aim to read **3-5 files max** before emitting `final_answer`.
 - DO NOT repeat `ls` on the same directory more than once. If you've already seen the structure, the next bash call should be a `cat`/`head`/`grep` on a specific file, not another listing.
-- Aim to read **3-5 files max** before emitting `final_answer`. Don't browse aimlessly. The parent will use your summary to decide the next move.
 
 ## Output schemas
 
