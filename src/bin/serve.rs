@@ -116,11 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut shutdown_rx = state.shutdown_rx.clone();
     let shutdown_signal = async move {
         loop {
-            if *shutdown_rx.borrow_and_update() {
+            if shutdown_rx.changed().await.is_err() {
+                // Sender dropped — shouldn't happen, but don't hang.
+                break;
+            }
+            if *shutdown_rx.borrow() {
                 info!("shutdown signal received; exiting gracefully");
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     };
 
