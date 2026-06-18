@@ -380,6 +380,12 @@ impl Model for OpenAICompatModel {
         let mut finish_reason = FinishReason::Stop;
         let mut usage = Usage::default();
         let mut buf = String::new();
+        // Accumulate streaming tool_calls by index.
+        // Key: tool_call index. Value: (id, name, arguments_json_fragment).
+        let mut tool_call_buf: std::collections::HashMap<
+            usize,
+            (String, String, String),
+        > = std::collections::HashMap::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -412,6 +418,28 @@ impl Model for OpenAICompatModel {
                 if let Some(choices) = chunk["choices"].as_array() {
                     for choice in choices {
                         if let Some(delta) = choice.get("delta") {
+                            // Accumulate streaming tool_calls.
+                            if let Some(tc_array) = delta["tool_calls"].as_array() {
+                                for tc in tc_array {
+                                    let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                                    let entry = tool_call_buf
+                                        .entry(idx)
+                                        .or_insert_with(|| (String::new(), String::new(), String::new()));
+                                    if let Some(id) = tc["id"].as_str() {
+                                        entry.0 = id.to_string();
+                                    }
+                                    if let Some(func) = tc.get("function") {
+                                        if let Some(name) = func["name"].as_str() {
+                                            if !name.is_empty() {
+                                                entry.1 = name.to_string();
+                                            }
+                                        }
+                                        if let Some(args) = func["arguments"].as_str() {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(content) = delta["content"].as_str() {
                                 full_content.push_str(content);
                                 let _ = tx.send(crate::model::StreamDelta::Delta {
@@ -449,11 +477,26 @@ impl Model for OpenAICompatModel {
             }
         }
 
+        // Convert accumulated streaming tool_calls to Vec<ToolCall>.
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut indices: Vec<usize> = tool_call_buf.keys().copied().collect();
+        indices.sort();
+        for idx in indices {
+            if let Some((id, name, arguments)) = tool_call_buf.remove(&idx) {
+                if name.is_empty() {
+                    continue;
+                }
+                let args = serde_json::from_str(&arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()));
+                tool_calls.push(ToolCall { id, name, arguments: args });
+            }
+        }
+
         let reasoning = if full_reasoning.is_empty() { None } else { Some(full_reasoning) };
         Ok(ModelResponse {
             content: full_content,
             reasoning_content: reasoning,
-            tool_calls: Vec::new(),
+            tool_calls,
             finish_reason,
             usage,
         })
