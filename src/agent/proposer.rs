@@ -159,6 +159,10 @@ pub struct GraphProposer {
     /// system prompt includes a "## Available skills" section listing
     /// them. When `None`, no section is included.
     pub skills: Option<std::sync::Arc<dyn crate::skills::SkillStorage>>,
+    /// Optional PromptRegistry for dynamic prompt block injection.
+    /// When set, the system prompt includes blocks like heartbeat mode,
+    /// skill matching, language, and platform — same as SubAgent.
+    pub prompt_registry: Option<std::sync::Arc<crate::skills::prompt_registry::PromptRegistry>>,
     /// Sampling temperature for the proposer call. Default 0.2.
     pub temperature: f64,
     /// Output cap for proposer responses (mostly structured JSON, so small).
@@ -175,14 +179,8 @@ impl GraphProposer {
             model,
             tools,
             skills,
+            prompt_registry: None,
             temperature: 0.2,
-            // Generous default. Reasoning-style models (DeepSeek-v4-pro,
-            // GPT-o1, Claude with extended thinking) can burn 8-20K tokens
-            // of invisible reasoning before producing the visible JSON,
-            // especially deep into a conversation when the running history
-            // grows large. 32K is the empirically-safe cap for deep models
-            // on multi-round Graph phases; non-reasoning models will never
-            // come close. Callers can override via `with_max_tokens`.
             max_tokens: Some(32768),
         }
     }
@@ -207,6 +205,16 @@ impl GraphProposer {
         skills: std::sync::Arc<dyn crate::skills::SkillStorage>,
     ) -> Self {
         self.skills = Some(skills);
+        self
+    }
+
+    /// Attach a PromptRegistry for dynamic block injection into the
+    /// system prompt (heartbeat mode, skill matching, language, etc.).
+    pub fn with_prompt_registry(
+        mut self,
+        pr: std::sync::Arc<crate::skills::prompt_registry::PromptRegistry>,
+    ) -> Self {
+        self.prompt_registry = Some(pr);
         self
     }
 
@@ -251,13 +259,123 @@ impl GraphProposer {
             }
         }
 
-        // v2.5: document skill node ID prefix so the model understands
-        // auto-matched task nodes.
+        // v2.5: inject dynamic prompt blocks via PromptRegistry.
+        // Same mechanism as SubAgent — heartbeat, skill matching,
+        // language, platform all flow through the registry.
+        if let Some(pr) = &self.prompt_registry {
+            let ctx = crate::skills::prompt_registry::PromptContext {
+                role: "edit".into(),
+                task_description: task.to_string(),
+                language: Some("Chinese".into()),
+                is_heartbeat: false, // set by caller via build_system_prompt_for_heartbeat
+                platform: if cfg!(target_os = "windows") {
+                    "windows".into()
+                } else {
+                    "linux".into()
+                },
+                auto_apply_skills: true,
+                matched_skills: String::new(),
+                ..Default::default()
+            };
+            let dynamic = pr.compose(&[], &ctx);
+            if !dynamic.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&dynamic);
+            }
+        }
+
+        // v2.5: document skill node ID prefix.
         prompt.push_str("\n\n## Skill-Aware Task Graphs\n\
 When a past skill is auto-matched to your current task, its compiled task \
 graph is injected as `skill:<slug>:<node-id>` nodes into the task plan. \
 These behave like regular Task nodes — you may add edges to or from them, \
 re-plan them, or supplement them with additional nodes from the Decomposer.");
+
+        prompt
+    }
+
+    /// Build a system prompt with heartbeat context. Sets `is_heartbeat: true`
+    /// so the PromptRegistry injects the autonomous-mode block.
+    pub fn build_system_prompt_heartbeat(&self, task: &str) -> String {
+        let mut prompt = self.build_system_prompt(task);
+        // Append heartbeat-specific override: no questions, direct execution.
+        if let Some(pr) = &self.prompt_registry {
+            let ctx = crate::skills::prompt_registry::PromptContext {
+                role: "edit".into(),
+                task_description: task.to_string(),
+                language: Some("Chinese".into()),
+                is_heartbeat: true,
+                platform: if cfg!(target_os = "windows") {
+                    "windows".into()
+                } else {
+                    "linux".into()
+                },
+                auto_apply_skills: true,
+                matched_skills: String::new(),
+                ..Default::default()
+            };
+            let hb_block = pr.compose(&[], &ctx);
+            // Replace the default (non-heartbeat) dynamic section with the
+            // heartbeat-aware version.
+            // Rebuild the whole prompt cleanly.
+            return self.build_system_prompt_with_ctx(task, &ctx);
+        }
+        prompt
+    }
+
+    /// Internal: build system prompt with an explicit PromptContext.
+    fn build_system_prompt_with_ctx(
+        &self,
+        task: &str,
+        ctx: &crate::skills::prompt_registry::PromptContext,
+    ) -> String {
+        let mut tools_section = String::new();
+        let defs = self.tools.defs();
+        if defs.is_empty() {
+            tools_section.push_str(
+                "(no direct tools available to you — your only execution path is the `explore` step, \
+                 which dispatches a subagent that has the actual tools)\n",
+            );
+        } else {
+            for def in &defs {
+                tools_section.push_str(&format!(
+                    "- `{}` — {}\n  args schema: {}\n",
+                    def.name, def.description,
+                    serde_json::to_string(&def.schema).unwrap_or_else(|_| "{}".into())
+                ));
+            }
+        }
+
+        let mut prompt = format!(
+            "{PROMPT_PREAMBLE}\n\n{PROMPT_INTAKE}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}"
+        );
+
+        // Dynamic blocks from PromptRegistry (before PROMPT_RULES).
+        if let Some(pr) = &self.prompt_registry {
+            let dynamic = pr.compose(&[], ctx);
+            if !dynamic.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&dynamic);
+            }
+        }
+
+        prompt.push_str("\n");
+        prompt.push_str(PROMPT_RULES);
+
+        // Skills section.
+        if let Some(skills) = &self.skills {
+            let section = crate::skills::retrieve::list_for_prompt(skills.as_ref());
+            if !section.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&section);
+            }
+        }
+
+        // Skill-Aware note.
+        prompt.push_str("\n\n## Skill-Aware Task Graphs\n\
+When a past skill is auto-matched to your current task, its compiled task \
+graph is injected as `skill:<slug>:<node-id>` nodes. These behave like \
+regular Task nodes.");
 
         prompt
     }

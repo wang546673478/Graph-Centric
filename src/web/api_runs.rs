@@ -435,16 +435,19 @@ pub async fn drive_run(
     // also keeps a copy. We don't actually need to call it from here.
     let _tool_ctx = ToolContext::new(state.config.project_root.clone());
 
-    // Proposer (with skills). Note: the proposer advertises
-    // its `tools` in the system prompt. We pass the EMPTY
-    // `main_tool_registry` so the prompt says "no direct
-    // tools — your only execution path is `explore`" and
-    // the model emits Explore steps instead of bash loops.
+    // Shared PromptRegistry — used by both Proposer and SubAgent
+    // for dynamic block injection (heartbeat, skill matching, etc.).
+    let prompt_registry = Arc::new(
+        crate::skills::prompt_registry::PromptRegistry::new(Some(&state.config.project_root))
+    );
+
+    // Proposer (with skills + dynamic prompt blocks).
     let proposer = GraphProposer::new(
         fast_model.clone(),
         main_tool_registry.clone(),
         Some(state.skills.clone()),
-    );
+    )
+    .with_prompt_registry(prompt_registry.clone());
 
     // Verifier, enricher, repairer.
     let verifier = Verifier::with_model(fast_model.clone());
@@ -460,9 +463,6 @@ pub async fn drive_run(
     // sub-tasks. The main agent gets the empty one (see
     // `main_tool_registry` above).
     let decomposer = Decomposer::new(deep_model.clone());
-    let prompt_registry = Arc::new(
-        crate::skills::prompt_registry::PromptRegistry::new(Some(&state.config.project_root))
-    );
     let subagent = Arc::new(
         SubAgent::new(fast_model.clone())
             .with_tools(subagent_tool_registry.clone())
