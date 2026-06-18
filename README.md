@@ -364,11 +364,6 @@ What this is **NOT** (yet):
 - A full multi-agent framework with named roles, persistent memory, etc.
   Sub-agents are single-shot tool-calling loops; nested GraphLoops are
   reserved for a future iteration.
-- A production retry / backoff layer for model calls. The
-  `OpenAICompatModel` does exactly one HTTP call per `complete()`; rate
-  limits or transient failures bubble up as `HarnessError::Model`.
-- A persistence layer. Graphs serialize to JSON via `Graph::to_json`, but
-  there's no built-in session store, checkpointing, or resume-across-process.
 
 ### Build tool caveats
 

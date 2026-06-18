@@ -9,19 +9,36 @@
 
 ## 近期变更
 
-- **v1.1（2026-06-03）— IMPLICIT_CWD_WRITE_VERBS。** `ScopeGuard` 现在
-  识别 12 个常见 build 工具（`cargo`、`rustc`、`go`、`node`、
-  `npm`、`yarn`、`pnpm`、`python`、`python3`、`pip`、`pip3`、`make`）
-  为"隐式 cwd 写"：当命令没有显式出 scope 的路径参数时，scope 检查
-  被跳过。verb 列表运行时可配，通过 `with_implicit_cwd_verb` /
-  `without_implicit_cwd_verb` / `reset_implicit_cwd_verbs`。bash
-  算法从 7 步扩到 10 步（compound 检查现在跑在"unrecognized"检查
-  之前；新加"empty + implicit_cwd → Ok"分支）。见 §5、§10、§13。
-- **v1（2026-06-03）— Tool System Rework。** 新增 `DangerousCommandDeny`
-  策略（默认放行，对 20 条高危命令模式拒绝）和 `ScopeGuard`（写
-  scope 从 `task.involved_nodes` 派生）。SubAgent 默认策略从
-  `AllowAll` 切到 `DangerousCommandDeny`；dispatcher 自动为每个
-  task 派生 `ScopeGuard`。见 §10、§7。
+- **v2.4（2026-06-18）— 流式输出与持久化。** `ModelWithEvents` 透明
+  包装任意模型——`complete()` 调用被路由到 SSE 流式传输
+  （`complete_stream()`），每个 token 实时作为 `StreamChunk` 事件
+  转发给所有 WebSocket 客户端。`RunPersistence` 让 run 跨进程重启
+  存活：元数据、checkpoint 和分支记录以 JSON 形式存入
+  `data/runs/<id>/`，启动时重新加载。见 §13 获取流式架构和持久化布局。
+
+- **v2.3（2026-06-17）— HeartBeat 自改进循环。** 自治多轮 agent 优化，
+  跨进程重启存活。启动时，若存储了 heartbeat task，自动创建新 run。
+  每次 Review 成功后，轮次计数 +1，变更已提交，二进制被重编译，进程
+  退出——外部启动器重启它继续下一轮。通过 `POST /api/heartbeat` 或设置
+  页面管理。见 `docs/implementation-plan-fractal-graph.md`。
+
+- **v2.2（2026-06-17）— Hook 系统。** `PreToolUse`/`PostToolUse` 生命周期
+  回调环绕每次工具调用。搭载 `LoggingHook`（tracing）、`StatsHook`
+  （按工具统计调用次数/耗时/字节数）和 `SafetyHook`（拒绝模式匹配）。
+  集成到 SubAgent 的 `ToolContext`。见 `src/tools/mod.rs`。
+
+- **v2.1（2026-06-16）— 分形架构。** L0/L1/L2 递归：复杂节点（文件、函数）
+  展开为带有同样三层的子图。AST scanner 提取函数/类级别符号，带行号
+  范围作为子节点通过 `Contains` 边连接。质量指标（LOC、unwrap/unsafe/
+  TODO 数量）按文件计算。3D 图面板基于 Three.js。见
+  `docs/recursive-l0-l1-l2-architecture.md`。
+
+- **v2.0（2026-06-15）— 级联回溯。** 下游节点失败时，主 agent 自动重规划，
+  级联验证沿着所有前驱边一直走到不可变的锚节点。见
+  `docs/design-v2-cascade-backtrack.md`。
+
+- **v1.1（2026-06-03）— IMPLICIT_CWD_WRITE_VERBS。** 见 §5、§10、§13。
+- **v1（2026-06-03）— Tool System Rework。** 见 §10、§7。
 
 ---
 
@@ -738,23 +755,47 @@ harness 里的缓解：
 
 Phase 5+ 范围项：嵌套 GraphLoop，共享父的 L0+L1，私有 L2 访问。
 
-### 不流式输出
+### 流式输出
 
-`OpenAICompatModel` 每次 `complete()` 发一次非流式 HTTP。对长深
-模型调用（20+ 秒），调用方看不到进度指示器。流式要：
+每次模型调用都经过 `ModelWithEvents`（[`src/model/streaming.rs`](src/model/streaming.rs)），
+一个透明的 `Arc<dyn Model>` 包装器。当 `complete()` 被调用时：
 
-- HTTP 客户端的 SSE 解析器
-- `ModelResponse::stream` variant 或独立 API
-- UI/CLI 集成做增量显示
+1. 包装器创建一个 mpsc channel，调用 `inner.complete_stream()`。
+2. `OpenAICompatModel::complete_stream()` 打开 SSE 连接
+   （`stream: true`），逐行解析 `data:` 内容，每个 token 发送
+   `StreamDelta::Delta { content, reasoning_content }`，结束时发送
+   `StreamDelta::Done { finish_reason, usage }`。
+3. `ModelWithEvents` 中的转发任务读取这些 delta，向 session 的
+   broadcast channel 发送 `RunEvent::StreamChunk` / `RunEvent::StreamEnd`。
+4. WebSocket 处理器将这些事件转发给所有连接的客户端。
+5. 前端在可折叠块中显示 `thinking` 内容，并将流式文本追加到当前
+   `assistant_streaming` 消息。`stream_end` 时角色锁定为 `assistant`。
 
-流式也会微妙改变 `max_tokens` 那段叙事（截断发生在流的末尾而不
-是作为一次被拒的响应）。
+没有实现 `complete_stream()` 的模型走 trait 的默认实现：发一个含
+完整内容的 `Delta`，然后 `Done`。流式传输对所有调用方透明——agent
+循环中的任何组件都不知道自己在跟流式还是非流式模型对话。
 
-### 不持久化
+### 持久化
 
-`Graph::to_json` 序列化为 JSON。没有内建的 session store、checkpoint
-格式、跨进程恢复。CLI 二进制中途崩溃会丢一切。对长跑生产
-agent 这是必需的基础设施但不在 Phase 4 范围。
+`RunPersistence`（[`src/web/persistence.rs`](src/web/persistence.rs)）
+将每个 run 存入 `data/runs/<id>/`：
+
+```
+data/runs/<run_id>/
+  run.json                         -- RunMetadata（任务、状态、耗时）
+  checkpoints/0000.json ... N.json -- 每个 checkpoint 一个 JSON 文件
+  branches.json                    -- HashMap<checkpoint_index → [child_run_ids]
+```
+
+- `run.json` 在创建 run 时写入，完成/错误/取消时更新。服务启动时从
+  磁盘加载所有 run 元数据，`GET /api/runs` 返回跨重启存活的已完成 runs。
+- 每次 checkpoint push 触发一次文件写入。内存中的 `CheckpointStore`
+  是主存储；磁盘写入是尽力而为（错误只 trace，不抛出）。
+- 分支记录按 run 持久化，随 run 重新加载。
+
+磁盘格式使用 `serde_json`，类型与内存表示相同（`RunMetadata`、
+`Checkpoint`、`Graph`）。暂无迁移层——格式变更通过 `#[serde(default)]`
+保持向后兼容。
 
 ### v1.1 build 工具护栏：三个已知限制
 

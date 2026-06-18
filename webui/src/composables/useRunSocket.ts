@@ -11,7 +11,7 @@ export interface WSEvent {
   index?: number; round?: number; node_count?: number; edge_count?: number
   changed_node?: string; predecessor?: string; depth?: number
   component?: string; model_name?: string; tier?: string
-  request_preview?: string; response_content?: string
+  request_preview?: string; response_content?: string; reasoning_content?: string
   finish_reason?: string; prompt_tokens?: number; completion_tokens?: number; duration_ms?: number
 }
 

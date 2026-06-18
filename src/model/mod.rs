@@ -5,9 +5,11 @@
 
 pub mod config;
 pub mod openai_compat;
+pub mod streaming;
 
 pub use config::ModelConfig;
 pub use openai_compat::OpenAICompatModel;
+pub use streaming::ModelWithEvents;
 
 use crate::error::Result;
 use async_trait::async_trait;

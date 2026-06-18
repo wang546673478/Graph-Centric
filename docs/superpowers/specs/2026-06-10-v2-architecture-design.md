@@ -54,6 +54,8 @@ Upgrades to WebSocket. Per-run bidirectional channel.
 {"type":"cascade_step","data":{"node":"...","predecessor":"...","verdict":"preserved|needs_repair|needs_reexec","rationale":"..."}}
 {"type":"checkpoint","data":{"index":17,"phase":"task","node_count":12,"edge_count":15}}
 {"type":"status","data":{"phase":"...","message":"...","tokens_used":12345}}
+{"type":"stream_chunk","data":{"component":"fast|deep","content":"...","reasoning_content":"...","finish_reason":null}}
+{"type":"stream_end","data":{"component":"fast|deep","finish_reason":"stop|tool_calls|...","prompt_tokens":123,"completion_tokens":456}}
 {"type":"done","data":{...}}
 {"type":"error","data":{"message":"..."}}
 ```
@@ -444,6 +446,43 @@ Emitted when a checkpoint is created (lightweight notification, not full data).
   }
 }
 ```
+
+### 5.4 stream_chunk / stream_end
+
+Emitted for every model invocation when streaming is active. Each token
+(likely more than one) produces a `stream_chunk`; each model call ends with
+a `stream_end`. The `component` field identifies the model tier ("fast" or
+"deep").
+
+```json
+{
+  "type": "stream_chunk",
+  "data": {
+    "component": "fast",
+    "content": "partial token text",
+    "reasoning_content": null,
+    "finish_reason": null
+  }
+}
+```
+
+```json
+{
+  "type": "stream_end",
+  "data": {
+    "component": "fast",
+    "finish_reason": "stop",
+    "prompt_tokens": 2340,
+    "completion_tokens": 512
+  }
+}
+```
+
+Streaming is transparent at the `Model` trait level — `ModelWithEvents`
+([`src/model/streaming.rs`](../../src/model/streaming.rs)) wraps any model
+and routes `complete()` through `complete_stream()`, forwarding deltas to
+the broadcast channel. See §13 of `ARCHITECTURE.md` for the full
+architecture.
 
 ---
 

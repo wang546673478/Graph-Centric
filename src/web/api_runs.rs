@@ -22,7 +22,7 @@ use crate::agent::subagent::SubAgent;
 use crate::agent::validator::{BashCheckValidator, PostExecutionValidator};
 use crate::agent::verifier::Verifier;
 use crate::graph::Graph;
-use crate::model::ModelConfig;
+use crate::model::{ModelConfig, ModelWithEvents};
 use crate::tools::{BashTool, DangerousCommandDeny, EditFileTool, ReadFileTool, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool};
 use axum::{
     extract::{Path, State},
@@ -366,8 +366,10 @@ pub async fn drive_run(
             return;
         }
     };
-    let fast_model = cfg.fast_model();
-    let deep_model = cfg.deep_model();
+    let fast_model =
+        ModelWithEvents::wrap(cfg.fast_model(), session.event_tx.clone(), "fast".into());
+    let deep_model =
+        ModelWithEvents::wrap(cfg.deep_model(), session.event_tx.clone(), "deep".into());
 
     // Tools.
     //

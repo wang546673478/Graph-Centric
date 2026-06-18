@@ -250,11 +250,6 @@ tests/
 
 - **完整的多 agent 框架**（带命名角色、持久记忆等）。子 agent 是单次
   工具循环；嵌套 GraphLoop 留给未来。
-- **生产级 retry / backoff 层**。`OpenAICompatModel` 每次
-  `complete()` 只发一次 HTTP 请求；限流或瞬时错误以
-  `HarnessError::Model` 冒上来。
-- **持久化层**。图能通过 `Graph::to_json` 序列化为 JSON，但没有内建的
-  session store、checkpoint 或跨进程恢复。
 
 ### Build tool caveats
 

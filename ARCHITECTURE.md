@@ -11,6 +11,14 @@ first if you haven't.
 
 ## Recent changes
 
+- **v2.4 (2026-06-18) — Streaming Output & Persistence.** `ModelWithEvents`
+  transparently wraps any model — `complete()` calls are routed through SSE
+  streaming (`complete_stream()`), forwarding each token as a real-time
+  `StreamChunk` event to all WebSocket clients. Runs survive process restarts
+  via `RunPersistence`: metadata, checkpoints, and branches are saved to
+  `data/runs/<id>/` as JSON files and reloaded on startup. See §13 for
+  streaming architecture and persistence layout.
+
 - **v2.3 (2026-06-17) — HeartBeat Self-Improvement Loop.** Autonomous
   multi-round agent optimization that survives process restarts. On startup,
   if a heartbeat task is stored, a new run is created automatically. After
@@ -890,24 +898,52 @@ scope (per-subcommand exclusion list, precise "this writes to
 `<subdir>`" detection). See `README.md` §Build tool caveats for the
 user-facing disclosure.
 
-### No streaming output
+### Streaming output
 
-The `OpenAICompatModel` makes a single non-streaming HTTP call per
-`complete()`. For long deep-model calls (20+ seconds), the caller sees
-no progress indicator. Streaming would require:
-- Server-sent events parser in the HTTP client
-- `ModelResponse::stream` variant or a separate API
-- UI/CLI integration for incremental display
+Every model call flows through `ModelWithEvents` ([`src/model/streaming.rs`](src/model/streaming.rs)),
+a transparent wrapper around `Arc<dyn Model>`. When `complete()` is called:
 
-Streaming would also subtly change the `max_tokens` story (truncation
-happens at the end of stream rather than as a single rejected response).
+1. The wrapper creates an mpsc channel and calls `inner.complete_stream()`.
+2. `OpenAICompatModel::complete_stream()` opens an SSE connection
+   (`stream: true`), parses each `data:` line as it arrives, and sends
+   `StreamDelta::Delta { content, reasoning_content }` for each token and
+   `StreamDelta::Done { finish_reason, usage }` at the end.
+3. A forwarder task in `ModelWithEvents` reads these deltas and emits
+   `RunEvent::StreamChunk` / `RunEvent::StreamEnd` to the session's
+   broadcast channel.
+4. The WebSocket handler forwards these events to all connected clients.
+5. The frontend displays `thinking` content in a collapsible block and
+   appends streaming text to the current `assistant_streaming` message.
+   On `stream_end`, the role locks to `assistant`.
 
-### No persistence
+Models that don't implement `complete_stream()` get the trait's default
+implementation: one `Delta` with the full content, then `Done`. Streaming
+is transparent to all callers — no component in the agent loop knows
+whether it's talking to a streaming or non-streaming model.
 
-`Graph::to_json` serializes to JSON. There's no built-in session store,
-no checkpoint format, no resume-across-process. A CLI binary that
-crashes mid-run loses everything. For long-running production agents
-this is required infrastructure but not in Phase 4 scope.
+### Persistence
+
+`RunPersistence` ([`src/web/persistence.rs`](src/web/persistence.rs)) saves
+each run to disk under `data/runs/<id>/`:
+
+```
+data/runs/<run_id>/
+  run.json                         -- RunMetadata (task, status, timing)
+  checkpoints/0000.json ... N.json -- one JSON file per checkpoint
+  branches.json                    -- HashMap<checkpoint_index → [child_run_ids]
+```
+
+- `run.json` is written on run creation and updated at completion/error/cancel.
+  On server startup, all run metadata is loaded from disk so `GET /api/runs`
+  returns completed runs that survived a restart.
+- Each checkpoint push triggers a file write. The in-memory `CheckpointStore`
+  is the primary store; disk writes are best-effort (errors are traced,
+  not surfaced).
+- Branch records are persisted per-run and reloaded with the run.
+
+The disk format uses `serde_json` with the same types as the in-memory
+representations (`RunMetadata`, `Checkpoint`, `Graph`). No migration layer
+yet — format changes are backward-compatible via `#[serde(default)]`.
 
 ### No formal tool-call protocol fallback
 
