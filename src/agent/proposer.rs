@@ -734,13 +734,27 @@ fn proposer_tools() -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "ready_for_verify",
-                "description": "Declare the graph complete and hand off to verification. Use this when all necessary nodes and edges are in place.",
+                "description": "Declare the graph complete and hand off to verification.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "rationale": {"type": "string"} },
+                    "required": ["rationale"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "block",
+                "description": "Pause and request specific input from the user (credentials, UX choice, etc). Only use when truly blocked.",
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "reason": {"type": "string", "description": "Short label of what you're blocked on"},
+                        "needed_from_user": {"type": "string", "description": "What the user should provide"},
                         "rationale": {"type": "string"}
                     },
-                    "required": ["rationale"]
+                    "required": ["reason", "rationale"]
                 }
             }
         }),
@@ -781,6 +795,13 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
         }
         "ready_for_verify" => {
             Ok(ProposerStep::ReadyForVerify {
+                rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        }
+        "block" => {
+            Ok(ProposerStep::Block {
+                reason: tc.arguments.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                needed_from_user: tc.arguments.get("needed_from_user").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             })
         }
