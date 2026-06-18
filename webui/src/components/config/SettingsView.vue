@@ -103,8 +103,7 @@ async function switchProfile(name: string) {
     config.value.active_profile = name
     origKey.value = config.value.model?.api_key_masked || ''
     keyDirty.value = false
-    // Auto-save on profile switch so env vars are set immediately.
-    await save()
+    // Don't auto-save on switch. User must click "Save Config" explicitly.
   }
 }
 
