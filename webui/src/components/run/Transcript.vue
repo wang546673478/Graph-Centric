@@ -11,11 +11,14 @@ watch(() => props.messages.length, async () => { await nextTick(); if (el.value)
 
 function roleClass(r: string) {
   if (r === 'user') return 'user'
-  if (r === 'assistant' || r === 'agent') return 'assistant'
+  if (r === 'assistant' || r === 'agent' || r === 'assistant_streaming') return 'assistant'
   if (r === 'tool_result') return 'tool'
   if (r === 'error') return 'error'
   if (r === 'cascade' || r === 'model' || r === 'checkpoint') return 'detail'
   return ''
+}
+function showRoleTag(r: string): boolean {
+  return r !== 'assistant_streaming'
 }
 
 function roleLabel(r: string): string {
@@ -41,7 +44,7 @@ function roleLabel(r: string): string {
         <pre v-if="thinkingExpanded" class="thinking-body">{{ m.content }}</pre>
       </div>
       <div v-else class="msg" :class="roleClass(m.role)">
-        <span class="role-tag">{{ roleLabel(m.role) }}</span>
+        <span v-if="showRoleTag(m.role)" class="role-tag">{{ roleLabel(m.role) }}</span>
         <pre class="body">{{ m.content }}</pre>
       </div>
     </template>
