@@ -929,7 +929,7 @@ impl GraphLoop {
         self.last_step = Some(step.clone());
 
         match step {
-            ProposerStep::AskUser { question, rationale } => {
+            ProposerStep::AskUser { question, options: _, rationale } => {
                 self.pending = Pending::AwaitingAnswer { question: question.clone() };
                 // Reset stuck detector — engaging the user is a way out.
                 self.stuck_repeat_count = 0;
@@ -2251,9 +2251,10 @@ fn hash_string(s: &str) -> u64 {
 /// differ), but semantically equivalent.
 fn render_step_as_json(step: &ProposerStep) -> String {
     let v = match step {
-        ProposerStep::AskUser { question, rationale } => serde_json::json!({
+        ProposerStep::AskUser { question, options, rationale } => serde_json::json!({
             "step": "ask_user",
             "question": question,
+            "options": options,
             "rationale": rationale,
         }),
         ProposerStep::CallTool {
@@ -2863,6 +2864,7 @@ mod tests {
         let steps = [
             ProposerStep::AskUser {
                 question: "q".into(),
+                options: vec![],
                 rationale: "r".into(),
             },
             ProposerStep::CallTool {

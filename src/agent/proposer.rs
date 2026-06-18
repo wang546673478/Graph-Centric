@@ -74,6 +74,9 @@ const MAX_EXPLORE_QUESTION_CHARS: usize = 2000;
 pub enum ProposerStep {
     AskUser {
         question: String,
+        /// Optional structured choices the user can pick from.
+        /// When present, the frontend renders these as clickable buttons.
+        options: Vec<String>,
         rationale: String,
     },
     CallTool {
@@ -535,6 +538,7 @@ regular Task nodes.");
                     return Ok((
                         ProposerStep::AskUser {
                             question,
+                            options: vec![],
                             rationale: format!(
                                 "Model did not produce valid JSON after retry. \
                                  First error: {parse_err}. Retry error: {retry_err}. \
@@ -980,20 +984,29 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
         }
         "ask_user" => {
             let mut question = tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            // Append options as formatted choices.
-            if let Some(opts) = tc.arguments.get("options").and_then(|v| v.as_array()) {
-                if !opts.is_empty() {
-                    question.push_str("\n\nOptions:");
-                    for (i, o) in opts.iter().enumerate() {
-                        if let Some(s) = o.as_str() {
-                            question.push_str(&format!("\n  {}. {}", i + 1, s));
-                        }
-                    }
-                    question.push_str("\n\nReply with a number, or type your own answer.");
+            // Extract structured options from tool_calls.
+            let options: Vec<String> = tc
+                .arguments
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|o| o.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Also append to question for non-UI consumers.
+            let mut q = question;
+            if !options.is_empty() {
+                q.push_str("\n\nOptions:");
+                for (i, o) in options.iter().enumerate() {
+                    q.push_str(&format!("\n  {}. {}", i + 1, o));
                 }
+                q.push_str("\n\nReply with a number, or type your own answer.");
             }
             Ok(ProposerStep::AskUser {
-                question,
+                question: q,
+                options,
                 rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             })
         }
@@ -1040,7 +1053,16 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                     HarnessError::model("proposer: ask_user requires 'question'".to_string())
                 })?
                 .to_string();
-            Ok(ProposerStep::AskUser { question, rationale })
+            let options: Vec<String> = value
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|o| o.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(ProposerStep::AskUser { question, options, rationale })
         }
         "call_tool" => {
             let tool = value
@@ -1706,7 +1728,7 @@ mod tests {
     fn parse_step_ask_user() {
         let s = r#"{"step":"ask_user","question":"How many users?","rationale":"need scale"}"#;
         match parse_step(s).unwrap() {
-            ProposerStep::AskUser { question, rationale } => {
+            ProposerStep::AskUser { question, options: _, rationale } => {
                 assert_eq!(question, "How many users?");
                 assert_eq!(rationale, "need scale");
             }
@@ -2032,7 +2054,7 @@ mod tests {
         let graph = Graph::new();
         let (step, _tokens) = p.next_step_with_retry(&conv, &graph, None).await.unwrap();
         match step {
-            ProposerStep::AskUser { question, rationale } => {
+            ProposerStep::AskUser { question, options: _, rationale } => {
                 assert_eq!(question, "what now?");
                 assert_eq!(rationale, "after retry");
             }
@@ -2117,7 +2139,7 @@ mod tests {
             .await
             .expect("salvage should produce a step");
         match step {
-            ProposerStep::AskUser { question, rationale } => {
+            ProposerStep::AskUser { question, options: _, rationale } => {
                 assert!(
                     rationale.to_lowercase().contains("falling") || rationale.contains("salvage"),
                     "rationale should mention salvage/fallback: {rationale}"

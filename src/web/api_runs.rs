@@ -1074,6 +1074,7 @@ mod step_transcripts_tests {
         // Order: model voice first (rationale), then the ask_user question.
         let step = ProposerStep::AskUser {
             question: "what's the deadline?".into(),
+            options: vec![],
             rationale: "I need a date to plan around".into(),
         };
         let lines = step_transcripts(&step);
@@ -1089,6 +1090,7 @@ mod step_transcripts_tests {
         // When the model writes no rationale, only the question shows.
         let step = ProposerStep::AskUser {
             question: "q".into(),
+            options: vec![],
             rationale: "".into(),
         };
         let lines = step_transcripts(&step);

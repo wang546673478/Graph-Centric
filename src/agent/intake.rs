@@ -307,6 +307,7 @@ mod tests {
     fn gate_round_zero_vague_with_ask_user_passes() {
         let step = ProposerStep::AskUser {
             question: "你感兴趣的是哪一类借鉴?".into(),
+            options: vec![],
             rationale: "需要确认方向".into(),
         };
         assert!(check_intake_compliance(
