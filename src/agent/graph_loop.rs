@@ -44,7 +44,7 @@ use super::validator::{PostExecutionValidator, ValidationVerdict};
 use super::verifier::{Severity, VerificationResult, VerifyIssue, Verifier};
 use super::Conversation;
 use crate::context::SourceLoader;
-use crate::error::Result;
+use crate::error::{HarnessError, Result};
 use crate::graph::{Graph, NodeId, NodeKind};
 use crate::tools::{ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
@@ -334,7 +334,103 @@ enum Pending {
 // GraphLoop
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+/// Optional graph structure constraints. When set, every ProposePatch is
+/// validated against these rules before being applied. If validation fails,
+/// the patch is rejected with a descriptive error surfaced to the model
+/// (via the fix-it retry path), so it can correct its output.
+#[derive(Debug, Clone)]
+pub struct GraphSchema {
+    /// Allowed node kinds. Empty = all kinds allowed.
+    pub allowed_node_kinds: Vec<crate::graph::NodeKind>,
+    /// Required edge relation. `None` = any relation allowed.
+    pub required_edge_relation: Option<crate::graph::RelationType>,
+    /// Whether the final graph must contain at least one immutable node.
+    pub require_immutable_anchor: bool,
+    /// Minimum number of nodes the graph must have after the patch.
+    pub min_nodes: usize,
+    /// Minimum number of edges the graph must have after the patch.
+    pub min_edges: usize,
+}
+
+/// Validate a patch against a GraphSchema. Returns `Ok(())` if the resulting
+/// graph would satisfy the schema, or `Err(reason)` with a human-readable
+/// explanation of what's wrong.
+fn validate_patch_schema(
+    graph: &Graph,
+    patch: &crate::graph::GraphPatch,
+    schema: &GraphSchema,
+) -> std::result::Result<(), String> {
+    use crate::graph::NodeKind;
+
+    // Build the hypothetical graph after applying the patch.
+    let mut after = graph.clone();
+    let _ = after.apply_patch(patch.clone());
+
+    // 1. Check node kinds.
+    if !schema.allowed_node_kinds.is_empty() {
+        for node in after.nodes.values() {
+            if !schema.allowed_node_kinds.iter().any(|k| *k == node.kind) {
+                return Err(format!(
+                    "node '{}' has kind {:?} which is not allowed. \
+                     Allowed kinds: {:?}",
+                    node.id.as_str(),
+                    node.kind,
+                    schema.allowed_node_kinds,
+                ));
+            }
+        }
+    }
+
+    // 2. Check edge relation type.
+    if let Some(ref required_rel) = schema.required_edge_relation {
+        for edge in &after.edges {
+            if edge.relation != *required_rel {
+                return Err(format!(
+                    "edge {} -> {} has relation {:?} which is not allowed. \
+                     All edges must be {:?}",
+                    edge.source.as_str(),
+                    edge.target.as_str(),
+                    edge.relation,
+                    required_rel,
+                ));
+            }
+        }
+    }
+
+    // 3. Check immutable anchor.
+    if schema.require_immutable_anchor {
+        let has_anchor = after.nodes.values().any(|n| n.immutable);
+        if !has_anchor {
+            return Err(
+                "the graph must contain at least one immutable anchor node \
+                 (mark one Task node with immutable: true). \
+                 The anchor represents the user's unchangeable intent."
+                    .to_string(),
+            );
+        }
+    }
+
+    // 4. Check minimum node/edge counts.
+    if after.node_count() < schema.min_nodes {
+        return Err(format!(
+            "the graph has {} nodes but at least {} are required. \
+             Add more nodes to cover the task.",
+            after.node_count(),
+            schema.min_nodes,
+        ));
+    }
+    if after.edge_count() < schema.min_edges {
+        return Err(format!(
+            "the graph has {} edges but at least {} are required. \
+             Add more edges (DependsOn) to connect your nodes.",
+            after.edge_count(),
+            schema.min_edges,
+        ));
+    }
+
+    Ok(())
+}
+
 pub struct GraphLoopConfig {
     /// Hard cap on total proposer rounds (including ask_user / call_tool turns).
     pub max_rounds: usize,
@@ -350,6 +446,9 @@ pub struct GraphLoopConfig {
     /// Whether to auto-match and apply skills in the Task phase.
     /// Default: true (matching runs before decomposer; no-op when no skills configured).
     pub auto_apply_skills: bool,
+    /// Optional graph structure constraints. When `Some`, every ProposePatch
+    /// is validated before application.
+    pub graph_schema: Option<GraphSchema>,
 
     // Stagnation detection thresholds
     pub stagnation_soft_hint: u32,
@@ -375,6 +474,7 @@ impl GraphLoopConfig {
             tool_output_cap: 100_000,
             tool_policy: Arc::new(crate::tools::AllowAll),
             auto_apply_skills: true,
+            graph_schema: None,
             stagnation_soft_hint: 4,
             stagnation_hard_hint: 6,
             stagnation_terminate: 8,
@@ -1165,6 +1265,17 @@ impl GraphLoop {
                 Ok(LoopState::Running)
             }
             ProposerStep::ProposePatch { patch, rationale: _ } => {
+                // Schema validation: if a GraphSchema is configured, reject
+                // patches that would violate structural constraints.
+                if let Some(ref schema) = self.config.graph_schema {
+                    if let Err(reason) = validate_patch_schema(&self.graph, &patch, schema) {
+                        return Err(HarnessError::model(format!(
+                            "GraphSchema violation: {reason}\n\
+                             The patch was NOT applied. Correct your patch to follow \
+                             these rules and emit a new propose_patch.",
+                        )));
+                    }
+                }
                 let before_nodes = self.graph.node_count();
                 let before_edges = self.graph.edge_count();
                 // Capture which node ids the patch is adding, so we can

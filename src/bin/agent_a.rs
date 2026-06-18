@@ -207,6 +207,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         stuck_terminate: 6,
         tool_failure_warn_after: 3,
         tool_failure_halt_after: 8,
+        graph_schema: None,
     };
 
     let mut gl = GraphLoop::new(task.clone(), proposer, verifier, Some(repairer), tools, loop_cfg)
