@@ -310,7 +310,19 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
         let step = if !resp.tool_calls.is_empty() {
             parse_step_from_tool_calls(&resp.tool_calls)?
         } else {
-            parse_step(&resp.content)?
+            // Try content first. If it's empty (DeepSeek puts everything in
+            // reasoning_content), fall back to reasoning_content.
+            let parse_text = if resp.content.trim().is_empty() {
+                resp.reasoning_content.as_deref().unwrap_or("")
+            } else {
+                &resp.content
+            };
+            if parse_text.trim().is_empty() {
+                return Err(HarnessError::model(
+                    "proposer: empty response — model returned neither tool_calls, content, nor reasoning_content"
+                ));
+            }
+            parse_step(parse_text)?
         };
 
         // Layer 3: post-Explore commit gate. After an Explore step the
