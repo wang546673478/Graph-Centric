@@ -75,6 +75,10 @@ pub const DEFAULT_OPTIMIZATION_PROMPT: &str = "\
 \n- 子代理有 web_search 工具可直接搜索 GitHub,然后用 bash cat/grep 读返回的代码文件\
 \n- 搜索目标: 找到具体实现模式(不是概念描述),带回文件路径和代码片段\
 \n\
+\n## 子任务角色注入 (role_prompt)\
+\n- 对代码编辑类子任务,设置 `role_prompt`: \"你是代码编辑专家。用 read_file 读代码, edit_file 替换, write_file 创建文件。每步必须产生实际文件更改,禁止只分析不修改。\"\
+\n- 对探索调研类子任务,设置 `role_prompt`: \"你是探索专家。用 read_file 和 web_search 全面了解目标,产出带文件路径的报告。\"\
+\n\
 \n## 每轮工作流 (A→D)\
 \n1. 创建 A(当前问题)和 D(优化目标),比如 A=\"graph_loop.rs:1655 处 unwrap 会 panic\" D=\"用 proper error propagation 替换\"\
 \n2. Explore 扫描 src/ 或 webui/src/ 找出具体问题点,用节点 metadata 的 quality_score/unwrap_count 定位\
