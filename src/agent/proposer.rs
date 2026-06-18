@@ -220,17 +220,14 @@ impl GraphProposer {
 
     /// Build the system prompt for a given task. Includes the schema for
     /// `ProposerStep` and the currently registered tools.
+    ///
+    /// Prompt sections are loaded from `skills/prompts/proposer-*.md` if
+    /// those files exist, falling back to the hardcoded defaults below.
+    /// Edit the .md files to tune prompts without recompiling.
     pub fn build_system_prompt(&self, task: &str) -> String {
         let mut tools_section = String::new();
         let defs = self.tools.defs();
         if defs.is_empty() {
-            // Pure-orchestrator mode (the default in web/CLI
-            // paths): the main agent has NO direct tool
-            // access. Its only execution path is the `explore`
-            // step, which dispatches a subagent that DOES have
-            // tools. Tell the model this explicitly so it
-            // doesn't waste steps emitting `call_tool` (which
-            // would fail with "unknown tool").
             tools_section.push_str(
                 "(no direct tools available to you — your only execution path is the `explore` step, \
                  which dispatches a subagent that has the actual tools)\n",
@@ -246,8 +243,13 @@ impl GraphProposer {
             }
         }
 
+        // Load prompts from files if available, fall back to hardcoded.
+        let preamble = load_prompt_file("skills/prompts/proposer-preamble.md", PROMPT_PREAMBLE);
+        let intake = load_prompt_file("skills/prompts/proposer-intake.md", PROMPT_INTAKE);
+        let rules = load_prompt_file("skills/prompts/proposer-rules.md", PROMPT_RULES);
+
         let mut prompt = format!(
-            "{PROMPT_PREAMBLE}\n\n{PROMPT_INTAKE}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{PROMPT_RULES}"
+            "{preamble}\n\n{intake}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{rules}"
         );
 
         // Append the skills section if a storage is attached.
@@ -1292,6 +1294,12 @@ fn parse_relation_type(s: &str) -> RelationType {
 // ---------------------------------------------------------------------------
 // Prompt text — written for any modern instruction-tuned model.
 // ---------------------------------------------------------------------------
+
+/// Try to load a prompt from a file, falling back to the hardcoded default.
+/// This lets users edit `skills/prompts/proposer-*.md` without recompiling.
+fn load_prompt_file(path: &str, default: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|_| default.to_string())
+}
 
 const PROMPT_PREAMBLE: &str =
     "You are a Graph-Centric agent. Your job is to build a *relationship graph* \
