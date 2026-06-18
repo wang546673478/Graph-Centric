@@ -350,6 +350,20 @@ pub struct GraphLoopConfig {
     /// Whether to auto-match and apply skills in the Task phase.
     /// Default: true (matching runs before decomposer; no-op when no skills configured).
     pub auto_apply_skills: bool,
+
+    // Stagnation detection thresholds
+    pub stagnation_soft_hint: u32,
+    pub stagnation_hard_hint: u32,
+    pub stagnation_terminate: u32,
+
+    // Stuck detection thresholds
+    pub stuck_soft_hint: u32,
+    pub stuck_hard_hint: u32,
+    pub stuck_terminate: u32,
+
+    // Tool failure thresholds
+    pub tool_failure_warn_after: u32,
+    pub tool_failure_halt_after: u32,
 }
 
 impl GraphLoopConfig {
@@ -361,6 +375,14 @@ impl GraphLoopConfig {
             tool_output_cap: 100_000,
             tool_policy: Arc::new(crate::tools::AllowAll),
             auto_apply_skills: true,
+            stagnation_soft_hint: 4,
+            stagnation_hard_hint: 6,
+            stagnation_terminate: 8,
+            stuck_soft_hint: 3,
+            stuck_hard_hint: 5,
+            stuck_terminate: 6,
+            tool_failure_warn_after: 3,
+            tool_failure_halt_after: 8,
         }
     }
 }
@@ -1007,7 +1029,7 @@ impl GraphLoop {
                         // the only branch that returns a non-Running
                         // state, so the model cannot make the run
                         // drag on by ignoring hints forever.
-                        if self.stuck_repeat_count >= STUCK_REPEAT_TERMINATE {
+                        if self.stuck_repeat_count >= self.config.stuck_terminate {
                             error!(
                                 tool = %tool,
                                 count = self.stuck_repeat_count,
@@ -1038,7 +1060,7 @@ impl GraphLoop {
                         // Tier 2: hard hint — the next repeat will
                         // terminate. Model has a chance to act on
                         // it; if it doesn't, tier 3 fires.
-                        if self.stuck_repeat_count >= STUCK_REPEAT_HARD_HINT {
+                        if self.stuck_repeat_count >= self.config.stuck_hard_hint {
                             warn!(
                                 tool = %tool,
                                 count = self.stuck_repeat_count,
@@ -1055,7 +1077,7 @@ impl GraphLoop {
                                  Do NOT call the same tool with the same args again.",
                                 self.stuck_repeat_count
                             ));
-                        } else if self.stuck_repeat_count >= STUCK_REPEAT_SOFT_HINT {
+                        } else if self.stuck_repeat_count >= self.config.stuck_soft_hint {
                             warn!(
                                 tool = %tool,
                                 count = self.stuck_repeat_count,
@@ -1092,7 +1114,7 @@ impl GraphLoop {
                             .or_insert(0);
                         *count += 1;
                         let failure_count = *count;
-                        if failure_count >= TOOL_FAILURE_HALT_AFTER {
+                        if failure_count >= self.config.tool_failure_halt_after {
                             error!(
                                 tool = %tool,
                                 count = failure_count,
@@ -1123,7 +1145,7 @@ impl GraphLoop {
                             };
                             return Ok(LoopState::Error(err));
                         }
-                        if failure_count >= TOOL_FAILURE_WARN_AFTER {
+                        if failure_count >= self.config.tool_failure_warn_after {
                             warn!(
                                 tool = %tool,
                                 count = failure_count,
@@ -2036,25 +2058,31 @@ impl GraphLoop {
 /// Stuck-detection tier 1: after this many consecutive rounds with the
 /// same `(command, output)` signature, inject a soft hint into the
 /// conversation telling the model to propose_patch or ask_user.
+#[allow(dead_code)]
 const STUCK_REPEAT_SOFT_HINT: u32 = 3;
 
 /// Stuck-detection tier 2: after this many consecutive rounds, escalate
 /// to a hard hint that says the NEXT repeat will terminate the run.
+#[allow(dead_code)]
 const STUCK_REPEAT_HARD_HINT: u32 = 5;
 
 /// Stuck-detection tier 3: at this many consecutive rounds, terminate
 /// the run with `LoopState::Error` instead of letting it burn
 /// `max_rounds` rounds. The error message is informative — the user
 /// can see "stuck loop: 6 repeats" and try a different task shape.
+#[allow(dead_code)]
 const STUCK_REPEAT_TERMINATE: u32 = 6;
 
 /// Graph stagnation tier 1: inject a soft hint into the conversation.
+#[allow(dead_code)]
 const GRAPH_STAGNATION_SOFT_HINT: u32 = 4;
 
 /// Graph stagnation tier 2: inject a hard warning, last chance.
+#[allow(dead_code)]
 const GRAPH_STAGNATION_HARD_HINT: u32 = 6;
 
 /// Graph stagnation tier 3: escalate to GraphInvalid for repair/re-planning.
+#[allow(dead_code)]
 const GRAPH_STAGNATION_TERMINATE: u32 = 8;
 
 /// Compute a lightweight fingerprint of the current graph.
@@ -2086,7 +2114,7 @@ impl GraphLoop {
             self.graph_stagnation_count += 1;
 
             // Tier 1: soft hint.
-            if self.graph_stagnation_count == GRAPH_STAGNATION_SOFT_HINT {
+            if self.graph_stagnation_count == self.config.stagnation_soft_hint {
                 warn!(count = self.graph_stagnation_count, "graph stagnated — soft hint");
                 self.conversation.add_user(
                     "The graph hasn't changed for several rounds. If you're stuck, \
@@ -2096,7 +2124,7 @@ impl GraphLoop {
             }
 
             // Tier 2: hard hint.
-            if self.graph_stagnation_count == GRAPH_STAGNATION_HARD_HINT {
+            if self.graph_stagnation_count == self.config.stagnation_hard_hint {
                 warn!(count = self.graph_stagnation_count, "graph stagnated — hard hint");
                 self.conversation.add_user(format!(
                     "STILL STUCK: {} rounds with no graph change. Go back to the LAST \
@@ -2108,7 +2136,7 @@ impl GraphLoop {
             }
 
             // Tier 3: cascade verification or terminate.
-            if self.graph_stagnation_count >= GRAPH_STAGNATION_TERMINATE {
+            if self.graph_stagnation_count >= self.config.stagnation_terminate {
                 // Try cascade backtracking if configured.
                 if let (Some(cascade), Some(loader)) =
                     (&self.cascade, &self.subagent_loader)
@@ -2174,8 +2202,8 @@ impl GraphLoop {
                     self.graph.node_count(),
                     self.graph.edge_count(),
                     if self.cascade.is_some() { "no issues found" } else { "not configured" },
-                    GRAPH_STAGNATION_SOFT_HINT,
-                    GRAPH_STAGNATION_HARD_HINT,
+                    self.config.stagnation_soft_hint,
+                    self.config.stagnation_hard_hint,
                 )));
             }
 
@@ -2192,10 +2220,12 @@ impl GraphLoop {
 /// `same_tool_failure_warn_after`): after this many consecutive
 /// failures of the same tool, inject a hint telling the model to
 /// change strategy.
+#[allow(dead_code)]
 const TOOL_FAILURE_WARN_AFTER: u32 = 3;
 
 /// Tool-failure guardrail tier 2: after this many consecutive
 /// failures, request a graceful summary and terminate.
+#[allow(dead_code)]
 const TOOL_FAILURE_HALT_AFTER: u32 = 8;
 
 /// How many leading characters of the tool output to fold into the

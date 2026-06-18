@@ -69,6 +69,7 @@ impl WebState {
                         let session = Arc::new(run_session::RunSession::new(
                             meta.id.clone(),
                             meta.task.clone(),
+                            self.config.engine.loop_tuning.event_channel_capacity,
                         ));
                         let status = if !meta.status.is_terminal() {
                             // Zombie: was Running/Paused/GraphInvalid when process died.

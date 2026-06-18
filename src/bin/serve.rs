@@ -89,7 +89,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let id = uuid::Uuid::new_v4().to_string();
                     let label = format!("🫀 Round {}/10", hb.completed_rounds + 1);
                     let prompt = hb.prompt.clone();
-                    let session = Arc::new(graph_harness::web::run_session::RunSession::new(id.clone(), label));
+                    let session = Arc::new(graph_harness::web::run_session::RunSession::new(
+                        id.clone(),
+                        label,
+                        state.config.engine.loop_tuning.event_channel_capacity,
+                    ));
                     state.runs.write().await.insert(id.clone(), session.clone());
                     hb.current_run_id = Some(id.clone());
                     hb.save();

@@ -199,6 +199,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tool_output_cap: 8_000,
         tool_policy: Arc::new(ReadOnly),
         auto_apply_skills: true,
+        stagnation_soft_hint: 4,
+        stagnation_hard_hint: 6,
+        stagnation_terminate: 8,
+        stuck_soft_hint: 3,
+        stuck_hard_hint: 5,
+        stuck_terminate: 6,
+        tool_failure_warn_after: 3,
+        tool_failure_halt_after: 8,
     };
 
     let mut gl = GraphLoop::new(task.clone(), proposer, verifier, Some(repairer), tools, loop_cfg)

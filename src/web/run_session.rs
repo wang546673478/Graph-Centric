@@ -10,6 +10,8 @@ use std::time::Instant;
 use tokio::sync::{broadcast, Notify};
 use tokio_util::sync::CancellationToken;
 
+/// Default event channel capacity (kept as fallback).
+#[allow(dead_code)]
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// One run's state. The `RunSession` is the single source of truth for
@@ -60,8 +62,8 @@ impl RunStatus {
 }
 
 impl RunSession {
-    pub fn new(id: String, task: String) -> Self {
-        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+    pub fn new(id: String, task: String, event_channel_capacity: usize) -> Self {
+        let (event_tx, _) = broadcast::channel(event_channel_capacity);
         Self {
             id,
             task,
@@ -207,13 +209,13 @@ mod tests {
 
     #[tokio::test]
     async fn new_session_starts_running() {
-        let s = RunSession::new("r1".into(), "task".into());
+        let s = RunSession::new("r1".into(), "task".into(), 256);
         assert_eq!(*s.status.read().await, RunStatus::Running);
     }
 
     #[tokio::test]
     async fn emit_and_receive_via_broadcast() {
-        let s = RunSession::new("r1".into(), "task".into());
+        let s = RunSession::new("r1".into(), "task".into(), 256);
         let mut rx = s.event_tx.subscribe();
         s.emit(RunEvent::Transcript {
             role: "assistant".into(),
@@ -231,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_token_cancels() {
-        let s = RunSession::new("r1".into(), "task".into());
+        let s = RunSession::new("r1".into(), "task".into(), 256);
         assert!(!s.cancel.is_cancelled());
         s.cancel.cancel();
         assert!(s.cancel.is_cancelled());
@@ -239,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn answer_flow_resolves() {
-        let s = std::sync::Arc::new(RunSession::new("r1".into(), "task".into()));
+        let s = std::sync::Arc::new(RunSession::new("r1".into(), "task".into(), 256));
         let s2 = s.clone();
         let waiter = tokio::spawn(async move { s2.await_answer().await });
         // Give the waiter a tick to subscribe.
@@ -251,7 +253,7 @@ mod tests {
 
     #[tokio::test]
     async fn repair_flow_resolves() {
-        let s = std::sync::Arc::new(RunSession::new("r1".into(), "task".into()));
+        let s = std::sync::Arc::new(RunSession::new("r1".into(), "task".into(), 256));
         let s2 = s.clone();
         let waiter = tokio::spawn(async move { s2.await_repair().await });
         tokio::task::yield_now().await;

@@ -92,7 +92,11 @@ pub async fn create_run(
     Json(body): Json<CreateRunBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = uuid::Uuid::new_v4().to_string();
-    let session = Arc::new(RunSession::new(id.clone(), body.task.clone()));
+    let session = Arc::new(RunSession::new(
+        id.clone(),
+        body.task.clone(),
+        state.config.engine.loop_tuning.event_channel_capacity,
+    ));
     state.runs.write().await.insert(id.clone(), session.clone());
 
     // Spawn the run driver.
@@ -306,7 +310,11 @@ pub async fn create_branch(
     };
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    let new_session = Arc::new(RunSession::new(new_id.clone(), parent_task));
+    let new_session = Arc::new(RunSession::new(
+        new_id.clone(),
+        parent_task,
+        state.config.engine.loop_tuning.event_channel_capacity,
+    ));
     state.runs.write().await.insert(new_id.clone(), new_session.clone());
 
     // Record branch relationship.
@@ -494,6 +502,14 @@ pub async fn drive_run(
         tool_output_cap: 8_000,
         tool_policy: Arc::new(DangerousCommandDeny::new()),
         auto_apply_skills: state.config.engine.loop_tuning.auto_apply_skills,
+        stagnation_soft_hint: state.config.engine.loop_tuning.stagnation_soft_hint,
+        stagnation_hard_hint: state.config.engine.loop_tuning.stagnation_hard_hint,
+        stagnation_terminate: state.config.engine.loop_tuning.stagnation_terminate,
+        stuck_soft_hint: state.config.engine.loop_tuning.stuck_soft_hint,
+        stuck_hard_hint: state.config.engine.loop_tuning.stuck_hard_hint,
+        stuck_terminate: state.config.engine.loop_tuning.stuck_terminate,
+        tool_failure_warn_after: state.config.engine.loop_tuning.tool_failure_warn_after,
+        tool_failure_halt_after: state.config.engine.loop_tuning.tool_failure_halt_after,
     };
 
     let mut gl = GraphLoop::new(
@@ -1244,7 +1260,7 @@ mod tests {
     async fn post_answer_to_running_run_returns_409() {
         let state = make_state();
         let id = uuid::Uuid::new_v4().to_string();
-        let session = Arc::new(RunSession::new(id.clone(), "t".into()));
+        let session = Arc::new(RunSession::new(id.clone(), "t".into(), 256));
         state.runs.write().await.insert(id.clone(), session);
         let err = post_answer(
             State(state),

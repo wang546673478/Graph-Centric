@@ -22,7 +22,11 @@ async fn spawn_heartbeat_run(state: &Arc<WebState>, hb: &mut super::heartbeat::H
         state.config.project_root.display(),
         hb.prompt
     );
-    let session = Arc::new(super::run_session::RunSession::new(id.clone(), label));
+    let session = Arc::new(super::run_session::RunSession::new(
+        id.clone(),
+        label,
+        state.config.engine.loop_tuning.event_channel_capacity,
+    ));
     state.runs.write().await.insert(id.clone(), session.clone());
     let initial_transcript = vec![super::api_runs::InitialMessage {
         role: "user".into(),

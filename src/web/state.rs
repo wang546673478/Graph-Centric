@@ -97,11 +97,47 @@ pub struct LoopTuningConfig {
     /// substitute the decomposer output in the Task phase.
     #[serde(default = "default_true")]
     pub auto_apply_skills: bool,
+
+    // Stagnation detection thresholds
+    #[serde(default = "default_stagnation_soft_hint")]
+    pub stagnation_soft_hint: u32,
+    #[serde(default = "default_stagnation_hard_hint")]
+    pub stagnation_hard_hint: u32,
+    #[serde(default = "default_stagnation_terminate")]
+    pub stagnation_terminate: u32,
+
+    // Stuck detection thresholds
+    #[serde(default = "default_stuck_soft_hint")]
+    pub stuck_soft_hint: u32,
+    #[serde(default = "default_stuck_hard_hint")]
+    pub stuck_hard_hint: u32,
+    #[serde(default = "default_stuck_terminate")]
+    pub stuck_terminate: u32,
+
+    // Tool failure thresholds
+    #[serde(default = "default_tool_failure_warn")]
+    pub tool_failure_warn_after: u32,
+    #[serde(default = "default_tool_failure_halt")]
+    pub tool_failure_halt_after: u32,
+
+    // Event channel capacity
+    #[serde(default = "default_event_channel_capacity")]
+    pub event_channel_capacity: usize,
 }
 
 fn default_true() -> bool {
     true
 }
+
+fn default_stagnation_soft_hint() -> u32 { 4 }
+fn default_stagnation_hard_hint() -> u32 { 6 }
+fn default_stagnation_terminate() -> u32 { 8 }
+fn default_stuck_soft_hint() -> u32 { 3 }
+fn default_stuck_hard_hint() -> u32 { 5 }
+fn default_stuck_terminate() -> u32 { 6 }
+fn default_tool_failure_warn() -> u32 { 3 }
+fn default_tool_failure_halt() -> u32 { 8 }
+fn default_event_channel_capacity() -> usize { 256 }
 
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
@@ -183,6 +219,15 @@ impl Default for EngineConfig {
                 thinking_enabled: false,
                 reasoning_effort: "high".into(),
                 auto_apply_skills: true,
+                stagnation_soft_hint: 4,
+                stagnation_hard_hint: 6,
+                stagnation_terminate: 8,
+                stuck_soft_hint: 3,
+                stuck_hard_hint: 5,
+                stuck_terminate: 6,
+                tool_failure_warn_after: 3,
+                tool_failure_halt_after: 8,
+                event_channel_capacity: 256,
             },
         }
     }
