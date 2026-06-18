@@ -41,7 +41,7 @@ pub struct OpenAICompatModel {
 impl OpenAICompatModel {
     pub fn new(base_url: impl Into<String>, model_name: impl Into<String>) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client builds with default settings");
         Self {
@@ -49,7 +49,7 @@ impl OpenAICompatModel {
             model_name: model_name.into(),
             api_key: None,
             client,
-            retry_max_attempts: 3,
+            retry_max_attempts: 1,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
         }
