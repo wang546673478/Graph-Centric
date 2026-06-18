@@ -275,29 +275,35 @@ impl GraphProposer {
     ) -> Result<(ProposerStep, u64)> {
         let snapshot = render_graph_for_prompt(graph);
         let mut req = conv.to_request(&snapshot, self.temperature, self.max_tokens);
-        // Make sure the system prompt is consistent with this proposer's task
-        // even if the conversation was constructed elsewhere.
+        // Make sure the system prompt is consistent with this proposer's task.
         if let Some(first) = req
             .messages
             .iter_mut()
             .find(|m| matches!(m.role, Role::System))
         {
-            // Only overwrite if the prompt looks different — preserves caller's intent
-            // when they pre-built a richer prompt.
             let want = self.build_system_prompt(&conv.task_description);
             if first.content != want {
                 first.content = want;
             }
         }
+        // Enable native function calling (OpenAI tool_calls).
+        req.tools = proposer_tools();
 
         let resp = self.model.complete(req).await?;
         let tokens = resp.usage.total_tokens as u64;
         debug!(
             content_len = resp.content.len(),
+            tool_calls = resp.tool_calls.len(),
             tokens,
             "proposer received model response"
         );
-        let step = parse_step(&resp.content)?;
+
+        // Prefer native tool_calls (structured, no JSON escape issues).
+        let step = if !resp.tool_calls.is_empty() {
+            parse_step_from_tool_calls(&resp.tool_calls)?
+        } else {
+            parse_step(&resp.content)?
+        };
 
         // Layer 3: post-Explore commit gate. After an Explore step the
         // next step MUST be a graph-committing or pause-declaring step
@@ -654,6 +660,132 @@ pub fn extract_json_block(text: &str) -> Result<String> {
     let end = end
         .ok_or_else(|| HarnessError::model("proposer: unterminated JSON object".to_string()))?;
     Ok(body[..end].to_string())
+}
+
+fn proposer_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "propose_patch",
+                "description": "Add/remove nodes and edges on the relationship graph. Use this for ALL graph modifications.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {
+                            "type": "object",
+                            "properties": {
+                                "add_nodes": {"type": "array", "items": {"type": "object"}},
+                                "add_edges": {"type": "array", "items": {"type": "object"}},
+                                "remove_node_ids": {"type": "array", "items": {"type": "string"}},
+                                "remove_edge_indices": {"type": "array", "items": {"type": "integer"}},
+                                "set_l1": {"type": "object"},
+                                "reason": {"type": "string"}
+                            },
+                            "required": ["reason"]
+                        },
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["patch", "rationale"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "explore",
+                "description": "Dispatch a subagent to read files and search the codebase. Use this to gather information before modifying the graph.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "items": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "scope": {"type": "string", "description": "Directory, file glob, or URL to explore"},
+                                    "question": {"type": "string", "description": "Specific question the subagent should answer"}
+                                },
+                                "required": ["scope", "question"]
+                            }
+                        },
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["items", "rationale"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "ask_user",
+                "description": "Ask the user a clarifying question BEFORE modifying the graph. Only use when the task is ambiguous.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["question", "rationale"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "ready_for_verify",
+                "description": "Declare the graph complete and hand off to verification. Use this when all necessary nodes and edges are in place.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["rationale"]
+                }
+            }
+        }),
+    ]
+}
+
+/// Parse a ProposerStep from native OpenAI tool_calls.
+fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<ProposerStep> {
+    let tc = &tool_calls[0];
+    match tc.name.as_str() {
+        "propose_patch" => {
+            let patch: crate::graph::GraphPatch = serde_json::from_value(tc.arguments.clone())
+                .map_err(|e| HarnessError::model(format!("propose_patch tool_call: invalid patch: {e}")))?;
+            Ok(ProposerStep::ProposePatch {
+                patch,
+                rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        }
+        "explore" => {
+            let items: Vec<ExploreItem> = tc.arguments
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|item| {
+                    Some(ExploreItem {
+                        scope: item.get("scope")?.as_str()?.to_string(),
+                        question: item.get("question")?.as_str()?.to_string(),
+                    })
+                }).collect())
+                .unwrap_or_default();
+            let rationale = tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(ProposerStep::Explore { items, rationale })
+        }
+        "ask_user" => {
+            Ok(ProposerStep::AskUser {
+                question: tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        }
+        "ready_for_verify" => {
+            Ok(ProposerStep::ReadyForVerify {
+                rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        }
+        other => Err(HarnessError::model(format!("unknown tool_call: {other}"))),
+    }
 }
 
 pub fn parse_step(text: &str) -> Result<ProposerStep> {
