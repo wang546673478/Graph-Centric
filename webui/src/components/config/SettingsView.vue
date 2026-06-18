@@ -11,6 +11,7 @@ const modelList = ref<string[]>([])
 const fetching = ref(false)
 const keyDirty = ref(false)
 const origKey = ref('')
+const isLoading = ref(false) // guard against reactivity-triggered switchProfile
 const profileName = ref('')
 const profiles = ref<Record<string, any>>({})
 const DEFAULTS = {
@@ -58,6 +59,7 @@ const hbPrompt = ref(DEFAULTS.prompt)
 const hbRounds = ref(DEFAULTS.max_rounds)
 
 onMounted(async () => {
+  isLoading.value = true
   try {
     config.value = await api.get('/api/config')
     origKey.value = config.value.model?.api_key_masked || ''
@@ -66,13 +68,13 @@ onMounted(async () => {
     if (heartbeat.value?.active && heartbeat.value?.prompt) {
       hbPrompt.value = heartbeat.value.prompt
     } else if (!heartbeat.value?.active) {
-      // Load saved prompt from localStorage (edits survive refresh)
       const saved = localStorage.getItem('hb-prompt')
       if (saved) hbPrompt.value = saved
       const savedRounds = localStorage.getItem('hb-rounds')
       if (savedRounds) hbRounds.value = parseInt(savedRounds) || 10
     }
   } catch { /* */ }
+  isLoading.value = false
 })
 
 // Persist prompt edits to localStorage on every keystroke.
@@ -98,12 +100,12 @@ async function refreshHeartbeat() {
 function onKeyInput() { keyDirty.value = true }
 
 async function switchProfile(name: string) {
+  if (isLoading.value) return  // skip if triggered by reactivity during save
   if (profiles.value[name]) {
     config.value.model = { ...profiles.value[name] }
     config.value.active_profile = name
     origKey.value = config.value.model?.api_key_masked || ''
     keyDirty.value = false
-    // Don't auto-save on switch. User must click "Save Config" explicitly.
   }
 }
 
@@ -151,15 +153,16 @@ async function save() {
     profiles.value[ap] = { ...config.value.model }
     config.value.profiles = { ...profiles.value }
   }
+  isLoading.value = true
   try {
     const resp = await api.post('/api/config', config.value)
-    // Update in-place to avoid reactivity issues with the dropdown.
     Object.assign(config.value, resp)
     origKey.value = resp.model?.api_key_masked || ''
     profiles.value = resp.profiles || {}
     keyDirty.value = false
     saved.value = true; setTimeout(() => saved.value = false, 2000)
   } catch (e) { alert(String(e)) }
+  isLoading.value = false
 }
 </script>
 
