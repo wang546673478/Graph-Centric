@@ -433,10 +433,14 @@ pub async fn drive_run(
     // sub-tasks. The main agent gets the empty one (see
     // `main_tool_registry` above).
     let decomposer = Decomposer::new(deep_model.clone());
+    let prompt_registry = Arc::new(
+        crate::skills::prompt_registry::PromptRegistry::load(&state.config.project_root)
+    );
     let subagent = Arc::new(
         SubAgent::new(fast_model.clone())
             .with_tools(subagent_tool_registry.clone())
             .with_policy(Arc::new(DangerousCommandDeny::new()))
+            .with_prompt_registry(prompt_registry)
             .with_tool_cwd(state.config.project_root.clone())
             .with_tool_output_cap(6_000)
             .with_max_steps(usize::MAX),

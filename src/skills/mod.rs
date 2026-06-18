@@ -5,6 +5,7 @@
 
 pub mod capture;
 pub mod compiler;
+pub mod prompt_registry;
 pub mod retrieve;
 pub mod slug;
 pub mod storage;

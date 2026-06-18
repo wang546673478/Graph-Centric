@@ -210,10 +210,11 @@ pub struct SubAgent {
     /// Max graph distance to include in the local subgraph context.
     pub context_depth: usize,
     pub context_builder: ContextBuilder,
-    /// Tool surface the sub-agent may invoke. Empty registry = no tool
-    /// loop (model emits final_answer directly, or plain text).
+    /// Tool surface the sub-agent may invoke.
     pub tools: Arc<ToolRegistry>,
     pub policy: Arc<dyn Policy>,
+    /// Optional prompt registry for dynamic prompt composition.
+    pub prompt_registry: Option<Arc<crate::skills::prompt_registry::PromptRegistry>>,
     /// Optional write-scope guard. When set, every bash invocation is
     /// checked against the allowed paths before reaching the tool. Set
     /// per-agent via `with_scope`, or per-task via `with_task_scope`
@@ -243,6 +244,7 @@ impl SubAgent {
             tools: Arc::new(ToolRegistry::new()),
             policy: Arc::new(DangerousCommandDeny::new()),
             scope_guard: None,
+            prompt_registry: None,
             tool_cwd: cwd,
             tool_output_cap: 6_000,
             max_steps: 8,
@@ -288,6 +290,11 @@ impl SubAgent {
         clone
     }
 
+    pub fn with_prompt_registry(mut self, pr: Arc<crate::skills::prompt_registry::PromptRegistry>) -> Self {
+        self.prompt_registry = Some(pr);
+        self
+    }
+
     pub fn with_tool_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.tool_cwd = cwd.into();
         self
@@ -330,7 +337,12 @@ impl SubAgent {
             loader,
         )?;
 
-        let system_prompt = build_system_prompt(self.tools.as_ref(), self.max_steps, &task.role_prompt);
+        let system_prompt = build_system_prompt(
+            self.tools.as_ref(),
+            self.max_steps,
+            &task.role_prompt,
+            self.prompt_registry.as_deref(),
+        );
         let user_prompt = build_initial_user_prompt(
             task,
             &context.text,
@@ -568,12 +580,33 @@ impl SubAgent {
 // Prompts
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(tools: &ToolRegistry, max_steps: usize, role_prompt: &str) -> String {
+fn build_system_prompt(
+    tools: &ToolRegistry,
+    max_steps: usize,
+    role_prompt: &str,
+    registry: Option<&crate::skills::prompt_registry::PromptRegistry>,
+) -> String {
     let defs = tools.defs();
-    let role_section = if role_prompt.is_empty() {
-        String::new()
-    } else {
+
+    // Use registry for role composition if available; fall back to role_prompt text.
+    let role_section = if let (Some(reg), true) = (registry, !role_prompt.is_empty()) {
+        let role = if role_prompt.contains("edit") || role_prompt.contains("code") || role_prompt.contains("修改") {
+            "edit"
+        } else if role_prompt.contains("explore") || role_prompt.contains("探索") || role_prompt.contains("调研") {
+            "explore"
+        } else {
+            "auto"
+        };
+        let blocks: &[&str] = match role {
+            "edit" => &["base/subagent-core", "base/subagent-edit", "tools/edit-strategy", "constraints/windows-safety"],
+            "explore" => &["base/subagent-core", "base/subagent-explore", "tools/edit-strategy"],
+            _ => &["base/subagent-core", "base/subagent-edit", "tools/edit-strategy", "constraints/windows-safety"],
+        };
+        format!("\n{}\n", reg.compose(blocks))
+    } else if !role_prompt.is_empty() {
         format!("\n## Role\n{role_prompt}\n")
+    } else {
+        String::new()
     };
     let tools_block = if defs.is_empty() {
         "(no tools registered — go straight to final_answer)".to_string()
