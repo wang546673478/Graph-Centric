@@ -788,8 +788,21 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
             Ok(ProposerStep::Explore { items, rationale })
         }
         "ask_user" => {
+            let mut question = tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // Append options as formatted choices.
+            if let Some(opts) = tc.arguments.get("options").and_then(|v| v.as_array()) {
+                if !opts.is_empty() {
+                    question.push_str("\n\nOptions:");
+                    for (i, o) in opts.iter().enumerate() {
+                        if let Some(s) = o.as_str() {
+                            question.push_str(&format!("\n  {}. {}", i + 1, s));
+                        }
+                    }
+                    question.push_str("\n\nReply with a number, or type your own answer.");
+                }
+            }
             Ok(ProposerStep::AskUser {
-                question: tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                question,
                 rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             })
         }
