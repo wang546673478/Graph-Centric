@@ -456,6 +456,12 @@ pub struct GraphLoop {
     /// Reset to 0 when the signature changes. Drives the tiered
     /// escalation: soft hint at 3, hard hint at 5, terminate at 6.
     stuck_repeat_count: u32,
+    /// Fingerprint of the graph at the last round end: hashed from
+    /// (node_count, edge_count, sorted node IDs). Used to detect
+    /// stagnation — rounds where the graph doesn't change at all.
+    last_graph_fingerprint: Option<u64>,
+    /// Consecutive rounds with the same graph fingerprint.
+    graph_stagnation_count: u32,
     /// Per-tool consecutive-failure counts. When a tool call
     /// fails, this map is incremented for that tool name; on a
     /// successful call, it's reset to 0. Drives the
@@ -626,6 +632,8 @@ impl GraphLoop {
             final_summary: None,
             last_stuck_signature: None,
             stuck_repeat_count: 0,
+            last_graph_fingerprint: None,
+            graph_stagnation_count: 0,
             tool_failure_counts: std::collections::HashMap::new(),
             tokens_used: 0,
             phase: Phase::Graph,
@@ -852,7 +860,7 @@ impl GraphLoop {
         }
         self.round += 1;
 
-        match self.phase {
+        let state = match self.phase {
             Phase::Graph => match self.step_graph().await {
                 Ok(s) => s,
                 Err(e) => {
@@ -864,7 +872,17 @@ impl GraphLoop {
             Phase::Review => self.step_review_stub().await,
             Phase::Done => LoopState::Done(self.build_final_result()),
             Phase::Poisoned => LoopState::Error("loop poisoned".into()),
+        };
+
+        // Graph stagnation guard: detect when the graph hasn't changed
+        // for many consecutive rounds (model stuck in explore-retry loop).
+        if matches!(state, LoopState::Running) {
+            if let Some(stuck) = self.check_graph_stagnation() {
+                return stuck;
+            }
         }
+
+        state
     }
 
     // -----------------------------------------------------------------------
@@ -2028,6 +2046,61 @@ const STUCK_REPEAT_HARD_HINT: u32 = 5;
 /// `max_rounds` rounds. The error message is informative — the user
 /// can see "stuck loop: 6 repeats" and try a different task shape.
 const STUCK_REPEAT_TERMINATE: u32 = 6;
+
+/// Graph stagnation: after this many consecutive rounds with zero graph
+/// change (same node count, edge count, and node IDs), terminate the run.
+/// This catches loops where the model explores repeatedly without ever
+/// committing a meaningful patch — a failure mode the CallTool stuck
+/// detector misses because the orchestrator has no direct tools.
+const GRAPH_STAGNATION_TERMINATE: u32 = 8;
+
+/// Compute a lightweight fingerprint of the current graph.
+fn graph_fingerprint(g: &Graph) -> u64 {
+    let mut node_ids: Vec<&str> = g.nodes.keys().map(|k| k.as_str()).collect();
+    node_ids.sort();
+    let mut s = String::new();
+    s.push_str(&format!("{}:{}:", g.node_count(), g.edge_count()));
+    for id in node_ids {
+        s.push_str(id);
+        s.push('|');
+    }
+    hash_string(&s)
+}
+
+impl GraphLoop {
+    /// Check and update the graph stagnation counter. Returns `Some(Error)`
+    /// if the graph hasn't changed for GRAPH_STAGNATION_TERMINATE rounds.
+    fn check_graph_stagnation(&mut self) -> Option<LoopState> {
+        let fp = graph_fingerprint(&self.graph);
+        if self.last_graph_fingerprint == Some(fp) {
+            self.graph_stagnation_count += 1;
+            if self.graph_stagnation_count >= GRAPH_STAGNATION_TERMINATE {
+                warn!(
+                    count = self.graph_stagnation_count,
+                    nodes = self.graph.node_count(),
+                    edges = self.graph.edge_count(),
+                    "graph stagnated — no changes for too many rounds"
+                );
+                self.phase = Phase::Poisoned;
+                return Some(LoopState::Error(format!(
+                    "graph stagnated: no changes for {} consecutive rounds ({} nodes, {} edges). \
+                     The model is likely stuck in an explore-retry loop without committing changes.",
+                    self.graph_stagnation_count,
+                    self.graph.node_count(),
+                    self.graph.edge_count(),
+                )));
+            }
+            debug!(
+                count = self.graph_stagnation_count,
+                "graph unchanged this round"
+            );
+        } else {
+            self.last_graph_fingerprint = Some(fp);
+            self.graph_stagnation_count = 0;
+        }
+        None
+    }
+}
 
 /// Tool-failure guardrail tier 1 (Hermes §tool_loop_guardrails
 /// `same_tool_failure_warn_after`): after this many consecutive
