@@ -2047,11 +2047,13 @@ const STUCK_REPEAT_HARD_HINT: u32 = 5;
 /// can see "stuck loop: 6 repeats" and try a different task shape.
 const STUCK_REPEAT_TERMINATE: u32 = 6;
 
-/// Graph stagnation: after this many consecutive rounds with zero graph
-/// change (same node count, edge count, and node IDs), terminate the run.
-/// This catches loops where the model explores repeatedly without ever
-/// committing a meaningful patch — a failure mode the CallTool stuck
-/// detector misses because the orchestrator has no direct tools.
+/// Graph stagnation tier 1: inject a soft hint into the conversation.
+const GRAPH_STAGNATION_SOFT_HINT: u32 = 4;
+
+/// Graph stagnation tier 2: inject a hard warning, last chance.
+const GRAPH_STAGNATION_HARD_HINT: u32 = 6;
+
+/// Graph stagnation tier 3: escalate to GraphInvalid for repair/re-planning.
 const GRAPH_STAGNATION_TERMINATE: u32 = 8;
 
 /// Compute a lightweight fingerprint of the current graph.
@@ -2068,28 +2070,74 @@ fn graph_fingerprint(g: &Graph) -> u64 {
 }
 
 impl GraphLoop {
-    /// Check and update the graph stagnation counter. Returns `Some(Error)`
-    /// if the graph hasn't changed for GRAPH_STAGNATION_TERMINATE rounds.
+    /// Check and update the graph stagnation counter.
+    ///
+    /// Staged escalation:
+    /// - 4 rounds: soft hint — ask the model to commit or change strategy
+    /// - 6 rounds: hard hint — warn that termination is imminent, suggest
+    ///   reconsidering the last node's assumptions
+    /// - 8 rounds: return `GraphInvalid` to trigger repair/re-planning
+    ///   (instead of Error — gives the model a chance to fix the root cause)
     fn check_graph_stagnation(&mut self) -> Option<LoopState> {
         let fp = graph_fingerprint(&self.graph);
         if self.last_graph_fingerprint == Some(fp) {
             self.graph_stagnation_count += 1;
+
+            // Tier 1: soft hint at 4 rounds.
+            if self.graph_stagnation_count == GRAPH_STAGNATION_SOFT_HINT {
+                warn!(
+                    count = self.graph_stagnation_count,
+                    "graph stagnated — injecting soft hint"
+                );
+                self.conversation.add_user(
+                    "The graph hasn't changed for several rounds. If you're stuck in an \
+                     explore loop, reconsider: is the last node you added still valid? \
+                     Does its output match what the next node needs? Try proposing a \
+                     patch — even a small edge change — to break the stall."
+                );
+            }
+
+            // Tier 2: hard hint at 6 rounds.
+            if self.graph_stagnation_count == GRAPH_STAGNATION_HARD_HINT {
+                warn!(
+                    count = self.graph_stagnation_count,
+                    "graph stagnated — injecting hard hint"
+                );
+                self.conversation.add_user(format!(
+                    "STILL STUCK: {} rounds with no graph change. The most likely cause \
+                     is that an upstream node's output doesn't satisfy its downstream \
+                     node's input. Go back to the LAST node you added or modified and \
+                     re-examine it. If its design is wrong, propose a patch to fix it. \
+                     If its design is correct but its output is wrong, re-execute it. \
+                     If there's a gap between two nodes, add an intermediate node. \
+                     This is your last chance before the run is terminated.",
+                    self.graph_stagnation_count
+                ));
+            }
+
+            // Tier 3: escalate to Error with repair guidance.
+            // (GraphInvalid doesn't help here — heartbeat auto-repair just
+            // clones the snapshot, which won't unstick a stagnated graph.)
             if self.graph_stagnation_count >= GRAPH_STAGNATION_TERMINATE {
                 warn!(
                     count = self.graph_stagnation_count,
-                    nodes = self.graph.node_count(),
-                    edges = self.graph.edge_count(),
-                    "graph stagnated — no changes for too many rounds"
+                    "graph stagnated — terminating with repair guidance"
                 );
                 self.phase = Phase::Poisoned;
                 return Some(LoopState::Error(format!(
-                    "graph stagnated: no changes for {} consecutive rounds ({} nodes, {} edges). \
-                     The model is likely stuck in an explore-retry loop without committing changes.",
+                    "graph stagnated for {} rounds ({} nodes, {} edges). \
+                     Hints were injected at rounds {} and {}. \
+                     Cause: model explored repeatedly without committing. \
+                     Next round should: re-examine the last modified node, \
+                     verify its upstream dependencies, and propose a concrete patch.",
                     self.graph_stagnation_count,
                     self.graph.node_count(),
                     self.graph.edge_count(),
+                    GRAPH_STAGNATION_SOFT_HINT,
+                    GRAPH_STAGNATION_HARD_HINT,
                 )));
             }
+
             debug!(
                 count = self.graph_stagnation_count,
                 "graph unchanged this round"
