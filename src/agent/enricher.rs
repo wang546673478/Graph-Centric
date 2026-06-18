@@ -200,9 +200,9 @@ impl L1Enricher {
         };
 
         let system_prompt = if has_l2 {
-            SYSTEM_PROMPT_ENRICHER
+            load_prompt_file("skills/prompts/enricher.md", SYSTEM_PROMPT_ENRICHER)
         } else {
-            SYSTEM_PROMPT_ENRICHER_NO_L2
+            load_prompt_file("skills/prompts/enricher-no-l2.md", SYSTEM_PROMPT_ENRICHER_NO_L2)
         };
 
         let req = ModelRequest {
@@ -357,6 +357,12 @@ fn tail_truncate(text: &str, max_chars: usize) -> String {
 // ---------------------------------------------------------------------------
 // Prompt text
 // ---------------------------------------------------------------------------
+
+/// Try to load a prompt from a file, falling back to the hardcoded default.
+/// This lets users edit `skills/prompts/enricher-*.md` without recompiling.
+fn load_prompt_file(path: &str, default: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|_| default.to_string())
+}
 
 const SYSTEM_PROMPT_ENRICHER: &str = "You are an L1 enrichment agent in a graph-centric agent harness. \
 Your job is to read a node's raw L2 content and produce a precise, structured semantic description \

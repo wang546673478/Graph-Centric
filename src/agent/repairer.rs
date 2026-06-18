@@ -130,7 +130,8 @@ impl LocalRepairer {
                             Calls | Triggers | Reads | Writes | RevealedBy | InvalidatedBy | Other"
         );
 
-        let resp = self.call_model(SYSTEM_PROMPT_L0_REPAIRER, &user_prompt).await?;
+        let system = load_prompt_file("skills/prompts/l0-repairer.md", SYSTEM_PROMPT_L0_REPAIRER);
+        let resp = self.call_model(&system, &user_prompt).await?;
         let value = parse_json(&resp.content)?;
         let patch_v = value.get("patch").ok_or_else(|| {
             HarnessError::model("repairer: L0 response missing 'patch' field".to_string())
@@ -243,7 +244,8 @@ impl LocalRepairer {
                             Calls | Triggers | Reads | Writes | RevealedBy | InvalidatedBy | Other"
         );
 
-        let resp = self.call_model(SYSTEM_PROMPT_SCOPE_REPAIRER, &user_prompt).await?;
+        let system = load_prompt_file("skills/prompts/scope-repairer.md", SYSTEM_PROMPT_SCOPE_REPAIRER);
+        let resp = self.call_model(&system, &user_prompt).await?;
         let value = parse_json(&resp.content)?;
         let patch_v = value.get("patch").ok_or_else(|| {
             HarnessError::model("repairer: ScopeGap response missing 'patch' field".to_string())
@@ -559,6 +561,12 @@ fn format_error_for_prompt(err: &GraphError) -> String {
         "kind: {kind}\nscope: {scope_str}\ndiscovered_by: {discovered}\ndetail: {}",
         err.detail()
     )
+}
+
+/// Try to load a prompt from a file, falling back to the hardcoded default.
+/// This lets users edit `skills/prompts/repairer-*.md` without recompiling.
+fn load_prompt_file(path: &str, default: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|_| default.to_string())
 }
 
 const SYSTEM_PROMPT_L0_REPAIRER: &str = "You are an L0-structure repairer in a graph-centric agent harness. \

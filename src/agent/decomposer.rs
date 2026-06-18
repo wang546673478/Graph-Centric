@@ -123,7 +123,7 @@ impl Decomposer {
 
         let req = ModelRequest {
             messages: vec![
-                Message::system(SYSTEM_PROMPT_DECOMPOSER),
+                Message::system(load_prompt_file("skills/prompts/decomposer.md", SYSTEM_PROMPT_DECOMPOSER)),
                 Message::user(user_prompt),
             ],
             tools: Vec::new(),
@@ -389,6 +389,12 @@ fn recent_turns(conv: &Conversation, max_turns: usize) -> String {
         out.push_str("(no prior dialog)\n");
     }
     out
+}
+
+/// Try to load a prompt from a file, falling back to the hardcoded default.
+/// This lets users edit `skills/prompts/decomposer-*.md` without recompiling.
+fn load_prompt_file(path: &str, default: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|_| default.to_string())
 }
 
 const SYSTEM_PROMPT_DECOMPOSER: &str = "You are a decomposer in a graph-centric agent harness. \

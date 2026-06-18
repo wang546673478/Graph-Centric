@@ -298,7 +298,7 @@ impl Verifier {
 
             let req = ModelRequest {
                 messages: vec![
-                    Message::system(SYSTEM_PROMPT_L1_CHECK),
+                    Message::system(load_prompt_file("skills/prompts/l1-check.md", SYSTEM_PROMPT_L1_CHECK)),
                     Message::user(user_prompt),
                 ],
                 tools: vec![],
@@ -379,7 +379,7 @@ impl Verifier {
 
         let req = ModelRequest {
             messages: vec![
-                Message::system(SYSTEM_PROMPT_VERIFIER),
+                Message::system(load_prompt_file("skills/prompts/verifier.md", SYSTEM_PROMPT_VERIFIER)),
                 Message::user(user_prompt),
             ],
             tools: vec![],
@@ -546,6 +546,12 @@ fn recent_dialog(conv: &Conversation, max_turns: usize) -> String {
         s.push_str("(no prior dialog)\n");
     }
     s
+}
+
+/// Try to load a prompt from a file, falling back to the hardcoded default.
+/// This lets users edit `skills/prompts/verifier-*.md` without recompiling.
+fn load_prompt_file(path: &str, default: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|_| default.to_string())
 }
 
 const SYSTEM_PROMPT_VERIFIER: &str = "You are a verifier in a graph-centric agent harness. \

@@ -246,7 +246,7 @@ impl Reviewer {
 
         let req = ModelRequest {
             messages: vec![
-                Message::system(SYSTEM_PROMPT_REVIEWER),
+                Message::system(load_prompt_file("skills/prompts/reviewer.md", SYSTEM_PROMPT_REVIEWER)),
                 Message::user(user_prompt),
             ],
             tools: Vec::new(),
@@ -416,6 +416,12 @@ fn render_outcome_for_judge(outcome: &DispatchOutcome) -> String {
         s.push_str(&format!("  …and {} more\n", outcome.results.len() - 8));
     }
     s
+}
+
+/// Try to load a prompt from a file, falling back to the hardcoded default.
+/// This lets users edit `skills/prompts/reviewer-*.md` without recompiling.
+fn load_prompt_file(path: &str, default: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|_| default.to_string())
 }
 
 const SYSTEM_PROMPT_REVIEWER: &str = "You are an acceptance reviewer in a graph-centric agent harness. \
