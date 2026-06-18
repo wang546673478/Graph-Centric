@@ -588,8 +588,8 @@ fn build_system_prompt(
 ) -> String {
     let defs = tools.defs();
 
-    // Use registry for role composition if available; fall back to role_prompt text.
-    let role_section = if let (Some(reg), true) = (registry, !role_prompt.is_empty()) {
+    // Use registry with PromptContext for dynamic composition.
+    let role_section = if let Some(reg) = registry {
         let role = if role_prompt.contains("edit") || role_prompt.contains("code") || role_prompt.contains("修改") {
             "edit"
         } else if role_prompt.contains("explore") || role_prompt.contains("探索") || role_prompt.contains("调研") {
@@ -597,12 +597,8 @@ fn build_system_prompt(
         } else {
             "auto"
         };
-        let blocks: &[&str] = match role {
-            "edit" => &["base/subagent-core", "base/subagent-edit", "tools/edit-strategy", "constraints/windows-safety"],
-            "explore" => &["base/subagent-core", "base/subagent-explore", "tools/edit-strategy"],
-            _ => &["base/subagent-core", "base/subagent-edit", "tools/edit-strategy", "constraints/windows-safety"],
-        };
-        format!("\n{}\n", reg.compose(blocks))
+        let composed = reg.compose_role(role, role_prompt, false);
+        if !composed.is_empty() { format!("\n{composed}\n") } else { String::new() }
     } else if !role_prompt.is_empty() {
         format!("\n## Role\n{role_prompt}\n")
     } else {

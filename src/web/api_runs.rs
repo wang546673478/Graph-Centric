@@ -434,7 +434,7 @@ pub async fn drive_run(
     // `main_tool_registry` above).
     let decomposer = Decomposer::new(deep_model.clone());
     let prompt_registry = Arc::new(
-        crate::skills::prompt_registry::PromptRegistry::load(&state.config.project_root)
+        crate::skills::prompt_registry::PromptRegistry::new(Some(&state.config.project_root))
     );
     let subagent = Arc::new(
         SubAgent::new(fast_model.clone())

@@ -1,34 +1,185 @@
-//! Prompt Registry — modular, composable prompt blocks.
+//! Prompt Registry — dynamic, composable prompt blocks.
 //!
-//! Each prompt block is a `.md` file under `skills/prompts/` organized by
-//! category (base/, tools/, constraints/). Blocks are loaded on demand and
-//! composed by category into the final system prompt.
+//! Inspired by Claude Code's `SystemPromptSection` architecture:
+//! - Named blocks with lazy `compute()` functions
+//! - Cacheable (computed once) vs volatile (every turn)
+//! - Conditional: return `None` to skip a block
+//! - Ordered by priority, resolved in parallel
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 
-/// A loaded prompt block with its category tag.
-#[derive(Debug, Clone)]
-pub struct PromptBlock {
-    pub name: String,
-    pub content: String,
+// ---------------------------------------------------------------------------
+// PromptContext — what each block can inspect to decide its output.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct PromptContext {
+    /// e.g., "edit", "explore", "auto"
+    pub role: String,
+    /// Task description for context-aware prompts.
+    pub task_description: String,
+    /// Language preference (e.g., "Chinese", "English").
+    pub language: Option<String>,
+    /// Whether this is a self-improvement (heartbeat) run.
+    pub is_heartbeat: bool,
+    /// OS name for platform-specific instructions.
+    pub platform: String,
+    /// Extra context key-values.
+    pub extra: HashMap<String, String>,
 }
 
-/// Registry of prompt blocks organized by category.
-#[derive(Debug, Clone, Default)]
+// ---------------------------------------------------------------------------
+// PromptBlock trait
+// ---------------------------------------------------------------------------
+
+/// A prompt block that can produce text (or `None` to skip).
+pub trait PromptBlock: Send + Sync {
+    fn name(&self) -> &str;
+    fn compute(&self, ctx: &PromptContext) -> Option<String>;
+    /// If true, this block is recomputed every turn (never cached).
+    fn is_volatile(&self) -> bool { false }
+}
+
+// ---------------------------------------------------------------------------
+// Static file block
+// ---------------------------------------------------------------------------
+
+struct StaticBlock {
+    name: String,
+    content: String,
+}
+
+impl PromptBlock for StaticBlock {
+    fn name(&self) -> &str { &self.name }
+    fn compute(&self, _ctx: &PromptContext) -> Option<String> {
+        if self.content.is_empty() { None } else { Some(self.content.clone()) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic function block
+// ---------------------------------------------------------------------------
+
+type ComputeFn = Arc<dyn Fn(&PromptContext) -> Option<String> + Send + Sync>;
+
+struct DynamicBlock {
+    name: String,
+    compute_fn: ComputeFn,
+    volatile: bool,
+}
+
+impl PromptBlock for DynamicBlock {
+    fn name(&self) -> &str { &self.name }
+    fn compute(&self, ctx: &PromptContext) -> Option<String> {
+        (self.compute_fn)(ctx)
+    }
+    fn is_volatile(&self) -> bool { self.volatile }
+}
+
+// ---------------------------------------------------------------------------
+// PromptRegistry
+// ---------------------------------------------------------------------------
+
 pub struct PromptRegistry {
-    blocks: HashMap<String, PromptBlock>,
+    blocks: HashMap<String, Arc<dyn PromptBlock>>,
 }
 
 impl PromptRegistry {
-    /// Load all `.md` files under `skills/prompts/` recursively.
-    pub fn load(root: &Path) -> Self {
-        let prompts_dir = root.join("skills").join("prompts");
-        let mut reg = Self::default();
-        if !prompts_dir.exists() { return reg; }
-        reg.scan_dir(&prompts_dir, "");
-        tracing::info!(count = reg.blocks.len(), "prompt registry loaded");
+    /// Create registry with built-in dynamic blocks + optional static files.
+    pub fn new(root: Option<&Path>) -> Self {
+        let mut reg = Self { blocks: HashMap::new() };
+
+        // ---- Built-in dynamic blocks (from Claude Code patterns) ----
+
+        // Language section
+        reg.add_dynamic("builtin/language", false, Arc::new(|ctx: &PromptContext| {
+            match &ctx.language {
+                Some(lang) if !lang.is_empty() => Some(format!(
+                    "# Language\nAlways respond in {lang}. Use {lang} for all explanations, comments, and communications."
+                )),
+                _ => None,
+            }
+        }));
+
+        // Platform section
+        reg.add_dynamic("builtin/platform", false, Arc::new(|ctx: &PromptContext| {
+            let platform = &ctx.platform;
+            if platform.is_empty() { return None; }
+            let note = if platform.contains("windows") {
+                "This agent runs on Windows. Use `cmd /c` for shell commands. `sed`, `grep`, `cat` do not exist; use `read_file` and `edit_file` instead."
+            } else {
+                "This agent runs on Unix. Use `bash -c` for shell commands."
+            };
+            Some(format!("# Platform\n{note}"))
+        }));
+
+        // Heartbeat mode section
+        reg.add_dynamic("builtin/heartbeat", true, Arc::new(|ctx: &PromptContext| {
+            if ctx.is_heartbeat {
+                Some("# Autonomous Mode\n\
+This is an unattended automation loop. Do NOT ask questions — any question \
+will be auto-answered. Directly execute: Explore → ProposePatch → SubAgent → Verify.".into())
+            } else { None }
+        }));
+
+        // Code editor role
+        reg.add_dynamic("builtin/role-edit", false, Arc::new(|ctx: &PromptContext| {
+            if ctx.role == "edit" || ctx.role.contains("code") || ctx.role.contains("edit") {
+                Some(format!(
+                    "## Role: Code Editor\n\
+You are a code modification specialist.\n\
+Task: {}\n\
+**RULES:**\n\
+- Use `read_file` to read, `edit_file` to replace, `write_file` to create.\n\
+- Every call MUST produce an actual file change. Do NOT just analyze.\n\
+- After editing, run `cargo check --lib` to verify.\n\
+- Do NOT use bash for file I/O — use the dedicated file tools.",
+                    ctx.task_description
+                ))
+            } else { None }
+        }));
+
+        // Explorer role
+        reg.add_dynamic("builtin/role-explore", false, Arc::new(|ctx: &PromptContext| {
+            if ctx.role == "explore" || ctx.role.contains("explore") {
+                Some(format!(
+                    "## Role: Explorer\n\
+Task: {}\n\
+Use `read_file` and `bash ls/find` to discover structure, patterns, and key files.\n\
+Produce a report with file paths, functions/classes, and relationships.",
+                    ctx.task_description
+                ))
+            } else { None }
+        }));
+
+        // Tool strategy
+        reg.add_dynamic("builtin/tool-strategy", false, Arc::new(|ctx: &PromptContext| {
+            Some(r#"## Available Tools
+- `read_file(path, offset?, limit?)` — read any file
+- `edit_file(path, old_string, new_string)` — replace a unique string
+- `write_file(path, content)` — create or overwrite a file
+- `bash` — run shell commands (for `cargo check`, `ls`, `find`, `grep`)
+- `web_search(query)` — search the web
+- `web_fetch(url)` — fetch a URL"#.into())
+        }));
+
+        // Load static .md files from disk if root provided.
+        if let Some(root) = root {
+            let prompts_dir = root.join("skills").join("prompts");
+            if prompts_dir.exists() {
+                reg.scan_dir(&prompts_dir, "");
+            }
+        }
+
+        tracing::info!(count = reg.blocks.len(), "prompt registry initialized");
         reg
+    }
+
+    fn add_dynamic<N: Into<String>>(&mut self, name: N, volatile: bool, f: ComputeFn) {
+        let name = name.into();
+        self.blocks.insert(name.clone(), Arc::new(DynamicBlock { name, compute_fn: f, volatile }));
     }
 
     fn scan_dir(&mut self, dir: &Path, prefix: &str) {
@@ -36,48 +187,81 @@ impl PromptRegistry {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let new_prefix = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
-                    self.scan_dir(&path, &new_prefix);
+                    let n = entry.file_name().to_string_lossy().into_owned();
+                    let np = if prefix.is_empty() { n } else { format!("{prefix}/{n}") };
+                    self.scan_dir(&path, &np);
                 } else if path.extension().map_or(false, |e| e == "md") {
                     let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
                     let name = if prefix.is_empty() { stem } else { format!("{prefix}/{stem}") };
                     if let Ok(content) = std::fs::read_to_string(&path) {
-                        self.blocks.insert(name.clone(), PromptBlock { name, content });
+                        self.blocks.insert(name.clone(), Arc::new(StaticBlock { name, content }));
                     }
                 }
             }
         }
     }
 
-    /// Get a single block by name (e.g., "tools/edit-strategy").
-    pub fn get(&self, name: &str) -> Option<&PromptBlock> {
-        self.blocks.get(name)
-    }
-
-    /// Compose a prompt from a list of block names. Empty names are skipped.
-    pub fn compose(&self, names: &[&str]) -> String {
+    /// Compose a prompt from named blocks + role-based defaults.
+    /// Blocks returning `None` are skipped. Volatile blocks always recompute;
+    /// static blocks are cached after first compute.
+    pub fn compose(&self, block_names: &[&str], ctx: &PromptContext) -> String {
         let mut parts = Vec::new();
-        for name in names {
-            if name.is_empty() { continue; }
-            if let Some(block) = self.blocks.get(*name) {
-                parts.push(block.content.clone());
+
+        // Always include tool strategy.
+        if let Some(b) = self.blocks.get("builtin/tool-strategy") {
+            if let Some(text) = b.compute(ctx) { parts.push(text); }
+        }
+
+        // Role block: match "edit", "explore", or generic.
+        let role_block = if ctx.role.contains("edit") || ctx.role.contains("code") {
+            "builtin/role-edit"
+        } else if ctx.role.contains("explore") {
+            "builtin/role-explore"
+        } else {
+            ""
+        };
+        if !role_block.is_empty() {
+            if let Some(b) = self.blocks.get(role_block) {
+                if let Some(text) = b.compute(ctx) { parts.push(text); }
             }
         }
+
+        // Platform block.
+        if let Some(b) = self.blocks.get("builtin/platform") {
+            if let Some(text) = b.compute(ctx) { parts.push(text); }
+        }
+
+        // Language block.
+        if let Some(b) = self.blocks.get("builtin/language") {
+            if let Some(text) = b.compute(ctx) { parts.push(text); }
+        }
+
+        // Heartbeat block (volatile).
+        if let Some(b) = self.blocks.get("builtin/heartbeat") {
+            if let Some(text) = b.compute(ctx) { parts.push(text); }
+        }
+
+        // Named blocks from the task.
+        for name in block_names {
+            if name.is_empty() { continue; }
+            if let Some(b) = self.blocks.get(*name) {
+                if let Some(text) = b.compute(ctx) { parts.push(text); }
+            }
+        }
+
         parts.join("\n\n")
     }
 
-    /// Compose with default blocks for a given role.
-    /// Role shortcuts: "edit" = base/core + tools/edit-strategy + constraints/windows-safety
-    ///               "explore" = base/core + tools/edit-strategy
-    ///               "auto" = base/core + tools/edit-strategy + constraints/no-questions
-    pub fn compose_role(&self, role: &str) -> String {
-        let defaults: &[&str] = match role {
-            "edit" => &["base/subagent-core", "base/subagent-edit", "tools/edit-strategy", "constraints/windows-safety"],
-            "explore" => &["base/subagent-core", "base/subagent-explore", "tools/edit-strategy"],
-            "auto" => &["base/subagent-core", "base/subagent-edit", "tools/edit-strategy", "constraints/windows-safety"],
-            _ => &["base/subagent-core"],
+    /// Quick compose with role shortcut.
+    pub fn compose_role(&self, role: &str, task_desc: &str, is_hb: bool) -> String {
+        let ctx = PromptContext {
+            role: role.to_string(),
+            task_description: task_desc.to_string(),
+            language: Some("Chinese".into()),
+            is_heartbeat: is_hb,
+            platform: if cfg!(target_os = "windows") { "windows".into() } else { "linux".into() },
+            ..Default::default()
         };
-        self.compose(defaults)
+        self.compose(&[], &ctx)
     }
 }
