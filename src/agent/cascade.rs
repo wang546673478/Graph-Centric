@@ -240,13 +240,13 @@ Respond with JSON:
 {{"verdict": "PRESERVED|NEEDS_REPAIR|NEEDS_REEXECUTION", "rationale": "..."}}"#,
             succ_id = successor.id.as_str(),
             succ_kind = successor.kind.as_wire(),
-            succ_l1 = pred_l1
+            succ_l1 = succ_l1
                 .map(|l| l.responsibility.as_str())
                 .unwrap_or("(none)"),
             succ_l2 = succ_l2_snippet,
             pred_id = predecessor.id.as_str(),
             pred_kind = predecessor.kind.as_wire(),
-            pred_l1 = succ_l1
+            pred_l1 = pred_l1
                 .map(|l| l.responsibility.as_str())
                 .unwrap_or("(none)"),
             pred_l2 = pred_l2_snippet,
