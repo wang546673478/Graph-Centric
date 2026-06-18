@@ -59,7 +59,15 @@ pub async fn get_heartbeat(
 ) -> Json<serde_json::Value> {
     let guard = state.heartbeat.lock().await;
     if let Some(ref hb) = *guard {
-        Json(serde_json::json!({"active": hb.active, "prompt": hb.prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds, "current_run_id": hb.current_run_id}))
+        // If the .md prompt file exists, use it as the canonical prompt.
+        // The JSON state's prompt field may be stale (from an old save).
+        let prompt_path = state.config.project_root.join(".graph_harness_heartbeat_prompt.md");
+        let prompt = if prompt_path.exists() {
+            std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| hb.prompt.clone())
+        } else {
+            hb.prompt.clone()
+        };
+        Json(serde_json::json!({"active": hb.active, "prompt": prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds, "current_run_id": hb.current_run_id}))
     } else {
         Json(serde_json::json!({"active": false}))
     }
