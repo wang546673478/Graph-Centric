@@ -147,6 +147,9 @@ fn compute_domain_tags(graph: &Graph) -> Vec<String> {
             NodeKind::Task => {
                 tags.insert("business".to_string());
             }
+            NodeKind::Component | NodeKind::Style | NodeKind::Layout | NodeKind::Page => {
+                tags.insert("ui".to_string());
+            }
             NodeKind::Other(_) => {
                 // Skip — could be anything.
             }

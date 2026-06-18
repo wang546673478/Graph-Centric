@@ -67,12 +67,27 @@ impl fmt::Display for NodeId {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeKind {
+    /// A source file on disk (Rust, TS, CSS, etc.).
     File,
+    /// A function definition.
     Function,
+    /// A class or struct definition.
     Class,
+    /// A module or directory grouping.
     Module,
+    /// A configuration file or block.
     Config,
+    /// A task in a plan DAG — one unit of work.
     Task,
+    /// A UI component (Vue SFC, React component, Web Component, etc.).
+    Component,
+    /// A visual style definition (CSS block, theme token, design variable).
+    Style,
+    /// A layout definition (grid, flexbox, page structure).
+    Layout,
+    /// A page or route — one screen in a web app.
+    Page,
+    /// Free-form kind for domain-specific node types.
     Other(String),
 }
 
@@ -87,6 +102,10 @@ impl NodeKind {
             Self::Module => "Module",
             Self::Config => "Config",
             Self::Task => "Task",
+            Self::Component => "Component",
+            Self::Style => "Style",
+            Self::Layout => "Layout",
+            Self::Page => "Page",
             Self::Other(s) => s.as_str(),
         }
     }
@@ -104,6 +123,10 @@ impl NodeKind {
             "Module" => Self::Module,
             "Config" => Self::Config,
             "Task" => Self::Task,
+            "Component" => Self::Component,
+            "Style" => Self::Style,
+            "Layout" => Self::Layout,
+            "Page" => Self::Page,
             _ => Self::Other(s.to_string()),
         }
     }
@@ -373,6 +396,30 @@ impl Node {
             format!("task:{id}"),
             description,
         )
+    }
+
+    /// Convenience: a UI component node (Vue SFC, React component, etc.).
+    pub fn component(id: impl Into<String>, summary: impl Into<String>) -> Self {
+        let id = id.into();
+        Self::new(id.clone(), NodeKind::Component, id, summary)
+    }
+
+    /// Convenience: a visual style node (CSS block, theme token, design variable).
+    pub fn style(id: impl Into<String>, summary: impl Into<String>) -> Self {
+        let id = id.into();
+        Self::new(id.clone(), NodeKind::Style, id, summary)
+    }
+
+    /// Convenience: a layout node (grid, flexbox, page structure).
+    pub fn layout(id: impl Into<String>, summary: impl Into<String>) -> Self {
+        let id = id.into();
+        Self::new(id.clone(), NodeKind::Layout, id, summary)
+    }
+
+    /// Convenience: a page or route node (one screen in a web app).
+    pub fn page(id: impl Into<String>, summary: impl Into<String>) -> Self {
+        let id = id.into();
+        Self::new(id.clone(), NodeKind::Page, id, summary)
     }
 
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
