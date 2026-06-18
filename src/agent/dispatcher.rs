@@ -432,10 +432,12 @@ mod tests {
                 content,
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                reasoning_content: None,
                 usage: Usage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
                     total_tokens: 15,
+                    ..Default::default()
                 },
             })
         }
@@ -714,6 +716,7 @@ mod tests {
                 must_mention_any: vec!["auth.rs".into()],
                 min_length: 5,
             },
+            role_prompt: String::new(),
         };
         let mut g = Graph::new();
         g.add_node(st.clone().to_task_node());

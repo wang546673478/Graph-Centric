@@ -419,6 +419,7 @@ mod tests {
                 content,
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
+                reasoning_content: None,
                 usage: Usage::default(),
             })
         }

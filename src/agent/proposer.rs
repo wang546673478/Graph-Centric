@@ -251,6 +251,14 @@ impl GraphProposer {
             }
         }
 
+        // v2.5: document skill node ID prefix so the model understands
+        // auto-matched task nodes.
+        prompt.push_str("\n\n## Skill-Aware Task Graphs\n\
+When a past skill is auto-matched to your current task, its compiled task \
+graph is injected as `skill:<slug>:<node-id>` nodes into the task plan. \
+These behave like regular Task nodes — you may add edges to or from them, \
+re-plan them, or supplement them with additional nodes from the Decomposer.");
+
         prompt
     }
 
@@ -1407,6 +1415,7 @@ mod tests {
                 content,
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
+                reasoning_content: None,
                 usage: Usage::default(),
             })
         }

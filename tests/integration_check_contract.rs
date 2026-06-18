@@ -53,6 +53,7 @@ impl Model for ScriptedModel {
             content,
             tool_calls: Vec::new(),
             finish_reason: FinishReason::Stop,
+            reasoning_content: None,
             usage: Usage::default(),
         })
     }
@@ -88,6 +89,7 @@ async fn end_to_end_knowhow_contract_failure_marks_dispatch_failed() {
             must_mention_any: vec!["auth.rs".into()],
             min_length: 5,
         },
+        role_prompt: String::new(),
     };
 
     let mut g = Graph::new();

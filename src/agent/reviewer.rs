@@ -506,6 +506,7 @@ mod tests {
                 content,
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                reasoning_content: None,
                 usage: Usage::default(),
             })
         }

@@ -347,6 +347,9 @@ pub struct GraphLoopConfig {
     pub tool_output_cap: usize,
     /// Policy applied to tool invocations.
     pub tool_policy: Arc<dyn crate::tools::Policy>,
+    /// Whether to auto-match and apply skills in the Task phase.
+    /// Default: true (matching runs before decomposer; no-op when no skills configured).
+    pub auto_apply_skills: bool,
 }
 
 impl GraphLoopConfig {
@@ -357,6 +360,7 @@ impl GraphLoopConfig {
             tool_cwd: cwd.into(),
             tool_output_cap: 100_000,
             tool_policy: Arc::new(crate::tools::AllowAll),
+            auto_apply_skills: true,
         }
     }
 }
@@ -382,6 +386,11 @@ pub struct GraphLoop {
     /// trigger auto-replan + cascade verification instead of surfacing
     /// GraphInvalid to the caller.
     pub cascade: Option<crate::agent::cascade::CascadeBacktracker>,
+    /// Phase A (skill system): optional skill storage for auto-matching.
+    /// When Some and auto_apply_skills is true, step_task_stub checks for
+    /// matching skills and may substitute their compiled task graphs for
+    /// the decomposer output.
+    pub skill_storage: Option<Arc<dyn crate::skills::SkillStorage>>,
     /// Phase 4: optional PostExecutionValidator that runs between the Task
     /// phase and the Review phase. When the validator returns
     /// `FailedAsGraphIssue`, the loop surfaces
@@ -595,6 +604,7 @@ impl GraphLoop {
             dispatcher: None,
             subagent_loader: None,
             cascade: None,
+            skill_storage: None,
             validator: None,
             reviewer: None,
             tools: tools.clone(),
@@ -694,6 +704,72 @@ impl GraphLoop {
     pub fn with_cascade(mut self, cascade: crate::agent::cascade::CascadeBacktracker) -> Self {
         self.cascade = Some(cascade);
         self
+    }
+
+    /// Phase A (skill system): attach a SkillStorage for auto-matching.
+    pub fn with_skill_storage(
+        mut self,
+        storage: Arc<dyn crate::skills::SkillStorage>,
+    ) -> Self {
+        self.skill_storage = Some(storage);
+        self
+    }
+
+    /// Try to match the current task against stored skills and compile the
+    /// best match into a task graph. Returns `None` when:
+    /// - No skill storage configured (`skill_storage` is `None`).
+    /// - `auto_apply_skills` is false.
+    /// - No skill scored above the threshold.
+    /// - Loading or compiling the matched skill failed.
+    /// - The compiled graph is empty.
+    async fn try_match_and_compile_skill(&mut self) -> Option<Graph> {
+        let storage = self.skill_storage.as_ref()?;
+        if !self.config.auto_apply_skills {
+            return None;
+        }
+
+        let matched = match crate::skills::retrieve::find_and_load_matching_skills(
+            &self.task,
+            storage.as_ref(),
+            0.25, // threshold
+            1,    // top 1 for Phase A
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "skill matching failed");
+                return None;
+            }
+        };
+
+        let skill = match matched.first() {
+            Some(s) => s,
+            None => return None,
+        };
+
+        let compiled = crate::skills::compiler::compile_skill_to_task_graph(skill);
+        if compiled.node_count() == 0 {
+            tracing::info!(skill = %skill.slug, "matched skill has empty graph; falling back to decomposer");
+            return None;
+        }
+
+        tracing::info!(
+            skill = %skill.slug,
+            trigger = %skill.trigger,
+            compiled_nodes = compiled.node_count(),
+            compiled_edges = compiled.edge_count(),
+            "auto-matched skill injected into task DAG"
+        );
+
+        self.conversation.add_user(format!(
+            "Auto-matched skill `{}` (trigger: \"{}\"). Its compiled task graph \
+             ({} nodes, {} edges) has been injected into the task plan.",
+            skill.slug,
+            skill.trigger,
+            compiled.node_count(),
+            compiled.edge_count(),
+        ));
+
+        Some(compiled)
     }
 
     /// Resume after surfacing `Paused`. The answer is added to the
@@ -1234,16 +1310,20 @@ impl GraphLoop {
             "graph_loop: entering Task phase"
         );
 
-        // 1. Decompose
-        let task_graph = match decomp
-            .decompose(&self.graph, &self.task, Some(&self.conversation))
-            .await
-        {
-            Ok(g) => g,
-            Err(e) => {
-                warn!(error = %e, "decomposer failed");
-                self.phase = Phase::Poisoned;
-                return LoopState::Error(format!("decomposer failed: {e}"));
+        // 1. Decompose (or use auto-matched skill graph).
+        let task_graph = if let Some(compiled) = self.try_match_and_compile_skill().await {
+            compiled
+        } else {
+            match decomp
+                .decompose(&self.graph, &self.task, Some(&self.conversation))
+                .await
+            {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!(error = %e, "decomposer failed");
+                    self.phase = Phase::Poisoned;
+                    return LoopState::Error(format!("decomposer failed: {e}"));
+                }
             }
         };
         info!(
@@ -2125,6 +2205,7 @@ mod tests {
                 content,
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
+                reasoning_content: None,
                 usage: Usage::default(),
             })
         }

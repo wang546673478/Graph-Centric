@@ -907,10 +907,12 @@ mod tests {
                 content,
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
+                reasoning_content: None,
                 usage: Usage {
                     prompt_tokens: 100,
                     completion_tokens: 50,
                     total_tokens: 150,
+                    ..Default::default()
                 },
             })
         }
@@ -937,6 +939,7 @@ mod tests {
             involved_nodes: vec![NodeId::from("a")],
             needs: TaskNeeds::read_only(),
             contract: CheckContract::default(),
+            role_prompt: String::new(),
         }
     }
 
@@ -966,6 +969,7 @@ mod tests {
                 must_mention_any: vec!["module A".into()],
                 min_length: 20,
             },
+            role_prompt: String::new(),
         };
         let node = st.to_task_node();
         let st2 = SubTask::from_task_node(&node).unwrap();
@@ -990,6 +994,7 @@ mod tests {
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
             contract: CheckContract::default(),
+            role_prompt: String::new(),
         };
         let node = st.to_task_node();
         let st2 = SubTask::from_task_node(&node).unwrap();

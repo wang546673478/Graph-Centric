@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use graph_harness::skills::storage::LocalSkillStorage;
-use graph_harness::web::state::WebConfig;
+use graph_harness::web::state::{EngineConfig, WebConfig};
 use graph_harness::web::WebState;
 
 fn make_state() -> (TempDir, Arc<WebState>) {
@@ -15,6 +15,7 @@ fn make_state() -> (TempDir, Arc<WebState>) {
         bind_addr: "0.0.0.0:0".to_string(),
         static_dir: String::new(),
         project_root: dir.path().to_path_buf(),
+        engine: EngineConfig::default(),
     };
     (dir, Arc::new(WebState::new(local, cfg)))
 }

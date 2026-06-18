@@ -53,6 +53,7 @@ impl Model for MockModel {
             content,
             tool_calls: vec![],
             finish_reason: FinishReason::Stop,
+            reasoning_content: None,
             usage: Usage::default(),
         })
     }
@@ -75,6 +76,7 @@ fn task(involved: Vec<&str>) -> SubTask {
         involved_nodes: involved.into_iter().map(NodeId::from).collect(),
         needs: Default::default(),
         contract: CheckContract::default(),
+        role_prompt: String::new(),
     }
 }
 

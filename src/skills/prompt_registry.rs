@@ -26,6 +26,11 @@ pub struct PromptContext {
     pub is_heartbeat: bool,
     /// OS name for platform-specific instructions.
     pub platform: String,
+    /// Formatted list of auto-matched skills (one "slug: trigger" per line).
+    /// When non-empty, the `builtin/skill-matching` block activates.
+    pub matched_skills: String,
+    /// Whether auto-skill-matching is enabled.
+    pub auto_apply_skills: bool,
     /// Extra context key-values.
     pub extra: HashMap<String, String>,
 }
@@ -165,6 +170,23 @@ Produce a report with file paths, functions/classes, and relationships.",
 - `web_fetch(url)` — fetch a URL"#.into())
         }));
 
+        // Skill matching section (volatile — task changes every turn).
+        reg.add_dynamic("builtin/skill-matching", true, Arc::new(|ctx: &PromptContext| {
+            if !ctx.auto_apply_skills || ctx.matched_skills.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "# Auto-Matched Skills\n\
+The following skills from past successful runs were matched to your current task:\n\
+{}\n\
+These skills have been automatically applied. Their compiled task graphs have \
+been injected into the task plan as `skill:<slug>:<node-id>` nodes. These nodes \
+behave like regular Task nodes — you may add edges to/from them or re-plan them \
+if needed.",
+                ctx.matched_skills
+            ))
+        }));
+
         // Load static .md files from disk if root provided.
         if let Some(root) = root {
             let prompts_dir = root.join("skills").join("prompts");
@@ -238,6 +260,11 @@ Produce a report with file paths, functions/classes, and relationships.",
 
         // Heartbeat block (volatile).
         if let Some(b) = self.blocks.get("builtin/heartbeat") {
+            if let Some(text) = b.compute(ctx) { parts.push(text); }
+        }
+
+        // Skill matching block (volatile — only when auto_apply + matches exist).
+        if let Some(b) = self.blocks.get("builtin/skill-matching") {
             if let Some(text) = b.compute(ctx) { parts.push(text); }
         }
 

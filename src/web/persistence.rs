@@ -173,6 +173,7 @@ mod tests {
             id: id.into(), task: "test".into(),
             status: RunStatus::Done,
             duration_ms: 5000, captured_skill: None,
+            tokens_used: 0,
         }
     }
 

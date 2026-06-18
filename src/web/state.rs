@@ -92,6 +92,15 @@ pub struct LoopTuningConfig {
     /// Reasoning effort: "high" or "max".
     #[serde(default)]
     pub reasoning_effort: String,
+    /// Auto-match and apply skills to incoming tasks.
+    /// When true (default), matching skills' compiled task graphs
+    /// substitute the decomposer output in the Task phase.
+    #[serde(default = "default_true")]
+    pub auto_apply_skills: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl EngineConfig {
@@ -173,6 +182,7 @@ impl Default for EngineConfig {
                 cascade_backtrack: true,
                 thinking_enabled: false,
                 reasoning_effort: "high".into(),
+                auto_apply_skills: true,
             },
         }
     }

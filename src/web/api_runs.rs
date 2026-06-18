@@ -468,6 +468,7 @@ pub async fn drive_run(
         tool_cwd: state.config.project_root.clone(),
         tool_output_cap: 8_000,
         tool_policy: Arc::new(DangerousCommandDeny::new()),
+        auto_apply_skills: state.config.engine.loop_tuning.auto_apply_skills,
     };
 
     let mut gl = GraphLoop::new(
@@ -496,7 +497,9 @@ pub async fn drive_run(
     .with_cascade(
         crate::agent::cascade::CascadeBacktracker::new(deep_model.clone())
             .with_step_sink(cascade_tx),
-    );
+    )
+    // v2.5: auto-match and apply stored skills.
+    .with_skill_storage(state.skills.clone());
 
     if let Some(dto) = initial_graph {
         let g = dto.into_graph();

@@ -1,7 +1,10 @@
 //! Format available skills as a markdown section for the Proposer's
-//! system prompt.
+//! system prompt, and load skills matched by the token-based matcher.
 
+use super::matcher::find_matching_skills;
 use super::storage::SkillStorage;
+use super::types::Skill;
+use crate::error::HarnessError;
 
 /// The maximum number of skills surfaced in a single Proposer prompt.
 /// Older skills are git history anyway; if a user has more than 20 they
@@ -31,6 +34,35 @@ pub fn list_for_prompt(storage: &dyn SkillStorage) -> String {
         ));
     }
     out
+}
+
+/// Find matching skills and load their full `Skill` objects.
+///
+/// Calls `find_matching_skills` and then `storage.load()` for each match
+/// up to `max`. Load failures are traced and skipped (not surfaced as
+/// errors — matching is best-effort).
+pub fn find_and_load_matching_skills(
+    task: &str,
+    storage: &dyn SkillStorage,
+    threshold: f64,
+    max: usize,
+) -> std::result::Result<Vec<Skill>, HarnessError> {
+    let matches = find_matching_skills(task, storage, threshold)
+        .map_err(|e| HarnessError::model(format!("skill matching failed: {e}")))?;
+    let mut loaded = Vec::new();
+    for (ref_, _score) in matches.iter().take(max) {
+        match storage.load(&ref_.slug) {
+            Ok(skill) => loaded.push(skill),
+            Err(e) => {
+                tracing::warn!(
+                    slug = %ref_.slug,
+                    error = %e,
+                    "failed to load matched skill, skipping"
+                );
+            }
+        }
+    }
+    Ok(loaded)
 }
 
 /// Build a short header (e.g. "12 skills available"). Useful for log lines.

@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use graph_harness::skills::storage::LocalSkillStorage;
-use graph_harness::web::state::WebConfig;
+use graph_harness::web::state::{EngineConfig, WebConfig};
 use graph_harness::web::WebState;
 
 async fn boot_server() -> (String, TempDir) {
@@ -19,6 +19,7 @@ async fn boot_server() -> (String, TempDir) {
         bind_addr: addr.to_string(),
         static_dir: String::new(),
         project_root: dir.path().to_path_buf(),
+        engine: EngineConfig::default(),
     };
     let state = WebState::new(local, cfg);
     let app = graph_harness::web::router(state, "");
