@@ -45,7 +45,7 @@ use super::verifier::{Severity, VerificationResult, VerifyIssue, Verifier};
 use super::Conversation;
 use crate::context::SourceLoader;
 use crate::error::Result;
-use crate::graph::{Graph, NodeId};
+use crate::graph::{Graph, NodeId, NodeKind};
 use crate::tools::{ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -875,9 +875,10 @@ impl GraphLoop {
         };
 
         // Graph stagnation guard: detect when the graph hasn't changed
-        // for many consecutive rounds (model stuck in explore-retry loop).
+        // for many consecutive rounds. Tier 3 triggers cascade backtracking
+        // if configured, to verify upstream nodes before giving up.
         if matches!(state, LoopState::Running) {
-            if let Some(stuck) = self.check_graph_stagnation() {
+            if let Some(stuck) = self.check_graph_stagnation().await {
                 return stuck;
             }
         }
@@ -2073,75 +2074,112 @@ impl GraphLoop {
     /// Check and update the graph stagnation counter.
     ///
     /// Staged escalation:
-    /// - 4 rounds: soft hint — ask the model to commit or change strategy
-    /// - 6 rounds: hard hint — warn that termination is imminent, suggest
-    ///   reconsidering the last node's assumptions
-    /// - 8 rounds: return `GraphInvalid` to trigger repair/re-planning
-    ///   (instead of Error — gives the model a chance to fix the root cause)
-    fn check_graph_stagnation(&mut self) -> Option<LoopState> {
+    /// - 4 rounds: soft hint
+    /// - 6 rounds: hard hint
+    /// - 8 rounds: if CascadeBacktracker is configured, run cascade
+    ///   verification on the anchor (or most recent node). If cascade
+    ///   finds issues → surface them as hints and continue. If cascade
+    ///   finds nothing → terminate. If no cascade → terminate.
+    async fn check_graph_stagnation(&mut self) -> Option<LoopState> {
         let fp = graph_fingerprint(&self.graph);
         if self.last_graph_fingerprint == Some(fp) {
             self.graph_stagnation_count += 1;
 
-            // Tier 1: soft hint at 4 rounds.
+            // Tier 1: soft hint.
             if self.graph_stagnation_count == GRAPH_STAGNATION_SOFT_HINT {
-                warn!(
-                    count = self.graph_stagnation_count,
-                    "graph stagnated — injecting soft hint"
-                );
+                warn!(count = self.graph_stagnation_count, "graph stagnated — soft hint");
                 self.conversation.add_user(
-                    "The graph hasn't changed for several rounds. If you're stuck in an \
-                     explore loop, reconsider: is the last node you added still valid? \
-                     Does its output match what the next node needs? Try proposing a \
-                     patch — even a small edge change — to break the stall."
+                    "The graph hasn't changed for several rounds. If you're stuck, \
+                     reconsider: is the last node you added still valid? Try proposing \
+                     a patch — even a small edge change — to break the stall."
                 );
             }
 
-            // Tier 2: hard hint at 6 rounds.
+            // Tier 2: hard hint.
             if self.graph_stagnation_count == GRAPH_STAGNATION_HARD_HINT {
-                warn!(
-                    count = self.graph_stagnation_count,
-                    "graph stagnated — injecting hard hint"
-                );
+                warn!(count = self.graph_stagnation_count, "graph stagnated — hard hint");
                 self.conversation.add_user(format!(
-                    "STILL STUCK: {} rounds with no graph change. The most likely cause \
-                     is that an upstream node's output doesn't satisfy its downstream \
-                     node's input. Go back to the LAST node you added or modified and \
-                     re-examine it. If its design is wrong, propose a patch to fix it. \
-                     If its design is correct but its output is wrong, re-execute it. \
-                     If there's a gap between two nodes, add an intermediate node. \
-                     This is your last chance before the run is terminated.",
+                    "STILL STUCK: {} rounds with no graph change. Go back to the LAST \
+                     node you added or modified and re-examine it. If its design is \
+                     wrong, patch it. If output is stale, re-execute. If there's a gap \
+                     between two nodes, add an intermediate node.",
                     self.graph_stagnation_count
                 ));
             }
 
-            // Tier 3: escalate to Error with repair guidance.
-            // (GraphInvalid doesn't help here — heartbeat auto-repair just
-            // clones the snapshot, which won't unstick a stagnated graph.)
+            // Tier 3: cascade verification or terminate.
             if self.graph_stagnation_count >= GRAPH_STAGNATION_TERMINATE {
-                warn!(
-                    count = self.graph_stagnation_count,
-                    "graph stagnated — terminating with repair guidance"
-                );
+                // Try cascade backtracking if configured.
+                if let (Some(cascade), Some(loader)) =
+                    (&self.cascade, &self.subagent_loader)
+                {
+                    warn!(count = self.graph_stagnation_count,
+                        "graph stagnated — running cascade verification");
+
+                    // Find the anchor or any task node to backtrack from.
+                    let target = self
+                        .graph
+                        .nodes
+                        .values()
+                        .find(|n| matches!(n.kind, NodeKind::Task))
+                        .map(|n| n.id.clone())
+                        .unwrap_or_else(|| NodeId::from("anchor"));
+
+                    match cascade
+                        .backtrack_from(&target, &self.graph, &self.task, loader.as_ref())
+                        .await
+                    {
+                        Ok(result) if !result.needs_repair.is_empty() => {
+                            let ids: Vec<String> =
+                                result.needs_repair.iter().map(|n| n.to_string()).collect();
+                            self.conversation.add_user(format!(
+                                "Cascade found {} node(s) needing repair: {}. \
+                                 Propose patches for these nodes.",
+                                ids.len(),
+                                ids.join(", ")
+                            ));
+                            // Reset stagnation — cascade found actionable issues.
+                            self.graph_stagnation_count = 0;
+                            return None;
+                        }
+                        Ok(result) if !result.needs_reexec.is_empty() => {
+                            let ids: Vec<String> =
+                                result.needs_reexec.iter().map(|n| n.to_string()).collect();
+                            self.conversation.add_user(format!(
+                                "Cascade found {} node(s) needing re-execution: {}. \
+                                 Re-execute these tasks.",
+                                ids.len(),
+                                ids.join(", ")
+                            ));
+                            self.graph_stagnation_count = 0;
+                            return None;
+                        }
+                        Ok(_) => {
+                            // Cascade found nothing — all preserved. Terminate.
+                            warn!("cascade found no issues — graph truly stuck");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "cascade verification failed");
+                        }
+                    }
+                }
+
+                // No cascade, or cascade found nothing — terminate.
                 self.phase = Phase::Poisoned;
                 return Some(LoopState::Error(format!(
                     "graph stagnated for {} rounds ({} nodes, {} edges). \
-                     Hints were injected at rounds {} and {}. \
-                     Cause: model explored repeatedly without committing. \
-                     Next round should: re-examine the last modified node, \
-                     verify its upstream dependencies, and propose a concrete patch.",
+                     Cascade verification: {}. Hints at rounds {} and {}. \
+                     Next round should pick a different optimization target.",
                     self.graph_stagnation_count,
                     self.graph.node_count(),
                     self.graph.edge_count(),
+                    if self.cascade.is_some() { "no issues found" } else { "not configured" },
                     GRAPH_STAGNATION_SOFT_HINT,
                     GRAPH_STAGNATION_HARD_HINT,
                 )));
             }
 
-            debug!(
-                count = self.graph_stagnation_count,
-                "graph unchanged this round"
-            );
+            debug!(count = self.graph_stagnation_count, "graph unchanged");
         } else {
             self.last_graph_fingerprint = Some(fp);
             self.graph_stagnation_count = 0;
