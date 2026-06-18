@@ -389,10 +389,8 @@ pub async fn drive_run(
 
     // Build the GraphLoop. This mirrors what bin/agent_a does.
     let cfg = ModelConfig::from_engine_config(&state.config.engine.model);
-    // Fast model: no streaming wrapper (tools + stream: true compatibility
-    // issues with some providers). Calls go through complete() directly.
-    let fast_model = cfg.fast_model();
-    // Deep model: streaming via ModelWithEvents for real-time visibility.
+    let fast_model =
+        ModelWithEvents::wrap(cfg.fast_model(), session.event_tx.clone(), "fast".into());
     let deep_model =
         ModelWithEvents::wrap(cfg.deep_model(), session.event_tx.clone(), "deep".into());
 

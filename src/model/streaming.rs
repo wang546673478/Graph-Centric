@@ -61,6 +61,11 @@ impl Model for ModelWithEvents {
         self.inner.name()
     }
 
+    /// Stream-first with non-streaming fallback (Claude Code pattern).
+    /// 1. Try SSE streaming with a 90s idle watchdog.
+    /// 2. If streaming hangs (no delta within 90s), fall back to
+    ///    non-streaming `inner.complete()`.
+    /// 3. If streaming produces data, use it.
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let event_tx = self.event_tx.clone();
@@ -70,10 +75,7 @@ impl Model for ModelWithEvents {
         let fwd = tokio::spawn(async move {
             while let Some(delta) = rx.recv().await {
                 match delta {
-                    StreamDelta::Delta {
-                        content,
-                        reasoning_content,
-                    } => {
+                    StreamDelta::Delta { content, reasoning_content } => {
                         let _ = event_tx.send(RunEvent::StreamChunk {
                             component: component.clone(),
                             content,
@@ -81,10 +83,7 @@ impl Model for ModelWithEvents {
                             finish_reason: None,
                         });
                     }
-                    StreamDelta::Done {
-                        finish_reason,
-                        usage,
-                    } => {
+                    StreamDelta::Done { finish_reason, usage } => {
                         let _ = event_tx.send(RunEvent::StreamEnd {
                             component: component.clone(),
                             finish_reason: format!("{:?}", finish_reason).to_lowercase(),
@@ -96,13 +95,42 @@ impl Model for ModelWithEvents {
             }
         });
 
-        // Drive the inner model's streaming call.
-        let result = self.inner.complete_stream(request, tx).await;
+        // Clone request for potential non-streaming fallback.
+        let fallback_req = ModelRequest {
+            messages: request.messages.clone(),
+            tools: request.tools.clone(),
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            stop: request.stop.clone(),
+        };
 
-        // Wait for the forwarder to finish draining. The tx was dropped
-        // when complete_stream returned, so rx will yield None shortly.
-        let _ = fwd.await;
+        // Stream with 90s timeout (Claude Code: CLAUDE_STREAM_IDLE_TIMEOUT_MS).
+        // tokio::select! ensures the timeout always fires regardless of
+        // whether the stream future is cancellable.
+        let stream_fut = self.inner.complete_stream(request, tx);
+        tokio::pin!(stream_fut);
+        let sleep = tokio::time::sleep(std::time::Duration::from_secs(90));
+        tokio::pin!(sleep);
 
-        result
+        let stream_result = tokio::select! {
+            res = &mut stream_fut => Some(res),
+            _ = &mut sleep => None,
+        };
+
+        match stream_result {
+            Some(Ok(resp)) => {
+                let _ = fwd.await;
+                Ok(resp)
+            }
+            _ => {
+                tracing::warn!(
+                    component = %self.component,
+                    "streaming timed out or failed; falling back to non-streaming"
+                );
+                let result = self.inner.complete(fallback_req).await;
+                let _ = fwd.await;
+                result
+            }
+        }
     }
 }

@@ -625,7 +625,7 @@ Respond with JSON:
             },
             tools: vec![],
             temperature: 0.1,
-            max_tokens: Some(4096),
+            max_tokens: Some(32768),
             stop: vec![],
         };
 
