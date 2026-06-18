@@ -14,49 +14,10 @@ const origKey = ref('')
 const isLoading = ref(false) // guard against reactivity-triggered switchProfile
 const profileName = ref('')
 const profiles = ref<Record<string, any>>({})
-const DEFAULTS = {
-  max_rounds: 10,
-  prompt: `对 Graph-Centric Agent 进行10轮自我优化。每轮选一个具体优化点，改完通过编译后自动重启进入下一轮。
-优化范围包括后端Rust代码(src/)和前端Vue3界面(webui/src/)。
-
-## 优化方向
-### 后端 (src/)
-- 降低unwrap/unsafe密度，提升代码健壮性
-- 优化模块边界，减少大文件(>500行)
-- 改善错误处理，用结构化错误替代字符串
-- 参考 openclaw/opencode/CodeWhale 中的模式但不照搬
-
-### 前端 (webui/src/)
-- 参考 GitHub 上优秀AI agent项目的Web界面设计
-- 优化现有Vue3组件的排版、配色、交互体验
-- 改进对话区域的视觉层次感和可读性
-- 增强3D关系图面板的可用性(标签、动画、布局)
-- 设置页面和信息页面的信息架构优化
-
-## 搜索外部项目 (Explore + WebSearch)
-- 用 Explore 派子代理去 GitHub 搜索关键词
-- 子代理有 web_search 工具可直接搜索
-
-## 每轮工作流 (A→D)
-1. 创建 A(当前问题)和 D(优化目标)
-2. Explore 扫描 src/ 或 webui/src/ 找出具体问题点
-3. 如果本轮需要外部参考: Explore + web_search 搜索 GitHub
-4. ProposePatch: 仅修改1-3个相关文件
-5. SubAgent执行修改(自动git commit+cargo check验证)
-6. Review通过→本轮完成→自动编译重启进入下一轮
-
-## 约束
-- 每轮只改1-3个文件，必须编译通过
-- 禁止引入新unwrap/unsafe，禁止删除测试
-- 不改graph/mod.rs和graph/l1.rs(核心图结构)
-- 外部项目只参考设计模式，不照搬代码
-- 前端改动不引入新依赖(保持轻量)
-- 第10轮结束自动停止`
-}
 
 const heartbeat = ref<any>(null)
-const hbPrompt = ref(DEFAULTS.prompt)
-const hbRounds = ref(DEFAULTS.max_rounds)
+const hbPrompt = ref("")
+const hbRounds = ref(10)
 
 onMounted(async () => {
   isLoading.value = true
@@ -65,9 +26,9 @@ onMounted(async () => {
     origKey.value = config.value.model?.api_key_masked || ''
     profiles.value = config.value.profiles || {}
     heartbeat.value = await api.get('/api/heartbeat')
-    if (heartbeat.value?.active && heartbeat.value?.prompt) {
+    if (heartbeat.value?.prompt) {
       hbPrompt.value = heartbeat.value.prompt
-    } else if (!heartbeat.value?.active) {
+    if (!heartbeat.value?.active && !hbPrompt.value) {
       const saved = localStorage.getItem('hb-prompt')
       if (saved) hbPrompt.value = saved
       const savedRounds = localStorage.getItem('hb-rounds')
@@ -87,15 +48,12 @@ async function startHeartbeat() {
     heartbeat.value = await api.post('/api/heartbeat', body)
     heartbeat.value = { active: true, max_rounds: hbRounds.value, completed_rounds: 0, prompt: hbPrompt.value }
   } catch(e) { alert(String(e)) }
-}
 async function cancelHeartbeat() {
   try { heartbeat.value = await api.post('/api/heartbeat/cancel') } catch { /* */ }
   heartbeat.value = { active: false }
-  hbPrompt.value = DEFAULTS.prompt
 }
 async function refreshHeartbeat() {
   try { heartbeat.value = await api.get('/api/heartbeat') } catch { /* */ }
-}
 
 function onKeyInput() { keyDirty.value = true }
 
@@ -107,7 +65,6 @@ async function switchProfile(name: string) {
     origKey.value = config.value.model?.api_key_masked || ''
     keyDirty.value = false
   }
-}
 
 function saveProfile() {
   const name = profileName.value.trim() || config.value.active_profile || 'default'
@@ -116,7 +73,6 @@ function saveProfile() {
   config.value.active_profile = name
   profileName.value = ''
   save()
-}
 
 function deleteProfile(name: string) {
   delete profiles.value[name]
@@ -125,7 +81,6 @@ function deleteProfile(name: string) {
     config.value.active_profile = ''
   }
   save()
-}
 
 async function fetchModels() {
   const baseUrl = config.value.model?.base_url?.trim()
@@ -141,7 +96,6 @@ async function fetchModels() {
     modelList.value = data.models || []
   } catch (e) { alert(String(e)) }
   finally { fetching.value = false }
-}
 
 async function save() {
   if (!keyDirty.value) {
@@ -163,7 +117,6 @@ async function save() {
     saved.value = true; setTimeout(() => saved.value = false, 2000)
   } catch (e) { alert(String(e)) }
   isLoading.value = false
-}
 </script>
 
 <template>
