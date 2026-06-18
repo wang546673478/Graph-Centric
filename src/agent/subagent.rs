@@ -68,12 +68,14 @@ pub struct SubTask {
     pub involved_nodes: Vec<NodeId>,
     #[serde(default)]
     pub needs: TaskNeeds,
-    /// Pre-dispatch verification predicate. Checked by the sub-agent
-    /// before emitting `final_answer`, and re-checked by the dispatcher.
-    /// Defaults to `CheckContract::None` — preserves the legacy behavior
-    /// of taking the sub-agent's output at face value.
+    /// Pre-dispatch verification predicate.
     #[serde(default)]
     pub contract: CheckContract,
+    /// Optional role-specific prompt injected into the sub-agent's system
+    /// prompt. Use for domain-specific instructions (e.g., "code editor",
+    /// "explorer", "security auditor"). When empty, uses default prompt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role_prompt: String,
 }
 
 impl SubTask {
@@ -98,12 +100,19 @@ impl SubTask {
             .get("contract")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
+        let role_prompt = node
+            .metadata
+            .get("role_prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         Ok(Self {
             id: node.id.clone(),
             description: node.summary.clone(),
             involved_nodes,
             needs,
             contract,
+            role_prompt,
         })
     }
 
@@ -123,6 +132,9 @@ impl SubTask {
                 "contract",
                 serde_json::to_value(&self.contract).unwrap_or(serde_json::json!(null)),
             );
+        }
+        if !self.role_prompt.is_empty() {
+            node = node.with_metadata("role_prompt", serde_json::json!(self.role_prompt));
         }
         node
     }
@@ -318,7 +330,7 @@ impl SubAgent {
             loader,
         )?;
 
-        let system_prompt = build_system_prompt(self.tools.as_ref(), self.max_steps);
+        let system_prompt = build_system_prompt(self.tools.as_ref(), self.max_steps, &task.role_prompt);
         let user_prompt = build_initial_user_prompt(
             task,
             &context.text,
@@ -556,8 +568,13 @@ impl SubAgent {
 // Prompts
 // ---------------------------------------------------------------------------
 
-fn build_system_prompt(tools: &ToolRegistry, max_steps: usize) -> String {
+fn build_system_prompt(tools: &ToolRegistry, max_steps: usize, role_prompt: &str) -> String {
     let defs = tools.defs();
+    let role_section = if role_prompt.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Role\n{role_prompt}\n")
+    };
     let tools_block = if defs.is_empty() {
         "(no tools registered — go straight to final_answer)".to_string()
     } else {
@@ -577,6 +594,7 @@ fn build_system_prompt(tools: &ToolRegistry, max_steps: usize) -> String {
         "You are a sub-agent in a graph-centric agent harness. You have been assigned ONE narrow \
 sub-task with a local slice of the parent's relationship graph. Your job is to execute that \
 sub-task and return a concise, useful result.\n\
+{role_section}\
 \n\
 **CODE MODIFICATION TASKS**: You MUST actually edit files. Use dedicated tools:\
 \n  - `read_file` to read any file (supports offset/limit for large files)\

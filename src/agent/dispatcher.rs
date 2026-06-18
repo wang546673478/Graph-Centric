@@ -457,21 +457,21 @@ mod tests {
             description: "analyze A".into(),
             involved_nodes: vec![NodeId::from("a")],
             needs: TaskNeeds::read_only(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         };
         let st2 = SubTask {
             id: NodeId::from("t2"),
             description: "analyze B".into(),
             involved_nodes: vec![NodeId::from("b")],
             needs: TaskNeeds::read_only(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         };
         let st3 = SubTask {
             id: NodeId::from("t3"),
             description: "synthesize".into(),
             involved_nodes: vec![NodeId::from("a"), NodeId::from("b"), NodeId::from("c")],
             needs: TaskNeeds::read_only(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         };
         g.add_node(st1.to_task_node());
         g.add_node(st2.to_task_node());
@@ -520,14 +520,14 @@ mod tests {
             description: "".into(),
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         }.to_task_node());
         g.add_node(SubTask {
             id: NodeId::from("tb"),
             description: "".into(),
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         }.to_task_node());
 
         let started = Instant::now();
@@ -566,7 +566,7 @@ mod tests {
                 description: "".into(),
                 involved_nodes: vec![],
                 needs: TaskNeeds::default(),
-                contract: CheckContract::default(),
+                contract: CheckContract::default(), role_prompt: String::new(),
             }.to_task_node());
         }
         let ids: Vec<NodeId> = ["ta", "tb", "tc", "td"].iter().map(|s| NodeId::from(*s)).collect();
@@ -619,14 +619,14 @@ mod tests {
             description: "x".into(),
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         }.to_task_node());
         g.add_node(SubTask {
             id: NodeId::from("t2"),
             description: "y".into(),
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         }.to_task_node());
         g.add_edge(Edge::new("t1", "t2", RelationType::DependsOn, 1.0, "")).unwrap();
         g.add_edge(Edge::new("t2", "t1", RelationType::DependsOn, 1.0, "")).unwrap();
@@ -654,14 +654,14 @@ mod tests {
             description: "x".into(),
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         }.to_task_node());
         g.add_node(SubTask {
             id: NodeId::from("t2"),
             description: "y".into(),
             involved_nodes: vec![],
             needs: TaskNeeds::default(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         }.to_task_node());
 
         let outcome = d.run(&g, &make_world(), loader()).await.unwrap();

@@ -1629,6 +1629,7 @@ impl GraphLoop {
                     must_mention_any: vec![item.scope.clone()],
                 };
                 SubTask {
+                    role_prompt: String::new(),
                     id: NodeId::from(format!(
                         "explore-r{}-i{}-pid{}",
                         self.round,

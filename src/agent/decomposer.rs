@@ -298,7 +298,7 @@ fn build_task_graph(parsed: Vec<ParsedTask>, world_graph: &Graph) -> Result<Grap
             description: t.description.clone(),
             involved_nodes: t.involved_nodes.clone(),
             needs: t.needs.clone(),
-            contract: CheckContract::default(),
+            contract: CheckContract::default(), role_prompt: String::new(),
         };
         g.add_node(st.to_task_node());
     }
