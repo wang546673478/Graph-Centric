@@ -102,7 +102,7 @@ impl L1Enricher {
     ) -> Result<L1Description> {
         let node = graph
             .get_node(node_id)
-            .ok_or_else(|| HarnessError::model(format!("enricher: node {node_id} not in graph")))?;
+            .ok_or_else(|| HarnessError::enricher(format!("enricher: node {node_id} not in graph")))?;
 
         // Try L2; if it fails, switch to the inferential prompt rather than
         // bailing out. This keeps abstract / planning tasks from getting
@@ -288,7 +288,7 @@ impl L1Enricher {
 fn parse_l1_description(text: &str) -> Result<L1Description> {
     let cleaned = extract_json_block(text)?;
     let value: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
-        HarnessError::model(format!(
+        HarnessError::enricher(format!(
             "enricher: invalid JSON: {e}\n--- raw ---\n{text}\n--- cleaned ---\n{cleaned}"
         ))
     })?;
@@ -324,7 +324,7 @@ fn parse_l1_description(text: &str) -> Result<L1Description> {
         && design_intent.trim().is_empty()
         && constraints.trim().is_empty()
     {
-        return Err(HarnessError::model(
+        return Err(HarnessError::enricher(
             "enricher: model returned an empty L1Description; rejecting",
         ));
     }
