@@ -12,3 +12,5 @@ Cargo.lock
 /data/
 .graph_harness_config.json
 .graph_harness_heartbeat.json
+count_lines.py
+count_webui.py

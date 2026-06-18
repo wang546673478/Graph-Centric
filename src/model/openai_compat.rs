@@ -312,6 +312,11 @@ impl Model for OpenAICompatModel {
     }
 
     /// Streaming implementation using SSE (`stream: true`).
+    ///
+    /// The initial connection is retried on transient errors (timeout/connect)
+    /// with the same exponential backoff as `complete()`. Once the stream starts
+    /// flowing, chunk errors are terminal — we don't retry mid-stream because
+    /// partial data has already been sent to the caller.
     async fn complete_stream(
         &self,
         request: ModelRequest,
@@ -323,29 +328,52 @@ impl Model for OpenAICompatModel {
         body.stream = true;
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let mut req = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body);
-        if let Some(ref key) = self.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
-        }
+        let url_for_error = url.clone();
+        let api_key = self.api_key.clone();
+        let client = self.client.clone();
 
-        let resp = req.send().await.map_err(|e| {
-            crate::error::HarnessError::model(format!("stream request failed: {e}"))
+        // Retry the initial connection (same policy as non-streaming `complete()`).
+        let max_attempts = self.retry_max_attempts;
+        let base_delay = self.retry_base_delay;
+        let max_delay = self.retry_max_delay;
+        let resp = send_with_retry(
+            move || {
+                let client = client.clone();
+                let api_key = api_key.clone();
+                let body = body.clone();
+                let url = url.clone();
+                async move {
+                    let mut req = client
+                        .post(&url)
+                        .header("Content-Type", "application/json")
+                        .json(&body);
+                    if let Some(key) = &api_key {
+                        req = req.header("Authorization", format!("Bearer {key}"));
+                    }
+                    req.send().await
+                }
+            },
+            is_transient_http_error,
+            max_attempts,
+            base_delay,
+            max_delay,
+        )
+        .await
+        .map_err(|e| {
+            crate::error::HarnessError::model(format_http_error("stream request failed", &e))
         })?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(crate::error::HarnessError::model(format!(
-                "stream HTTP {}: {}",
+                "stream HTTP {} from {url_for_error}: {}",
                 status.as_u16(),
                 body.chars().take(300).collect::<String>(),
             )));
         }
 
+        // Stream is flowing — no retry from here.
         let mut stream = resp.bytes_stream();
         let mut full_content = String::new();
         let mut full_reasoning = String::new();

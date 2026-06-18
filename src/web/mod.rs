@@ -49,6 +49,9 @@ impl WebState {
     }
 
     /// Restore completed runs from disk so the history survives restarts.
+    /// Runs that were still active (Running/Paused/GraphInvalid) when the
+    /// server was killed are marked as Error — they are zombies whose
+    /// background task no longer exists.
     pub async fn restore_persisted_runs(&self) {
         match self.persistence.load_all_runs() {
             Ok(metas) => {
@@ -59,8 +62,19 @@ impl WebState {
                             meta.id.clone(),
                             meta.task.clone(),
                         ));
-                        // Override status + duration from persisted metadata.
-                        *session.status.write().await = meta.status.clone();
+                        let status = if !meta.status.is_terminal() {
+                            // Zombie: was Running/Paused/GraphInvalid when process died.
+                            let err_msg = format!(
+                                "server restart — run was {:?} when process exited",
+                                meta.status
+                            );
+                            tracing::warn!(run_id = %meta.id, "restored zombie run as Error");
+                            *session.persisted_duration_ms.lock().await = meta.duration_ms;
+                            run_session::RunStatus::Error(err_msg)
+                        } else {
+                            meta.status.clone()
+                        };
+                        *session.status.write().await = status;
                         *session.persisted_duration_ms.lock().await = meta.duration_ms;
                         *session.tokens_used.lock().await = meta.tokens_used;
                         runs.insert(meta.id.clone(), session);
@@ -89,8 +103,9 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/heartbeat/default", post(config_api::start_default_heartbeat))
         .route("/heartbeat/prompt", post(config_api::update_heartbeat_prompt))
         .route("/heartbeat/cancel", post(config_api::cancel_heartbeat))
-        .route("/runs", get(api_runs::list_runs).post(api_runs::create_run))
+        .route("/runs", get(api_runs::list_runs).post(api_runs::create_run).delete(api_runs::clear_runs))
         .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))
+        .route("/runs/:id/delete", post(api_runs::delete_run))
         .route("/runs/:id/events", get(api_runs::run_events))
         .route("/runs/:id/checkpoints", get(api_runs::list_checkpoints))
         .route("/runs/:id/checkpoints/:idx", get(api_runs::get_checkpoint))

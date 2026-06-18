@@ -134,6 +134,47 @@ pub async fn cancel_run(
     Ok(Json(serde_json::json!({"cancelled": true})))
 }
 
+// --- Delete run ---
+
+pub async fn delete_run(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = {
+        let runs = state.runs.read().await;
+        runs
+            .get(&id)
+            .map(|s| s.clone())
+            .ok_or_else(|| ApiError::NotFound(format!("run {id}")))?
+    };
+    // Cancel if still running, then remove.
+    session.cancel.cancel();
+    {
+        let mut runs = state.runs.write().await;
+        runs.remove(&id);
+    }
+    // Remove persisted data if any.
+    let _ = state.persistence.delete_run(&id);
+    tracing::info!(run_id = %id, "run deleted");
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+// --- Clear all runs ---
+
+pub async fn clear_runs(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut runs = state.runs.write().await;
+    let count = runs.len();
+    for (id, session) in runs.iter() {
+        session.cancel.cancel();
+        let _ = state.persistence.delete_run(id);
+    }
+    runs.clear();
+    tracing::info!(count, "all runs cleared");
+    Ok(Json(serde_json::json!({"deleted": count})))
+}
+
 // --- SSE event stream ---
 
 pub async fn run_events(
