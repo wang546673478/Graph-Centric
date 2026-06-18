@@ -14,3 +14,7 @@ Cargo.lock
 .graph_harness_heartbeat.json
 count_lines.py
 count_webui.py
+_linecount.py
+count_lines.py
+count_webui.py
+Result'

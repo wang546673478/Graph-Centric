@@ -353,22 +353,14 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
     }
 
     /// Same as [`Self::next_step`] but retries the model call once if
-    /// the first response is malformed (no `{`, unterminated JSON,
-    /// invalid JSON, or unknown step kind). The retry message tells
-    /// the model that its previous output was broken and to reply
-    /// with valid JSON only.
-    ///
-    /// Returns the first error if both attempts fail (or if the
-    /// model itself errored on both calls). Caller can distinguish
-    /// model failure from parse failure via the error message.
+    /// the first response is malformed. If both attempts fail, salvages
+    /// a best-effort step from the response text instead of dying.
     pub async fn next_step_with_retry(
         &self,
         conv: &Conversation,
         graph: &Graph,
         prev_step: Option<&ProposerStep>,
     ) -> Result<(ProposerStep, u64)> {
-        // First attempt: either returns Ok((step, tokens)) or a parse
-        // error. We accumulate tokens across both attempts.
         let mut total_tokens: u64 = 0;
         let (step, parse_err) = match self.next_step(conv, graph, prev_step).await {
             Ok((s, t)) => {
@@ -378,9 +370,7 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
             Err(e) => (ProposerStep::ReadyForVerify { rationale: String::new() }, Some(e)),
         };
 
-        // Layer 1: parse-error retry. The model emitted something that
-        // wasn't a valid JSON step. Tell it what went wrong and ask
-        // for a clean re-emit.
+        // Layer 1: parse-error retry.
         if let Some(parse_err) = parse_err {
             warn!(
                 error = %parse_err,
@@ -392,30 +382,35 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
                 content: format!(
                     "Your previous response was malformed (parser said: {parse_err}). \
                      Reply with EXACTLY one valid JSON object matching one of the step \
-                     schemas above. No markdown fences, no prose around it. If the \
-                     user just asked a question or a greeting, an `ask_user` step with \
-                     the answer in `question` is appropriate. If no graph change is \
-                     needed, `propose_patch` with no add/remove and a `rationale` that \
-                     answers the user is also acceptable.\n\n\
-                     If the error mentioned a `cap is N` (question length or items count), \
-                     DO NOT re-emit the same payload — split it. For a long question, \
-                     break it into 2-3 `Explore` items each with a focused sub-question \
-                     (<=2000 chars). For too many items, split the batch into two `Explore` \
-                     steps across rounds."
+                     schemas above. No markdown fences, no prose around it."
                 ),
             });
-            return match self.next_step(&patched_conv, graph, prev_step).await {
-                Ok((step, tokens)) => Ok((step, total_tokens + tokens)),
+            match self.next_step(&patched_conv, graph, prev_step).await {
+                Ok((s, t)) => return Ok((s, total_tokens + t)),
                 Err(retry_err) => {
-                    // The retry didn't converge. Surface the LATEST
-                    // error (not the first one) so the human can see
-                    // what the second attempt actually produced. The
-                    // original `parse_err` is included in the message
-                    // for context.
-                    Err(HarnessError::model(format!(
-                        "fix-it retry did not converge. First error: {parse_err}. \
-                         Retry error: {retry_err}"
-                    )))
+                    // Both attempts failed to produce valid JSON. Salvage:
+                    // treat this as the model trying to communicate and
+                    // surface its prose as an `ask_user` step. For
+                    // unattended/heartbeat runs this gets auto-answered
+                    // with "proceed", giving the model a natural retry in
+                    // the next round without dying.
+                    warn!(
+                        first = %parse_err,
+                        retry = %retry_err,
+                        "proposer: both attempts failed; salvaging as ask_user fallback"
+                    );
+                    let question = extract_salvage_question(&parse_err.to_string());
+                    return Ok((
+                        ProposerStep::AskUser {
+                            question,
+                            rationale: format!(
+                                "Model did not produce valid JSON after retry. \
+                                 First error: {parse_err}. Retry error: {retry_err}. \
+                                 Falling back to ask_user to keep the loop alive."
+                            ),
+                        },
+                        total_tokens,
+                    ));
                 }
             };
         }
@@ -698,6 +693,23 @@ pub fn extract_json_block(text: &str) -> Result<String> {
         "proposer: no valid outermost JSON found. Last error: {}",
         last_err.unwrap_or_else(|| "no candidates".into())
     )))
+}
+
+/// Extract a meaningful question from a model's prose response that
+/// lacked any JSON. Used as a last-resort salvage to keep the loop alive.
+fn extract_salvage_question(parse_error: &str) -> String {
+    // If the error mentions the model's raw text, use a fragment of it.
+    // Otherwise, generate a generic continuation prompt.
+    let default_q = "Continue working on the task. Please output a valid JSON step this time.";
+    // Try to extract something useful from the error — it often includes
+    // the first ~100 chars of the raw response in "invalid JSON: ...".
+    if let Some(raw) = parse_error.split("--- raw ---").nth(1) {
+        let snippet: String = raw.chars().take(200).collect();
+        if !snippet.trim().is_empty() {
+            return format!("The model said: \"{}\" — how should we proceed?", snippet.trim());
+        }
+    }
+    default_q.to_string()
 }
 
 fn proposer_tools() -> Vec<serde_json::Value> {
@@ -1944,27 +1956,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn next_step_with_retry_returns_first_error_when_both_attempts_fail() {
-        // Both responses are malformed; the retry surfaces the FIRST
-        // error (not the retry's), so the caller sees the original
-        // failure context.
+    async fn next_step_with_retry_salvages_ask_user_when_both_attempts_fail() {
+        // When both attempts fail, the function salvages an AskUser step
+        // instead of dying — keeps the loop alive for heartbeat/auto-answer.
         let p = proposer_with(vec![
             "still bad on second try",
             "still bad on second try",
         ]);
         let conv = p.make_conversation("test task");
         let graph = Graph::new();
-        let err = p
+        let (step, _tokens) = p
             .next_step_with_retry(&conv, &graph, None)
             .await
-            .expect_err("both attempts should fail");
-        // The error message is from extract_json_block, which is the
-        // first-attempt failure (since second also fails and the
-        // function falls back to `first_err`).
-        assert!(
-            format!("{err}").contains("'{'"),
-            "expected the parse error to mention missing '{{', got: {err}"
-        );
+            .expect("salvage should produce a step");
+        match step {
+            ProposerStep::AskUser { question, rationale } => {
+                assert!(
+                    rationale.to_lowercase().contains("falling") || rationale.contains("salvage"),
+                    "rationale should mention salvage/fallback: {rationale}"
+                );
+                assert!(!question.is_empty());
+            }
+            other => panic!("expected AskUser salvage, got {other:?}"),
+        }
     }
 
     #[tokio::test]
