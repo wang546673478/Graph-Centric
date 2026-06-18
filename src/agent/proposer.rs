@@ -506,13 +506,22 @@ Respond with JSON:
         };
 
         let resp = self.model.complete(req).await?;
-        let step = parse_step(&resp.content)?;
+        let step = match parse_step(&resp.content) {
+            Ok(s) => s,
+            Err(e) => {
+                // Salvage: model returned prose instead of JSON.
+                // Return an empty patch — the caller (cascade) will
+                // see no changes and surface the stalemate naturally.
+                warn!(error = %e, "replan: parse_step failed, returning empty patch");
+                return Ok(GraphPatch::default());
+            }
+        };
         match step {
             ProposerStep::ProposePatch { patch, .. } => Ok(patch),
-            other => Err(HarnessError::model(format!(
-                "expected propose_patch from replan, got {}",
-                other.kind()
-            ))),
+            other => {
+                warn!(step = other.kind(), "replan: expected propose_patch, returning empty patch");
+                Ok(GraphPatch::default())
+            }
         }
     }
 }
