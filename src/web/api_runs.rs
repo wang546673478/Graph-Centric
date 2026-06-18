@@ -500,21 +500,7 @@ pub async fn drive_run(
         stuck_terminate: state.config.engine.loop_tuning.stuck_terminate,
         tool_failure_warn_after: state.config.engine.loop_tuning.tool_failure_warn_after,
         tool_failure_halt_after: state.config.engine.loop_tuning.tool_failure_halt_after,
-        // If heartbeat is active, enforce strict graph structure.
-        graph_schema: {
-            let hb_guard = tokio::runtime::Handle::current().block_on(state.heartbeat.lock());
-            if hb_guard.as_ref().map(|hb| hb.active).unwrap_or(false) {
-                Some(crate::agent::graph_loop::GraphSchema {
-                    allowed_node_kinds: vec![crate::graph::NodeKind::Task],
-                    required_edge_relation: Some(crate::graph::RelationType::DependsOn),
-                    require_immutable_anchor: true,
-                    min_nodes: 3,
-                    min_edges: 2,
-                })
-            } else {
-                None
-            }
-        },
+        graph_schema: None,
     };
 
     let mut gl = GraphLoop::new(
