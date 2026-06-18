@@ -388,17 +388,7 @@ pub async fn drive_run(
     let _ = state.persistence.save_run_meta(&session.metadata().await);
 
     // Build the GraphLoop. This mirrors what bin/agent_a does.
-    let cfg = match ModelConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            session.emit(RunEvent::Error {
-                message: format!("config error: {e}"),
-            });
-            *session.status.write().await = RunStatus::Error(e.to_string());
-            let _ = state.persistence.save_run_meta(&session.metadata().await);
-            return;
-        }
-    };
+    let cfg = ModelConfig::from_engine_config(&state.config.engine.model);
     // Fast model: no streaming wrapper (tools + stream: true compatibility
     // issues with some providers). Calls go through complete() directly.
     let fast_model = cfg.fast_model();

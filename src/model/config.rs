@@ -90,6 +90,16 @@ impl ModelConfig {
         })
     }
 
+    /// Build from web engine config (JSON file) — bypasses env vars entirely.
+    pub fn from_engine_config(cfg: &crate::web::state::ModelTierConfig) -> Self {
+        Self {
+            base_url: cfg.base_url.clone(),
+            api_key: if cfg.api_key.is_empty() { None } else { Some(cfg.api_key.clone()) },
+            fast: cfg.fast_model.clone(),
+            deep: cfg.deep_model.clone(),
+        }
+    }
+
     /// Programmatic constructor — useful for tests and embedded callers
     /// that don't want env at all.
     pub fn new(
