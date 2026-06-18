@@ -609,9 +609,14 @@ fn strip_think_blocks(text: &str) -> String {
     s
 }
 
-/// Pull the first balanced JSON object out of a (possibly markdown-wrapped)
-/// model response. Tolerant of leading prose, code-fence variants, and
-/// `<think>...</think>` reasoning blocks emitted by reasoning models.
+/// Pull the first **valid** JSON object out of a (possibly markdown-wrapped)
+/// model response. Tolerant of leading prose, embedded examples in reasoning
+/// blocks, code-fence variants, and `<think>...</think>` tags.
+///
+/// We find every *outermost* `{` (brace depth 0), balance-walk to its `}`,
+/// then try each candidate right-to-left — the last JSON block is usually
+/// the real one. Models with or without thinking/reasoning work regardless
+/// of whether the thinking contains example-JSON snippets.
 pub fn extract_json_block(text: &str) -> Result<String> {
     let trimmed = strip_think_blocks(text).trim().to_string();
     // Strip ```json ... ``` or ``` ... ``` fences.
@@ -629,45 +634,70 @@ pub fn extract_json_block(text: &str) -> Result<String> {
         &trimmed
     };
 
-    // Find the first '{' and walk to its balanced close, respecting strings.
-    let start = inner
-        .find('{')
-        .ok_or_else(|| HarnessError::model("proposer: no '{' in response".to_string()))?;
-    let body = &inner[start..];
+    // Collect every *outermost* `{` (brace depth 0) with its balanced close.
+    let chars: Vec<char> = inner.chars().collect();
+    let char_indices: Vec<usize> = inner.char_indices().map(|(i, _)| i).collect();
+    let mut candidates: Vec<(usize, usize)> = Vec::new(); // (start_byte, end_byte)
 
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    let mut end: Option<usize> = None;
-    for (i, c) in body.char_indices() {
-        if escape {
-            escape = false;
-            continue;
-        }
-        if in_string {
-            match c {
-                '\\' => escape = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i + 1);
-                    break;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            // Walk to balanced close.
+            let mut depth = 1i32;
+            let mut in_string = false;
+            let mut escape = false;
+            let mut end: Option<usize> = None;
+            for j in (i + 1)..chars.len() {
+                let c = chars[j];
+                if escape { escape = false; continue; }
+                if in_string {
+                    match c { '\\' => escape = true, '"' => in_string = false, _ => {} }
+                    continue;
+                }
+                match c {
+                    '"' => in_string = true,
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 { end = Some(j); break; }
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
+            if let Some(end_idx) = end {
+                let start_byte = char_indices[i];
+                let end_byte = char_indices[end_idx] + chars[end_idx].len_utf8();
+                candidates.push((start_byte, end_byte));
+                i = end_idx + 1; // skip past this balanced block
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
         }
     }
-    let end = end
-        .ok_or_else(|| HarnessError::model("proposer: unterminated JSON object".to_string()))?;
-    Ok(body[..end].to_string())
+
+    if candidates.is_empty() {
+        return Err(HarnessError::model("proposer: no '{' in response"));
+    }
+
+    // Try right-to-left: the last outermost block is usually the real response.
+    let mut last_err: Option<String> = None;
+    for (start, end) in candidates.iter().rev() {
+        let candidate = &inner[*start..*end];
+        if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+            return Ok(candidate.to_string());
+        }
+        last_err = Some(format!(
+            "JSON parse failed for outermost block at byte {start}: {}",
+            serde_json::from_str::<serde_json::Value>(candidate).unwrap_err()
+        ));
+    }
+
+    Err(HarnessError::model(format!(
+        "proposer: no valid outermost JSON found. Last error: {}",
+        last_err.unwrap_or_else(|| "no candidates".into())
+    )))
 }
 
 fn proposer_tools() -> Vec<serde_json::Value> {
@@ -1759,6 +1789,61 @@ mod tests {
         // Either no `{` or invalid JSON — both are acceptable here.
         assert!(format!("{err}").to_lowercase().contains("json")
             || format!("{err}").contains("'{'"));
+    }
+
+    // ---- extract_json_block robustness ----
+
+    #[test]
+    fn extract_json_handles_leading_prose() {
+        // Model emits natural-language thinking before the JSON.
+        // The outermost `{` in the prose (if any) or the actual JSON should work.
+        let text = "I'll help with that.\n\n{\"step\":\"ready_for_verify\",\"rationale\":\"done\"}";
+        let block = extract_json_block(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&block).unwrap();
+        assert_eq!(v["step"], "ready_for_verify");
+    }
+
+    #[test]
+    fn extract_json_handles_think_and_json() {
+        // `<think>` block with reasoning, then clean JSON.
+        let text = "<think>Need to add a node for the new module</think>\n{\"step\":\"propose_patch\",\"patch\":{\"add_nodes\":[],\"add_edges\":[],\"remove_node_ids\":[],\"remove_edge_indices\":[],\"set_l1\":{}},\"rationale\":\"adding\"}";
+        let block = extract_json_block(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&block).unwrap();
+        assert_eq!(v["step"], "propose_patch");
+    }
+
+    #[test]
+    fn extract_json_handles_prose_with_braces_in_example() {
+        // Prose that contains `{` (e.g. JSON example in thinking), then the real JSON.
+        let text = "Here's an example: {\"foo\": \"bar\"} — now my real answer:\n{\"step\":\"ready_for_verify\",\"rationale\":\"ok\"}";
+        let block = extract_json_block(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&block).unwrap();
+        assert_eq!(v["step"], "ready_for_verify");
+    }
+
+    #[test]
+    fn extract_json_handles_code_fence_with_prose() {
+        // ```json fence with leading prose after the fence.
+        let text = "```json\n{\"step\":\"ready_for_verify\",\"rationale\":\"done\"}\n```";
+        let block = extract_json_block(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&block).unwrap();
+        assert_eq!(v["step"], "ready_for_verify");
+    }
+
+    #[test]
+    fn extract_json_picks_last_valid_when_multiple_outermost() {
+        // Two outermost JSON blocks — the last one should win.
+        let text = "{\"a\":1}\nsome text\n{\"step\":\"ready_for_verify\",\"rationale\":\"last\"}";
+        let block = extract_json_block(text).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&block).unwrap();
+        assert_eq!(v["step"], "ready_for_verify");
+    }
+
+    #[test]
+    fn extract_json_no_braces_at_all() {
+        let text = "just plain text, no JSON anywhere";
+        let err = extract_json_block(text).unwrap_err();
+        assert!(format!("{err}").contains("'{'"));
     }
 
     #[tokio::test]
