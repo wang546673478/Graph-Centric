@@ -64,7 +64,16 @@ pub async fn get_heartbeat(
 pub async fn start_default_heartbeat(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let mut hb = HeartBeat::start(super::heartbeat::DEFAULT_OPTIMIZATION_PROMPT.to_string(), 10);
+    // Load prompt from markdown file if it exists, fall back to hardcoded default.
+    let prompt_path = state.config.project_root.join(".graph_harness_heartbeat_prompt.md");
+    let prompt = if prompt_path.exists() {
+        std::fs::read_to_string(&prompt_path).unwrap_or_else(|_| {
+            super::heartbeat::DEFAULT_OPTIMIZATION_PROMPT.to_string()
+        })
+    } else {
+        super::heartbeat::DEFAULT_OPTIMIZATION_PROMPT.to_string()
+    };
+    let mut hb = HeartBeat::start(prompt, 10);
     let run_id = spawn_heartbeat_run(&state, &mut hb).await;
     let mut guard = state.heartbeat.lock().await;
     *guard = Some(hb);
