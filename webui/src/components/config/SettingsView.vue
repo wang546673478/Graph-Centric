@@ -144,12 +144,18 @@ async function fetchModels() {
 
 async function save() {
   if (!keyDirty.value) {
-    // Don't overwrite the real key with the masked display value.
     config.value.model.api_key_masked = origKey.value
+  }
+  // Sync current model to the active profile so they stay consistent.
+  const ap = config.value.active_profile
+  if (ap && profiles.value[ap]) {
+    profiles.value[ap] = { ...config.value.model }
+    config.value.profiles = { ...profiles.value }
   }
   try {
     config.value = await api.post('/api/config', config.value)
     origKey.value = config.value.model?.api_key_masked || ''
+    profiles.value = config.value.profiles || {}
     keyDirty.value = false
     saved.value = true; setTimeout(() => saved.value = false, 2000)
   } catch (e) { alert(String(e)) }
