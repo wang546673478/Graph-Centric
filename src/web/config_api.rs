@@ -205,18 +205,16 @@ pub async fn post_config(
             config.policy.max_concurrent_subagents = v as usize;
         }
     }
-    // Handle profile switching.
-    if let Some(prof) = update.get("active_profile").and_then(|v| v.as_str()) {
-        if !prof.is_empty() {
-            config.active_profile = prof.to_string();
-            if let Some(p) = config.profiles.get(prof) {
-                config.model = p.clone();
-            }
-        }
-    }
+    // Save profiles if sent.
     if let Some(profiles) = update.get("profiles") {
         if let Ok(map) = serde_json::from_value::<std::collections::HashMap<String, ModelTierConfig>>(profiles.clone()) {
             config.profiles = map;
+        }
+    }
+    // Update active_profile AFTER model fields are applied (it only sets the name, not the model).
+    if let Some(prof) = update.get("active_profile").and_then(|v| v.as_str()) {
+        if !prof.is_empty() {
+            config.active_profile = prof.to_string();
         }
     }
 
