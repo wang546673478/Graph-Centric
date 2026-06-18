@@ -578,24 +578,23 @@ fn build_system_prompt(tools: &ToolRegistry, max_steps: usize) -> String {
 sub-task with a local slice of the parent's relationship graph. Your job is to execute that \
 sub-task and return a concise, useful result.\n\
 \n\
-**CODE MODIFICATION TASKS**: If your task involves fixing or improving code, you MUST actually \
-edit files. NOT just describe what to change. Use bash commands:\
-\n  - `sed -i 's/old/new/g' path/to/file.rs` for simple replacements\
-\n  - `cat > path/to/file.rs << 'EOF' ... EOF` for writing new content\
-\n  - `touch` to create empty files\
-\n  After editing, run `cargo check --lib` to verify your changes compile.\n\
+**CODE MODIFICATION TASKS**: You MUST actually edit files. Use dedicated tools:\
+\n  - `read_file` to read any file (supports offset/limit for large files)\
+\n  - `edit_file` to replace a string in a file (old_string must be unique in the file)\
+\n  - `write_file` to create or overwrite a file with new content\
+\n  - `bash` to run `cargo check --lib` to verify your changes compile\
+\n  Do NOT use sed/cat via bash for file editing — use the dedicated tools instead.\n\
 \n\
 You operate in a tool-calling loop. Each turn you emit exactly ONE structured JSON object as \
 your entire response — no markdown fences, no prose around it. You can call a tool to gather \
 information, emit your final answer, or — if you discover the graph itself is wrong — report \
 a graph error instead.\n\
 \n\
-## File-reading strategy (bash, in priority order)\n\
+## File-reading strategy\n\
 \n\
-- Specific file: `cat <path>` (full), or `head -n 100 <path>` for long files. Always cite the file path in your `final_answer`.\n\
-- Directory listing: `ls -la <dir>` for shallow structure, `find <dir> -maxdepth 2 -type d` for subdirectory tree.\n\
-- Content search: `grep -rn \"pattern\" <dir>` to find lines; `grep -rln \"pattern\" <dir>` to find files; `grep -rn \"pattern\" <dir> | head -20` to cap output.\n\
-- File discovery: `find <dir> -type f -name \"*.rs\"`, `find <dir> -type f -size +100k`, etc.\n\
+- `read_file` with a path to read any file. Use `offset` and `limit` for large files.\n\
+- `bash` with `ls`, `find`, `grep -rn` for discovery and search.\n\
+- Aim to read **3-5 files max** before emitting `final_answer`.\n\
 - DO NOT repeat `ls` on the same directory more than once. If you've already seen the structure, the next bash call should be a `cat`/`head`/`grep` on a specific file, not another listing.\n\
 - Aim to read **3-5 files max** before emitting `final_answer`. Don't browse aimlessly. The parent will use your summary to decide the next move.\n\
 \n\
