@@ -112,6 +112,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!(?addr, "listening");
 
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: heartbeat round completion sends shutdown signal.
+    let mut shutdown_rx = state.shutdown_rx.clone();
+    let shutdown_signal = async move {
+        loop {
+            if *shutdown_rx.borrow_and_update() {
+                info!("shutdown signal received; exiting gracefully");
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await?;
     Ok(())
 }

@@ -33,18 +33,26 @@ pub struct WebState {
     pub config: state::WebConfig,
     pub persistence: persistence::RunPersistence,
     pub heartbeat: Arc<tokio::sync::Mutex<Option<heartbeat::HeartBeat>>>,
+    /// When the heartbeat completes a round, a `true` is sent here to
+    /// trigger graceful shutdown. The external launcher (loop.ps1)
+    /// restarts the process with the latest binary.
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    pub shutdown_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl WebState {
     pub fn new(skills: Arc<dyn SkillStorage>, config: state::WebConfig) -> Self {
         let persistence = persistence::RunPersistence::new(&config.project_root);
         let hb = heartbeat::HeartBeat::load();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         Self {
             runs: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             skills,
             config,
             persistence,
             heartbeat: Arc::new(tokio::sync::Mutex::new(hb)),
+            shutdown_tx,
+            shutdown_rx,
         }
     }
 

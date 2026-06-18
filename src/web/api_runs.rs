@@ -345,33 +345,17 @@ pub async fn create_branch(
 
 // --- Run driver ---
 
-/// Spawn the next heartbeat run immediately.
-fn spawn_heartbeat_continuation(state: Arc<WebState>) {
-    let (prompt, label, do_it) = {
-        let rt = tokio::runtime::Handle::current();
-        let hb_guard = rt.block_on(state.heartbeat.lock());
-        match &*hb_guard {
-            Some(hb) if hb.active && hb.current_run_id.is_none() =>
-                (hb.prompt.clone(), format!("🫀 Round {}/{}", hb.completed_rounds + 1, hb.max_rounds), true),
-            _ => (String::new(), String::new(), false),
-        }
-    };
-    if !do_it { return; }
-    info!("heartbeat: spawning next run immediately");
-    let root = state.config.project_root.display().to_string();
-    let full_prompt = format!("You are working in the project at: {root}\n\n{prompt}");
-    let id = uuid::Uuid::new_v4().to_string();
-    let session = Arc::new(RunSession::new(id.clone(), label));
+/// Trigger graceful shutdown so the external launcher (loop.ps1) restarts
+/// us with the latest binary. Saves the heartbeat state first.
+fn heartbeat_trigger_shutdown(state: &Arc<WebState>) {
     let rt = tokio::runtime::Handle::current();
-    rt.block_on(state.runs.write()).insert(id.clone(), session.clone());
-    {
-        let mut hb_guard = rt.block_on(state.heartbeat.lock());
-        if let Some(ref mut hb) = *hb_guard {
-            hb.current_run_id = Some(id.clone()); hb.save();
-        }
-    }
-    let initial = vec![InitialMessage { role: "user".into(), content: full_prompt }];
-    tokio::spawn(async move { drive_run(state, id, None, Some(initial)).await; });
+    let hb_active = {
+        let hb_guard = rt.block_on(state.heartbeat.lock());
+        hb_guard.as_ref().map(|hb| hb.active).unwrap_or(false)
+    };
+    if !hb_active { return; }
+    info!("heartbeat: round complete — triggering graceful shutdown for restart");
+    let _ = state.shutdown_tx.send(true);
 }
 
 /// The actual agent loop. Spawned as a tokio task by `create_run`. Maps
@@ -813,7 +797,7 @@ pub async fn drive_run(
                         if hb.active { hb.round_complete() } else { false }
                     } else { false }
                 };
-                if do_spawn { spawn_heartbeat_continuation(state.clone()); }
+                if do_spawn { heartbeat_trigger_shutdown(&state); }
                 return;
             }
             LoopState::Error(msg) => {
@@ -827,7 +811,7 @@ pub async fn drive_run(
                         if hb.active { hb.round_complete() } else { false }
                     } else { false }
                 };
-                if do_spawn { spawn_heartbeat_continuation(state.clone()); }
+                if do_spawn { heartbeat_trigger_shutdown(&state); }
                 return;
             }
             LoopState::TaskFailed { failures } => {
@@ -843,7 +827,7 @@ pub async fn drive_run(
                         if hb.active { hb.round_complete() } else { false }
                     } else { false }
                 };
-                if do_spawn { spawn_heartbeat_continuation(state.clone()); }
+                if do_spawn { heartbeat_trigger_shutdown(&state); }
                 return;
             }
             LoopState::Running => {

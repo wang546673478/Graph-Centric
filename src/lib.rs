@@ -15,9 +15,6 @@
 //! domain trait surface. No model integration yet.
 
 pub mod agent;
-pub mod cascade_demo;
-#[cfg(test)]
-pub mod cascade_demo_test;
 pub mod context;
 pub mod domain;
 pub mod error;
