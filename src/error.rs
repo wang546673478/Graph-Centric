@@ -27,6 +27,9 @@ pub enum HarnessError {
     #[error("model: {0}")]
     Model(String),
 
+    #[error("enricher: {0}")]
+    Enricher(String),
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
@@ -59,5 +62,9 @@ impl HarnessError {
 
     pub fn model(msg: impl Into<String>) -> Self {
         Self::Model(msg.into())
+    }
+
+    pub fn enricher(msg: impl Into<String>) -> Self {
+        Self::Enricher(msg.into())
     }
 }
