@@ -146,16 +146,18 @@ async function save() {
   if (!keyDirty.value) {
     config.value.model.api_key_masked = origKey.value
   }
-  // Sync current model to the active profile so they stay consistent.
+  // Sync current model to the active profile.
   const ap = config.value.active_profile
   if (ap && profiles.value[ap]) {
     profiles.value[ap] = { ...config.value.model }
     config.value.profiles = { ...profiles.value }
   }
   try {
-    config.value = await api.post('/api/config', config.value)
-    origKey.value = config.value.model?.api_key_masked || ''
-    profiles.value = config.value.profiles || {}
+    const resp = await api.post('/api/config', config.value)
+    // Update in-place to avoid reactivity issues with the dropdown.
+    Object.assign(config.value, resp)
+    origKey.value = resp.model?.api_key_masked || ''
+    profiles.value = resp.profiles || {}
     keyDirty.value = false
     saved.value = true; setTimeout(() => saved.value = false, 2000)
   } catch (e) { alert(String(e)) }
