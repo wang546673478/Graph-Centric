@@ -97,14 +97,9 @@ pub struct LoopTuningConfig {
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
     pub fn load() -> Self {
-        // Try project-relative path first, then cwd-relative.
-        let candidates = [
-            std::path::PathBuf::from(".graph_harness_config.json"),
-            std::env::current_dir().unwrap_or_default().join(".graph_harness_config.json"),
-        ];
-        let path = candidates.iter().find(|p| p.exists());
-        if let Some(path) = path {
-            if let Ok(json) = std::fs::read_to_string(path) {
+        let path = std::path::PathBuf::from(".graph_harness_config.json");
+        if path.exists() {
+            if let Ok(json) = std::fs::read_to_string(&path) {
                 if let Ok(cfg) = serde_json::from_str(&json) {
                     return cfg;
                 }
@@ -145,9 +140,8 @@ impl EngineConfig {
     /// Persist config to disk.
     pub fn save(&self) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        // Write to cwd so the next load() finds it regardless of how the server was started.
-        let path = std::env::current_dir()?.join(".graph_harness_config.json");
-        std::fs::write(&path, json)
+        // Always write to the project-relative path (same as load's first candidate).
+        std::fs::write(".graph_harness_config.json", json)
     }
 }
 
