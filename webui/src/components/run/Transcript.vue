@@ -68,7 +68,7 @@ function roleLabel(r: string): string {
 .msg.detail { font-size: 0.75rem; }
 .msg.detail .body { color: var(--warning); }
 .role-tag { font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); margin-bottom: 2px; display: block; }
-.body { white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; margin: 0; font-family: var(--font); }
+.body { white-space: pre-wrap; word-break: break-word; font-size: 0.85rem; line-height: 1.6; margin: 0; font-family: var(--font); }
 .thinking { padding: 8px; color: var(--text-muted); font-size: 0.8rem; font-style: italic; }
 .thinking-msg { background: #fef3c7; border: 1px solid #fcd34d; border-radius: 6px; }
 .thinking-toggle { cursor: pointer; padding: 4px 8px; font-size: 0.72rem; color: #92400e; user-select: none; }
