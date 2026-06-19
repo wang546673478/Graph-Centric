@@ -644,6 +644,12 @@ pub struct GraphLoop {
     /// Whether the convergence hint has already been injected for the
     /// current stable streak (so we hint once, not every round).
     convergence_hint_sent: bool,
+    /// Gap (Seeding stall): consecutive rounds spent in the Seeding phase
+    /// with an empty graph while the model chose a non-patch step (e.g.
+    /// explore). The first action on any task must be the deterministic
+    /// "draw Start+Goal" patch; if the model keeps exploring instead, we
+    /// hint, then auto-seed so the loop can never stall at 0 nodes.
+    seeding_rounds_without_patch: u32,
 
     phase: Phase,
     pending: Pending,
@@ -805,6 +811,7 @@ impl GraphLoop {
             filling_rounds_without_nodes: 0,
             convergence_stable_count: 0,
             convergence_hint_sent: false,
+            seeding_rounds_without_patch: 0,
             last_verification: None,
             task_outcome: None,
             review_result: None,
@@ -1079,6 +1086,44 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
 
     async fn step_graph(&mut self) -> Result<LoopState> {
+        // ── Seeding guard: the first action must draw Start+Goal ──
+        // The graph-centric design mandates that the first step on a task
+        // is the deterministic 2-node Start→Goal seed, NOT exploration.
+        // We count rounds spent in Seeding with an empty graph regardless
+        // of what the proposer returns (explore, malformed-then-salvaged
+        // ask_user, etc.) — that's the exact failure that produced
+        // "graph stagnated … 0 nodes, 0 edges" over 8 rounds. After
+        // `seeding_stall_limit` such rounds, auto-seed so the loop can
+        // never stall at 0 nodes. The first round injects a strong hint
+        // and lets the model seed itself.
+        const SEEDING_STALL_LIMIT: u32 = 3;
+        if self.graph_phase == GraphPhase::Seeding && self.graph.node_count() == 0 {
+            self.seeding_rounds_without_patch += 1;
+            if self.seeding_rounds_without_patch >= SEEDING_STALL_LIMIT {
+                warn!(
+                    rounds = self.seeding_rounds_without_patch,
+                    "Seeding stalled — auto-seeding Start+Goal so the loop can proceed"
+                );
+                self.auto_seed_start_goal();
+                self.conversation.add_user(
+                    "I auto-created the Start (A) and Goal (D) nodes because the first \
+                     step on any task must be the 2-node Start→Goal seed, not endless \
+                     exploration. The graph is now in the Filling phase — explore if you \
+                     must, then `propose_patch` intermediate nodes between A and D.",
+                );
+                self.graph_phase = GraphPhase::Filling;
+                self.seeding_rounds_without_patch = 0;
+                return Ok(LoopState::Running);
+            }
+            if self.seeding_rounds_without_patch == 1 {
+                self.conversation.add_user(
+                    "⚠️ Your first action must be a `propose_patch` that creates exactly \
+                     two nodes — Start (current state) and Goal (desired outcome) — joined \
+                     by one DependsOn edge. Do NOT explore yet. Emit that seed patch now.",
+                );
+            }
+        }
+
         let (step, tokens) = self
             .proposer
             .next_step_with_retry(&self.conversation, &self.graph, self.last_step.as_ref())
@@ -2161,6 +2206,28 @@ impl GraphLoop {
              Current graph:\n{node_info}",
             node_info = node_info.join("\n")
         )
+    }
+
+    /// Seeding stall: deterministically create the two-node Start(A)→Goal(D)
+    /// seed when the model refuses to. A is the immutable anchor (the
+    /// starting state); D is the goal. One DependsOn edge D→A wires the
+    /// minimal plan, matching the seed the Proposer would have produced.
+    /// Guarantees the loop always leaves the empty-graph state.
+    fn auto_seed_start_goal(&mut self) {
+        use crate::graph::{Edge, Node, NodeId, NodeKind, RelationType};
+        let mut anchor =
+            Node::new("A", NodeKind::Task, "A", "Start: current state / the task to accomplish");
+        anchor.immutable = true;
+        let goal = Node::new("D", NodeKind::Task, "D", "Goal: the task completed successfully");
+        self.graph.add_node(anchor);
+        self.graph.add_node(goal);
+        let _ = self.graph.add_edge(Edge::new(
+            NodeId::from("D"),
+            NodeId::from("A"),
+            RelationType::DependsOn,
+            0.9,
+            "goal depends on start",
+        ));
     }
 
     /// Gap 1: build the explore items for a forced research subagent when
@@ -4061,6 +4128,40 @@ mod tests {
 
     // Silence the unused `NodeKind` import — it's there for parity with the
     // module's intent even if not used in tests.
+    #[test]
+    fn auto_seed_creates_start_goal_with_anchor_and_edge() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        assert_eq!(gl.graph.node_count(), 0);
+        gl.auto_seed_start_goal();
+        assert_eq!(gl.graph.node_count(), 2);
+        assert_eq!(gl.graph.edge_count(), 1);
+        let anchor = gl
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.immutable)
+            .expect("anchor must exist");
+        assert_eq!(anchor.id.as_str(), "A");
+        // Goal D must reach A via the DependsOn edge.
+        assert!(gl.path_exists(&crate::graph::NodeId::from("D"), &crate::graph::NodeId::from("A")));
+    }
+
+    #[tokio::test]
+    async fn seeding_stall_auto_seeds_after_repeated_explore() {
+        // Model always emits an explore step (never a seed patch).
+        let explore = r#"{"step":"explore","items":[{"scope":"x","question":"y"}],"rationale":"r"}"#;
+        let mut gl = build_loop_with(vec![explore, explore, explore, explore]);
+        assert_eq!(gl.graph_phase, GraphPhase::Seeding);
+        // Rounds 1 & 2: still Seeding, empty graph, hint injected.
+        let _ = gl.step_graph().await.unwrap();
+        let _ = gl.step_graph().await.unwrap();
+        assert_eq!(gl.graph.node_count(), 0, "no seed yet before the limit");
+        // Round 3: guard hits SEEDING_STALL_LIMIT → auto-seed fires.
+        let _ = gl.step_graph().await.unwrap();
+        assert_eq!(gl.graph.node_count(), 2, "auto-seed must create Start+Goal");
+        assert_eq!(gl.graph_phase, GraphPhase::Filling, "must advance past Seeding");
+    }
+
     #[allow(dead_code)]
     fn _silence_unused(_k: NodeKind) {}
 
