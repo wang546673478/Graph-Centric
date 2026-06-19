@@ -123,6 +123,16 @@ pub struct LoopTuningConfig {
     // Event channel capacity
     #[serde(default = "default_event_channel_capacity")]
     pub event_channel_capacity: usize,
+
+    // Self-optimization laws (graph-centric design gaps)
+    /// Gap 1: force an explore subagent after this many Filling rounds
+    /// without new nodes. 0 disables.
+    #[serde(default = "default_force_search_after_filling_stall")]
+    pub force_search_after_filling_stall: u32,
+    /// Gap 3: rounds of stable+connected+enriched graph before injecting
+    /// the "emit ready_for_verify" convergence hint. 0 disables.
+    #[serde(default = "default_convergence_stable_rounds")]
+    pub convergence_stable_rounds: u32,
 }
 
 fn default_true() -> bool {
@@ -138,6 +148,8 @@ fn default_stuck_terminate() -> u32 { 6 }
 fn default_tool_failure_warn() -> u32 { 3 }
 fn default_tool_failure_halt() -> u32 { 8 }
 fn default_event_channel_capacity() -> usize { 256 }
+fn default_force_search_after_filling_stall() -> u32 { 5 }
+fn default_convergence_stable_rounds() -> u32 { 3 }
 
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
@@ -228,6 +240,8 @@ impl Default for EngineConfig {
                 tool_failure_warn_after: 3,
                 tool_failure_halt_after: 8,
                 event_channel_capacity: 256,
+                force_search_after_filling_stall: 5,
+                convergence_stable_rounds: 3,
             },
         }
     }

@@ -569,6 +569,8 @@ pub async fn drive_run(
         stuck_terminate: state.config.engine.loop_tuning.stuck_terminate,
         tool_failure_warn_after: state.config.engine.loop_tuning.tool_failure_warn_after,
         tool_failure_halt_after: state.config.engine.loop_tuning.tool_failure_halt_after,
+        force_search_after_filling_stall: state.config.engine.loop_tuning.force_search_after_filling_stall,
+        convergence_stable_rounds: state.config.engine.loop_tuning.convergence_stable_rounds,
         is_heartbeat: is_heartbeat_active,
         graph_schema: if is_heartbeat_active {
             Some(crate::agent::graph_loop::GraphSchema {

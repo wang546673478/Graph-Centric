@@ -480,6 +480,19 @@ pub struct GraphLoopConfig {
     // Tool failure thresholds
     pub tool_failure_warn_after: u32,
     pub tool_failure_halt_after: u32,
+
+    // ── Self-optimization laws (graph-centric design gaps) ──
+    /// Gap 1: in Filling phase, after this many consecutive rounds without
+    /// adding a new node, the orchestrator force-dispatches an `explore`
+    /// subagent (web search + file reading) instead of waiting for the
+    /// model to volunteer one. 0 disables forced search.
+    pub force_search_after_filling_stall: u32,
+    /// Gap 3: how many consecutive rounds the graph must be both
+    /// structurally stable AND fully connected (anchor↔goal) AND fully
+    /// L1-enriched before the orchestrator injects a strong "you should
+    /// emit ready_for_verify now" hint. The hint never auto-emits — the
+    /// model keeps final say. 0 disables convergence hinting.
+    pub convergence_stable_rounds: u32,
 }
 
 impl GraphLoopConfig {
@@ -501,6 +514,8 @@ impl GraphLoopConfig {
             stuck_terminate: 6,
             tool_failure_warn_after: 3,
             tool_failure_halt_after: 8,
+            force_search_after_filling_stall: 5,
+            convergence_stable_rounds: 3,
         }
     }
 }
@@ -619,6 +634,16 @@ pub struct GraphLoop {
     /// adding new nodes. After 3 rounds, auto-inject a suggested
     /// intermediate node to break the research-only loop.
     filling_rounds_without_nodes: u32,
+    /// Gap 3 (convergence): consecutive rounds where the graph was
+    /// structurally stable AND anchor↔goal connected AND fully L1
+    /// enriched. When this reaches `convergence_stable_rounds`, the
+    /// orchestrator injects a one-shot strong hint nudging the model to
+    /// emit `ready_for_verify`. Reset whenever any of those conditions
+    /// breaks, or after the hint fires.
+    convergence_stable_count: u32,
+    /// Whether the convergence hint has already been injected for the
+    /// current stable streak (so we hint once, not every round).
+    convergence_hint_sent: bool,
 
     phase: Phase,
     pending: Pending,
@@ -778,6 +803,8 @@ impl GraphLoop {
             round: 0,
             graph_phase: GraphPhase::Seeding,
             filling_rounds_without_nodes: 0,
+            convergence_stable_count: 0,
+            convergence_hint_sent: false,
             last_verification: None,
             task_outcome: None,
             review_result: None,
@@ -1035,6 +1062,13 @@ impl GraphLoop {
             if let Some(stuck) = self.check_graph_stagnation().await {
                 return stuck;
             }
+            // Gap 3: convergence hint. When the graph is structurally
+            // stable, anchor↔goal connected, and fully L1-enriched for
+            // several rounds, nudge the model to emit ready_for_verify.
+            // This is the soft convergence signal that replaces the
+            // removed hard caps — it never auto-emits (per user choice),
+            // only strongly hints; the model keeps final say.
+            self.check_convergence_hint();
         }
 
         state
@@ -1061,11 +1095,41 @@ impl GraphLoop {
         self.last_step = Some(step.clone());
 
         // ── Orchestration: track Filling rounds without new nodes ──
+        // Gap 1: when the model spins in Filling without adding nodes, it
+        // usually means it doesn't know what intermediate steps to insert.
+        // First (3 rounds) we inject a textual hint; if it still hasn't
+        // added a node by `force_search_after_filling_stall`, we stop
+        // waiting and force-dispatch an explore subagent (web search +
+        // file reading) to gather the missing information. This turns
+        // "don't know how to fill" from a soft suggestion into a
+        // deterministic action. Applies to all runs, not just heartbeat.
         let is_patch_step = matches!(step, ProposerStep::ProposePatch { .. });
-        if self.config.is_heartbeat && self.graph_phase == GraphPhase::Filling && !is_patch_step {
+        let is_explore_step = matches!(step, ProposerStep::Explore { .. });
+        if self.graph_phase == GraphPhase::Filling && !is_patch_step && !is_explore_step {
             self.filling_rounds_without_nodes += 1;
-            if self.filling_rounds_without_nodes >= 3 {
-                self.filling_rounds_without_nodes = 0; // reset
+
+            let force_at = self.config.force_search_after_filling_stall;
+            if force_at > 0 && self.filling_rounds_without_nodes >= force_at {
+                // Escalation: force a web-search + file explore. Reset the
+                // counter and dispatch directly, bypassing the model's
+                // chosen step for this round.
+                self.filling_rounds_without_nodes = 0;
+                warn!(
+                    rounds = force_at,
+                    "Filling stalled — force-dispatching explore (web search + files)"
+                );
+                self.conversation.add_user(
+                    "You've spent several rounds without adding an intermediate node. \
+                     I'm dispatching a research subagent (web search + file reading) to \
+                     gather the information needed to fill the gap between Start and Goal. \
+                     Use its findings to propose the next intermediate node."
+                );
+                let items = self.build_forced_search_items();
+                return self.dispatch_explore_subagents(items).await;
+            }
+
+            // Soft hint at 3 rounds (existing behavior, now run-agnostic).
+            if self.filling_rounds_without_nodes == 3 {
                 let hint = self.build_filling_hint();
                 self.conversation.add_user(hint);
             }
@@ -2031,7 +2095,29 @@ impl GraphLoop {
             }
         }
 
-        // All errors processed. Re-enter Graph phase for re-verification.
+        // All errors processed. Gap 2: re-walk the whole graph from the
+        // layer-1 Start before re-verifying. Any node whose dependency
+        // chain no longer reaches the anchor is a structural break left by
+        // the re-plan — surface it so the next Graph round re-wires (or
+        // re-plans) the upstream that broke the path.
+        let orphaned = self.replay_from_anchor();
+        if !orphaned.is_empty() {
+            let ids = orphaned
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            warn!(orphaned = %ids, "replay-from-anchor found structural breaks");
+            self.conversation.add_user(format!(
+                "REPLAY FROM START: after re-planning, these node(s) no longer have a \
+                 dependency path back to the Start anchor: {ids}. That means an upstream \
+                 step that fed them was changed or removed. Re-wire them to the correct \
+                 (possibly re-planned) upstream node, or re-plan that upstream node, then \
+                 walk the whole graph again from Start. Do not leave orphaned nodes."
+            ));
+        }
+
+        // Re-enter Graph phase for re-verification.
         self.phase = Phase::Graph;
         LoopState::Running
     }
@@ -2075,6 +2161,40 @@ impl GraphLoop {
              Current graph:\n{node_info}",
             node_info = node_info.join("\n")
         )
+    }
+
+    /// Gap 1: build the explore items for a forced research subagent when
+    /// Filling has stalled. Produces two parallel scopes — a web search
+    /// for general "how to" knowledge and a local file/codebase scan — so
+    /// the model can fill intermediate nodes whether the gap is a
+    /// knowledge gap or a code-discovery gap. The questions are derived
+    /// from the task description and the current Start→Goal summaries.
+    fn build_forced_search_items(&self) -> Vec<ExploreItem> {
+        let goal_summary = self
+            .graph
+            .nodes
+            .get(&NodeId::from("D"))
+            .map(|n| n.summary.clone())
+            .unwrap_or_else(|| self.task.clone());
+        let task = self.task.clone();
+        vec![
+            ExploreItem {
+                scope: "web".into(),
+                question: format!(
+                    "Search the web for how to accomplish this task and what the \
+                     intermediate steps are: {task}. Target outcome: {goal_summary}. \
+                     Return a concise ordered list of concrete steps."
+                ),
+            },
+            ExploreItem {
+                scope: "codebase".into(),
+                question: format!(
+                    "Read the relevant files in the project to identify the concrete \
+                     steps needed between the current state and: {goal_summary}. \
+                     Report which files/functions must change and in what order."
+                ),
+            },
+        ]
     }
 
     /// whole point of the subagent: keep the main context
@@ -2587,6 +2707,147 @@ impl GraphLoop {
             self.graph_stagnation_count = 0;
         }
         None
+    }
+
+    /// Gap 3: convergence detector (soft signal, hint-only).
+    ///
+    /// Three conditions define a "converged-looking" graph:
+    ///   1. anchor (immutable) ↔ goal are connected (a directed path
+    ///      exists between them via the edge graph, in either direction);
+    ///   2. the graph fingerprint has been stable for this round (we piggy
+    ///      back on `graph_stagnation_count`, which counts unchanged rounds);
+    ///   3. every node has an L1 description (fully enriched).
+    ///
+    /// When all three hold for `convergence_stable_rounds` consecutive
+    /// rounds, inject a single strong hint telling the model it should now
+    /// emit `ready_for_verify`. We never emit it ourselves — the model
+    /// keeps final say (user's explicit choice). The hint fires once per
+    /// stable streak; any break in the conditions resets the streak.
+    fn check_convergence_hint(&mut self) {
+        let threshold = self.config.convergence_stable_rounds;
+        if threshold == 0 {
+            return; // disabled
+        }
+        // Only meaningful once we're past Seeding (a 2-node graph is
+        // trivially "connected" but not actually a plan).
+        if self.graph_phase == GraphPhase::Seeding || self.graph.node_count() < 3 {
+            self.convergence_stable_count = 0;
+            self.convergence_hint_sent = false;
+            return;
+        }
+
+        let connected = self.anchor_goal_connected();
+        let stable = self.graph_stagnation_count >= 1;
+        let fully_enriched = self
+            .graph
+            .nodes
+            .keys()
+            .all(|id| self.graph.l1.contains(id));
+
+        if connected && stable && fully_enriched {
+            self.convergence_stable_count += 1;
+            if self.convergence_stable_count >= threshold && !self.convergence_hint_sent {
+                self.convergence_hint_sent = true;
+                info!(
+                    nodes = self.graph.node_count(),
+                    edges = self.graph.edge_count(),
+                    "convergence detected — injecting ready_for_verify hint"
+                );
+                self.conversation.add_user(
+                    "✅ CONVERGENCE: the graph is structurally stable, the goal is \
+                     connected back to the start, and every node has an L1 description. \
+                     The plan looks complete. If you agree it satisfies the task, emit \
+                     `ready_for_verify` now to hand off to verification. If something is \
+                     still missing, add the missing node(s) instead — do not spin in place."
+                );
+            }
+        } else {
+            // Conditions broke — reset the streak so the hint can fire
+            // again on the next genuine convergence.
+            self.convergence_stable_count = 0;
+            self.convergence_hint_sent = false;
+        }
+    }
+
+    /// True if there is a directed path between the immutable anchor and
+    /// the goal node (in either direction — the seed wires Goal→Start via
+    /// DependsOn, but intermediate edges may run either way). Returns false
+    /// when either endpoint is missing.
+    fn anchor_goal_connected(&self) -> bool {
+        let anchor = self
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.immutable)
+            .map(|n| n.id.clone());
+        // Goal: prefer the conventional "D" id, else any non-immutable
+        // sink the seed produced.
+        let goal = if self.graph.nodes.contains_key(&NodeId::from("D")) {
+            Some(NodeId::from("D"))
+        } else {
+            self.graph
+                .nodes
+                .values()
+                .find(|n| !n.immutable)
+                .map(|n| n.id.clone())
+        };
+        let (Some(a), Some(d)) = (anchor, goal) else {
+            return false;
+        };
+        if a == d {
+            return false;
+        }
+        self.path_exists(&d, &a) || self.path_exists(&a, &d)
+    }
+
+    /// Directed reachability: is `to` reachable from `from` following
+    /// outgoing edges? Plain BFS over the edge list.
+    fn path_exists(&self, from: &NodeId, to: &NodeId) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(from.clone());
+        seen.insert(from.clone());
+        while let Some(cur) = queue.pop_front() {
+            for edge in self.graph.outgoing(&cur) {
+                if &edge.target == to {
+                    return true;
+                }
+                if seen.insert(edge.target.clone()) {
+                    queue.push_back(edge.target.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Gap 2: re-walk the whole graph from the layer-1 Start (the
+    /// immutable anchor) and report any node whose dependency chain no
+    /// longer reaches the anchor — i.e. a structural break introduced when
+    /// an upstream node was re-planned or removed. This is the
+    /// deterministic counterpart to the (semantic, model-driven)
+    /// CascadeBacktracker: after a node is redesigned, the cascade checks
+    /// whether each *direct* predecessor still fits, while this replay
+    /// checks the *global* property the user described — "start from the
+    /// first-layer Start and walk the whole graph; wherever the path back
+    /// to Start is broken, that node's upstream needs re-planning."
+    ///
+    /// Returns the ids of orphaned non-anchor nodes, in stable order.
+    /// Empty result means the graph is fully wired back to Start.
+    fn replay_from_anchor(&self) -> Vec<NodeId> {
+        let anchor = match self.graph.nodes.values().find(|n| n.immutable) {
+            Some(a) => a.id.clone(),
+            None => return Vec::new(), // no anchor yet; nothing to replay
+        };
+        let mut orphaned: Vec<NodeId> = self
+            .graph
+            .nodes
+            .values()
+            .filter(|n| !n.immutable && n.id != anchor)
+            .filter(|n| !self.path_exists(&n.id, &anchor))
+            .map(|n| n.id.clone())
+            .collect();
+        orphaned.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        orphaned
     }
 }
 
@@ -3802,4 +4063,128 @@ mod tests {
     // module's intent even if not used in tests.
     #[allow(dead_code)]
     fn _silence_unused(_k: NodeKind) {}
+
+    // ── Self-optimization laws: helpers ──
+
+    /// Build an A→…→D chain graph: anchor A (immutable), goal D, plus
+    /// intermediate task nodes. DependsOn edges run successor→predecessor
+    /// (D depends on the last middle, …, first middle depends on A).
+    fn build_chain_graph(gl: &mut GraphLoop, middles: &[&str], enrich_all: bool) {
+        use crate::graph::{Edge, L1Description, Node, NodeId, RelationType};
+        let mut anchor = Node::task("A", "Start");
+        anchor.immutable = true;
+        gl.graph.add_node(anchor);
+        gl.graph.add_node(Node::task("D", "Goal"));
+        for m in middles {
+            gl.graph.add_node(Node::task(*m, *m));
+        }
+        // Chain: D -> last middle -> ... -> first middle -> A
+        let mut chain: Vec<&str> = Vec::new();
+        chain.push("D");
+        chain.extend(middles.iter().rev());
+        chain.push("A");
+        for pair in chain.windows(2) {
+            gl.graph
+                .add_edge(Edge::new(
+                    NodeId::from(pair[0]),
+                    NodeId::from(pair[1]),
+                    RelationType::DependsOn,
+                    0.9,
+                    "",
+                ))
+                .unwrap();
+        }
+        if enrich_all {
+            let ids: Vec<NodeId> = gl.graph.nodes.keys().cloned().collect();
+            for id in ids {
+                gl.graph
+                    .l1
+                    .set(id, L1Description::new("r", "i", "d", "c"));
+            }
+        }
+    }
+
+    #[test]
+    fn anchor_goal_connected_true_for_wired_chain() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        build_chain_graph(&mut gl, &["B", "C"], false);
+        assert!(gl.anchor_goal_connected());
+    }
+
+    #[test]
+    fn anchor_goal_connected_false_when_path_broken() {
+        use crate::graph::Node;
+        let mut gl = build_loop_with(vec!["{}"]);
+        let mut anchor = Node::task("A", "Start");
+        anchor.immutable = true;
+        gl.graph.add_node(anchor);
+        gl.graph.add_node(Node::task("D", "Goal"));
+        gl.graph.add_node(Node::task("B", "B"));
+        // No edges at all → D cannot reach A.
+        assert!(!gl.anchor_goal_connected());
+    }
+
+    #[test]
+    fn replay_from_anchor_flags_orphan_node() {
+        use crate::graph::Node;
+        let mut gl = build_loop_with(vec!["{}"]);
+        build_chain_graph(&mut gl, &["B"], false);
+        // Add an orphan node with no path back to A.
+        gl.graph.add_node(Node::task("ORPHAN", "dangling"));
+        let orphans = gl.replay_from_anchor();
+        assert_eq!(orphans, vec![crate::graph::NodeId::from("ORPHAN")]);
+    }
+
+    #[test]
+    fn replay_from_anchor_empty_when_fully_wired() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        build_chain_graph(&mut gl, &["B", "C"], false);
+        assert!(gl.replay_from_anchor().is_empty());
+    }
+
+    #[test]
+    fn convergence_hint_fires_once_after_stable_rounds() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        gl.config.convergence_stable_rounds = 3;
+        gl.graph_phase = GraphPhase::Filling;
+        build_chain_graph(&mut gl, &["B", "C"], true);
+        // Simulate a stable graph: stagnation_count >= 1 each round.
+        gl.graph_stagnation_count = 5;
+        for _ in 0..3 {
+            gl.check_convergence_hint();
+        }
+        assert!(gl.convergence_hint_sent, "hint should have fired");
+        // The hint contains the marker "CONVERGENCE" and must appear
+        // exactly once across the 3 rounds (fire-once semantics).
+        let occurrences = gl.conversation.transcript().matches("CONVERGENCE").count();
+        assert_eq!(occurrences, 1, "convergence hint must fire exactly once");
+    }
+
+    #[test]
+    fn convergence_hint_resets_when_node_not_enriched() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        gl.config.convergence_stable_rounds = 2;
+        gl.graph_phase = GraphPhase::Filling;
+        // enrich_all = false → at least one node lacks L1.
+        build_chain_graph(&mut gl, &["B", "C"], false);
+        gl.graph_stagnation_count = 5;
+        for _ in 0..5 {
+            gl.check_convergence_hint();
+        }
+        assert!(!gl.convergence_hint_sent, "must not fire while un-enriched");
+        assert_eq!(gl.convergence_stable_count, 0);
+    }
+
+    #[test]
+    fn convergence_disabled_when_threshold_zero() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        gl.config.convergence_stable_rounds = 0;
+        gl.graph_phase = GraphPhase::Filling;
+        build_chain_graph(&mut gl, &["B", "C"], true);
+        gl.graph_stagnation_count = 5;
+        for _ in 0..5 {
+            gl.check_convergence_hint();
+        }
+        assert!(!gl.convergence_hint_sent);
+    }
 }
