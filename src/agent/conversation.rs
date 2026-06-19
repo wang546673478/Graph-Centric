@@ -86,8 +86,10 @@ impl Conversation {
             )),
             Message::user(format!("Task: {}", self.task_description)),
         ];
-        // Include last 8 conversation messages so model sees recent results.
-        let recent = &self.messages[self.messages.len().saturating_sub(8)..];
+        // Include the last 8 conversation messages after the pinned task
+        // message. The task already appears as a fresh header above.
+        let history: Vec<_> = self.messages.iter().skip(1).cloned().collect();
+        let recent = &history[history.len().saturating_sub(8)..];
         for m in recent {
             messages.push(m.clone());
         }

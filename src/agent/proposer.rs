@@ -233,7 +233,7 @@ impl GraphProposer {
         if defs.is_empty() {
             tools_section.push_str(
                 "(no direct tools available to you — your only execution path is the `explore` step, \
-                 which dispatches a subagent that has the actual tools)\n",
+                 which dispatches a subagent that has the actual tools. If you emit `call_tool` it will fail.)\n",
             );
         } else {
             for def in &defs {
@@ -248,11 +248,12 @@ impl GraphProposer {
 
         // Load prompts from files if available, fall back to hardcoded.
         let preamble = load_prompt_file("skills/prompts/proposer-preamble.md", PROMPT_PREAMBLE);
+        let iron_laws = load_prompt_file("skills/prompts/graph-centric-iron-laws.md", PROMPT_IRON_LAWS);
         let intake = load_prompt_file("skills/prompts/proposer-intake.md", PROMPT_INTAKE);
         let rules = load_prompt_file("skills/prompts/proposer-rules.md", PROMPT_RULES);
 
         let mut prompt = format!(
-            "{preamble}\n\n{intake}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{rules}"
+            "{preamble}\n\n{iron_laws}\n\n{intake}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}\n{rules}"
         );
 
         // Append the skills section if a storage is attached.
@@ -302,7 +303,7 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
     /// Build a system prompt with heartbeat context. Sets `is_heartbeat: true`
     /// so the PromptRegistry injects the autonomous-mode block.
     pub fn build_system_prompt_heartbeat(&self, task: &str) -> String {
-        let mut prompt = self.build_system_prompt(task);
+        let prompt = self.build_system_prompt(task);
         // Append heartbeat-specific override: no questions, direct execution.
         if let Some(pr) = &self.prompt_registry {
             let ctx = crate::skills::prompt_registry::PromptContext {
@@ -319,7 +320,7 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
                 matched_skills: String::new(),
                 ..Default::default()
             };
-            let hb_block = pr.compose(&[], &ctx);
+            let _hb_block = pr.compose(&[], &ctx);
             // Replace the default (non-heartbeat) dynamic section with the
             // heartbeat-aware version.
             // Rebuild the whole prompt cleanly.
@@ -339,7 +340,7 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
         if defs.is_empty() {
             tools_section.push_str(
                 "(no direct tools available to you — your only execution path is the `explore` step, \
-                 which dispatches a subagent that has the actual tools)\n",
+                 which dispatches a subagent that has the actual tools. If you emit `call_tool` it will fail.)\n",
             );
         } else {
             for def in &defs {
@@ -351,8 +352,13 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
             }
         }
 
+        let preamble = load_prompt_file("skills/prompts/proposer-preamble.md", PROMPT_PREAMBLE);
+        let iron_laws = load_prompt_file("skills/prompts/graph-centric-iron-laws.md", PROMPT_IRON_LAWS);
+        let intake = load_prompt_file("skills/prompts/proposer-intake.md", PROMPT_INTAKE);
+        let rules = load_prompt_file("skills/prompts/proposer-rules.md", PROMPT_RULES);
+
         let mut prompt = format!(
-            "{PROMPT_PREAMBLE}\n\n{PROMPT_INTAKE}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}"
+            "{preamble}\n\n{iron_laws}\n\n{intake}\n\n## Task\n{task}\n\n## Available Tools\n{tools_section}"
         );
 
         // Dynamic blocks from PromptRegistry (before PROMPT_RULES).
@@ -365,7 +371,7 @@ re-plan them, or supplement them with additional nodes from the Decomposer.");
         }
 
         prompt.push_str("\n");
-        prompt.push_str(PROMPT_RULES);
+        prompt.push_str(&rules);
 
         // Skills section.
         if let Some(skills) = &self.skills {
@@ -983,7 +989,7 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
             Ok(ProposerStep::Explore { items, rationale })
         }
         "ask_user" => {
-            let mut question = tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let question = tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
             // Extract structured options from tool_calls.
             let options: Vec<String> = tc
                 .arguments
@@ -1219,7 +1225,11 @@ fn parse_patch(v: &serde_json::Value) -> Result<GraphPatch> {
             patch.add_edges.push(parse_edge(e)?);
         }
     }
-    if let Some(arr) = obj.get("remove_node_ids").and_then(|v| v.as_array()) {
+    if let Some(arr) = obj
+        .get("remove_node_ids")
+        .or_else(|| obj.get("remove_nodes"))
+        .and_then(|v| v.as_array())
+    {
         for id in arr {
             if let Some(s) = id.as_str() {
                 patch.remove_node_ids.push(NodeId::from(s));
@@ -1250,6 +1260,14 @@ fn parse_node(v: &serde_json::Value) -> Result<Node> {
         .unwrap_or("")
         .to_string();
     let mut node = Node::new(id, kind, path, summary);
+    node.immutable = v
+        .get("immutable")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    node.expanded = v
+        .get("expanded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if let Some(meta) = v.get("metadata").and_then(|v| v.as_object()) {
         for (k, val) in meta {
             node = node.with_metadata(k, val.clone());
@@ -1384,6 +1402,21 @@ the graph is complete when the DependsOn chain from A to D is fully filled.";
 /// first interpretation has no recovery path inside a 24-round Graph
 /// phase, so the cost of asking one targeted question is much lower
 /// than the cost of guessing wrong.
+const PROMPT_IRON_LAWS: &str = r#"## Graph-Centric Iron Laws
+
+These laws override local convenience and model habits:
+
+1. The relationship graph is the task's authoritative state. Do not rely on transcript memory when the graph should carry the fact.
+2. The first graph for a fresh task has only A and D: A is the immutable anchor/current state, D is the desired verified result, and D DependsOn A.
+3. Intermediate nodes are filled only after A/D exists. If you know the path, add steps. If you do not know the path, Explore first and convert evidence into graph nodes/edges.
+4. Complex or abstract nodes must be recursively treated as their own A/D problem until they are concrete enough to execute.
+5. Execution follows the graph. Inputs, outputs, evidence, and failures must be reflected in the graph or execution ledger, not just prose.
+6. When a node fails, re-plan that node, then re-verify from the top-level A/D graph.
+7. If the failed node failed because the previous node's output contract is wrong, re-plan the previous dependency and re-verify from the top-level A/D graph.
+8. Try alternatives one at a time. Do not front-load a complete enumeration of every possible plan.
+9. Never remove or rewrite the anchor. If the anchor itself is infeasible, surface that explicitly.
+10. A self-optimization round is complete only when its D is verified by the configured checks."#;
+
 const PROMPT_INTAKE: &str = "## Intake (Mode A vs Mode B)\n\
 \n\
 Your FIRST step in a fresh conversation is intake. Pick one of two \

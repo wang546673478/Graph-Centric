@@ -28,7 +28,6 @@ use crate::error::{HarnessError, Result};
 use crate::graph::{Edge, Graph, Node, NodeId, NodeKind, RelationType};
 use crate::model::{Message, Model, ModelRequest};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Maximum expansion depth (L0 → L1 → L2 → stop).
@@ -144,7 +143,7 @@ async fn expand_recursive(
         "cascade: expanding nodes"
     );
 
-    for (node_id, node_summary) in to_expand {
+    for (node_id, _node_summary) in to_expand {
         // Skip if already expanded (has Contains children).
         let has_children = graph
             .outgoing(&node_id)
@@ -196,11 +195,11 @@ async fn expand_recursive(
                                 RelationType::Contains,
                                 0.9,
                                 format!("expanded from L{depth}"),
-                            ));
+                            ))?;
                         }
                         // Add DependsOn sub-edges.
                         for se in sub_edges {
-                            graph.add_edge(se);
+                            graph.add_edge(se)?;
                         }
                         info!(
                             id = %node_id,

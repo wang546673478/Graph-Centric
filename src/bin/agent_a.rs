@@ -207,6 +207,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         stuck_terminate: 6,
         tool_failure_warn_after: 3,
         tool_failure_halt_after: 8,
+        is_heartbeat: false,
         graph_schema: None,
     };
 

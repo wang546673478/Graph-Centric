@@ -10,7 +10,6 @@
 
 use graph_harness::skills::storage::{LocalSkillStorage, SkillStorage};
 use graph_harness::skills::{CompositeSkillStorage, RepoSkillStorage};
-use graph_harness::web::run_session::RunStatus;
 use graph_harness::web::state::WebConfig;
 use graph_harness::web::WebState;
 use std::net::SocketAddr;
@@ -71,13 +70,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         match runs.get(rid) {
                             Some(s) => {
                                 let status = s.status.read().await.clone();
-                                // If the run is Running but has no checkpoints, it's a zombie.
                                 let cp_count = s.checkpoints.lock().await.len();
-                                let is_zombie = matches!(status, RunStatus::Running) && cp_count == 0;
-                                if is_zombie {
-                                    info!(run_id = %rid, "heartbeat: stale zombie run, replacing");
-                                }
-                                is_zombie || matches!(status, RunStatus::Done | RunStatus::Error(_) | RunStatus::Cancelled)
+                                info!(
+                                    run_id = %rid,
+                                    ?status,
+                                    checkpoints = cp_count,
+                                    "heartbeat: restored run has no live driver after restart; replacing"
+                                );
+                                true
                             }
                             None => true,
                         }
@@ -85,6 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None => true,
                 };
                 if need_new {
+                    if hb.sync_prompt_from_file() {
+                        hb.save();
+                    }
                     info!(round = hb.completed_rounds + 1, "heartbeat: starting new run");
                     let id = uuid::Uuid::new_v4().to_string();
                     let label = format!("🫀 Round {}/10", hb.completed_rounds + 1);

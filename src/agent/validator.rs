@@ -259,6 +259,18 @@ mod tests {
     use crate::agent::subagent::SubAgentResult;
     use crate::graph::NodeId;
 
+    fn failing_command() -> &'static str {
+        "exit 1"
+    }
+
+    fn fail_with_stderr(message: &str) -> String {
+        if cfg!(target_os = "windows") {
+            format!("echo {message} 1>&2 & exit 1")
+        } else {
+            format!("echo '{message}' 1>&2; exit 1")
+        }
+    }
+
     fn empty_outcome() -> DispatchOutcome {
         DispatchOutcome {
             results: vec![SubAgentResult::ok(
@@ -288,7 +300,7 @@ mod tests {
     #[tokio::test]
     async fn bash_validator_passed_on_exit_zero() {
         let v = BashCheckValidator {
-            command: "true".into(),
+            command: "echo ok".into(),
             tool_cwd: std::env::current_dir().unwrap(),
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
@@ -306,7 +318,7 @@ mod tests {
     async fn bash_validator_task_issue_on_nonzero_without_pattern_match() {
         // `false` exits 1 with no output; no patterns match → TaskIssue.
         let v = BashCheckValidator {
-            command: "false".into(),
+            command: failing_command().into(),
             tool_cwd: std::env::current_dir().unwrap(),
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
@@ -331,7 +343,7 @@ mod tests {
         // Emit a fake compiler-style error containing "cannot find function"
         // to stderr, then exit non-zero.
         let v = BashCheckValidator {
-            command: "echo 'error: cannot find function `foo` in this scope' 1>&2; exit 1".into(),
+            command: fail_with_stderr("error: cannot find function foo in this scope"),
             tool_cwd: std::env::current_dir().unwrap(),
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
@@ -369,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn bash_validator_case_insensitive_pattern_match() {
         let v = BashCheckValidator {
-            command: "echo 'ERROR: UNRESOLVED IMPORT foo' 1>&2; exit 1".into(),
+            command: fail_with_stderr("ERROR: UNRESOLVED IMPORT foo"),
             tool_cwd: std::env::current_dir().unwrap(),
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,

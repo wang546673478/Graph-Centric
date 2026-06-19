@@ -36,6 +36,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 const STATE_FILE: &str = ".graph_harness_heartbeat.json";
+const PROMPT_FILE: &str = ".graph_harness_heartbeat_prompt.md";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartBeat {
@@ -104,13 +105,38 @@ pub const DEFAULT_OPTIMIZATION_PROMPT: &str = "\
 \n- 第10轮结束自动停止";
 
 impl HeartBeat {
+    fn prompt_from_file() -> Option<String> {
+        std::fs::read_to_string(PROMPT_FILE)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Keep the persisted heartbeat aligned with the repository prompt file.
+    /// This lets the self-optimization task evolve through normal file edits
+    /// instead of being trapped in an older JSON state snapshot.
+    pub fn sync_prompt_from_file(&mut self) -> bool {
+        if let Some(prompt) = Self::prompt_from_file() {
+            if self.prompt != prompt {
+                self.prompt = prompt;
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn load() -> Option<Self> {
         let path = PathBuf::from(STATE_FILE);
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(json) => match serde_json::from_str::<HeartBeat>(&json) {
-                    Ok(hb) => {
-                        if hb.active { return Some(hb); }
+                    Ok(mut hb) => {
+                        if hb.active {
+                            if hb.sync_prompt_from_file() {
+                                hb.save();
+                            }
+                            return Some(hb);
+                        }
                     }
                     Err(e) => warn!(error = %e, "heartbeat: corrupt state, skipping"),
                 },

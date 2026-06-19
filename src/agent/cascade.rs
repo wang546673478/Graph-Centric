@@ -6,8 +6,8 @@
 //! new requirements. Verification stops at the immutable anchor node.
 
 use crate::context::SourceLoader;
-use crate::error::{HarnessError, Result};
-use crate::graph::{Graph, Node, NodeId};
+use crate::error::Result;
+use crate::graph::{Edge, Graph, Node, NodeId, RelationType};
 use crate::model::{Message, Model, ModelRequest};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -122,7 +122,7 @@ impl CascadeBacktracker {
             return Ok(());
         }
 
-        let preds = graph.predecessors_of(&successor.id);
+        let preds = dependency_predecessors_of(graph, &successor.id);
 
         for (_, pred) in &preds {
             // Stop at anchor — it's immutable.
@@ -279,6 +279,18 @@ Respond with JSON:
     }
 }
 
+fn dependency_predecessors_of<'a>(
+    graph: &'a Graph,
+    node: &NodeId,
+) -> Vec<(&'a Edge, &'a Node)> {
+    graph
+        .edges
+        .iter()
+        .filter(|e| e.relation == RelationType::DependsOn && e.source == *node)
+        .filter_map(|e| graph.nodes.get(&e.target).map(|n| (e, n)))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -289,7 +301,6 @@ mod tests {
     use crate::graph::{Edge, RelationType};
     use crate::model::{FinishReason, ModelResponse, Usage};
     use async_trait::async_trait;
-    use std::sync::Mutex;
 
     /// A model that always returns "PRESERVED" — useful for structural tests.
     struct AlwaysPreservedModel;
@@ -325,11 +336,11 @@ mod tests {
         g.add_node(Node::task("b", "middle"));
         g.add_node(Node::task("c", "leaf"));
         g.add_edge(Edge::new(
-            "a", "b", RelationType::DependsOn, 1.0, "",
+            "c", "b", RelationType::DependsOn, 1.0, "",
         ))
         .unwrap();
         g.add_edge(Edge::new(
-            "b", "c", RelationType::DependsOn, 1.0, "",
+            "b", "a", RelationType::DependsOn, 1.0, "",
         ))
         .unwrap();
         g

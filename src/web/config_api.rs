@@ -46,6 +46,8 @@ pub async fn start_heartbeat(
     State(state): State<Arc<WebState>>,
     Json(body): Json<HeartBeatBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let prompt_path = state.config.project_root.join(".graph_harness_heartbeat_prompt.md");
+    let _ = std::fs::write(prompt_path, &body.prompt);
     let mut hb = HeartBeat::start(body.prompt, body.max_rounds);
     let run_id = spawn_heartbeat_run(&state, &mut hb).await;
     let rounds = hb.max_rounds;
@@ -104,6 +106,8 @@ pub async fn update_heartbeat_prompt(
     let mut guard = state.heartbeat.lock().await;
     if let Some(ref mut hb) = *guard {
         hb.prompt = body.prompt;
+        let prompt_path = state.config.project_root.join(".graph_harness_heartbeat_prompt.md");
+        let _ = std::fs::write(prompt_path, &hb.prompt);
         hb.save();
         Ok(Json(serde_json::json!({"updated": true})))
     } else {

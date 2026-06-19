@@ -392,6 +392,26 @@ mod tests {
         ToolContext::new(std::env::current_dir().unwrap())
     }
 
+    fn cwd_command() -> &'static str {
+        if cfg!(target_os = "windows") { "cd" } else { "pwd" }
+    }
+
+    fn long_output_command() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "for /L %i in (1,1,500) do @echo %i"
+        } else {
+            "seq 1 500"
+        }
+    }
+
+    fn sleep_command() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        }
+    }
+
     #[tokio::test]
     async fn echo_returns_stdout_and_exit_zero() {
         let t = BashTool::new();
@@ -435,7 +455,7 @@ mod tests {
         let t = BashTool::new();
         let out = t
             .call(
-                serde_json::json!({"command": "sleep 30", "timeout_ms": 200}),
+                serde_json::json!({"command": sleep_command(), "timeout_ms": 200}),
                 &ctx_here(),
             )
             .await
@@ -450,16 +470,22 @@ mod tests {
         let tmp = std::env::temp_dir();
         let ctx = ToolContext::new(tmp.clone());
         let out = t
-            .call(serde_json::json!({"command": "pwd"}), &ctx)
+            .call(serde_json::json!({"command": cwd_command()}), &ctx)
             .await
             .unwrap();
         // /tmp on macOS is symlinked to /private/tmp; accept either prefix.
-        let pwd_out = out.content.trim();
-        let tmp_str = tmp.to_string_lossy().to_string();
+        let pwd_raw = out.content.trim();
+        let tmp_raw = tmp.to_string_lossy().to_string();
+        let pwd_out = pwd_raw
+            .trim_end_matches(&['\\', '/'][..])
+            .to_ascii_lowercase();
+        let tmp_str = tmp_raw
+            .trim_end_matches(&['\\', '/'][..])
+            .to_ascii_lowercase();
         assert!(
             pwd_out.contains(&tmp_str)
                 || pwd_out.contains(tmp_str.trim_start_matches("/private")),
-            "pwd output {pwd_out:?} doesn't match cwd {tmp_str:?}"
+            "pwd output {pwd_raw:?} doesn't match cwd {tmp_raw:?}"
         );
     }
 
@@ -491,7 +517,7 @@ mod tests {
         let ctx = ToolContext::new(std::env::current_dir().unwrap()).with_max_output(200);
         // Generate a long output: 'seq 1 500' prints "1\n2\n…500\n"
         let out = t
-            .call(serde_json::json!({"command": "seq 1 500"}), &ctx)
+            .call(serde_json::json!({"command": long_output_command()}), &ctx)
             .await
             .unwrap();
         assert!(out.truncated);

@@ -324,7 +324,7 @@ enum Phase {
 /// guides the model through the "Start→Goal → fill middle → expand
 /// complex nodes → verify" workflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum GraphPhase {
+pub enum GraphPhase {
     /// First step: build only Start (anchor, immutable) + Goal (target)
     /// with a single DependsOn edge Goal→Start.
     Seeding,
@@ -376,8 +376,6 @@ fn validate_patch_schema(
     patch: &crate::graph::GraphPatch,
     schema: &GraphSchema,
 ) -> std::result::Result<(), String> {
-    use crate::graph::NodeKind;
-
     // Build the hypothetical graph after applying the patch.
     let mut after = graph.clone();
     let _ = after.apply_patch(patch.clone());
@@ -719,7 +717,7 @@ fn extract_entities_to_patch(text: &str, scope: &str, graph: &crate::graph::Grap
 }
 
 /// Summarize long subagent output into a concise report for the main agent.
-async fn summarize_for_main_agent(model: &(dyn crate::model::Model), text: &str) -> String {
+async fn summarize_for_main_agent(model: &dyn crate::model::Model, text: &str) -> String {
     if text.len() <= 3000 {
         return text.to_string();
     }
@@ -1314,10 +1312,10 @@ impl GraphLoop {
                 // Orchestration layer: enforce the "Start→Goal first,
                 // then fill middle" workflow based on graph_phase.
                 // ──────────────────────────────────────────────
-                if self.config.is_heartbeat {
+                {
                     // ── Seeding phase: enforce 2-node Start+Goal patch ──
                     if self.graph_phase == GraphPhase::Seeding && self.graph.node_count() == 0 {
-                        if patch.add_nodes.len() > 2 {
+                        if !patch.add_nodes.is_empty() {
                             warn!(
                                 count = patch.add_nodes.len(),
                                 "seeding: reducing patch to 2 nodes (Start + Goal)"
@@ -1468,7 +1466,7 @@ impl GraphLoop {
                             self.graph.edge_count()
                         ));
                         // ── Orchestration: phase transitions after patch ──
-                        if self.config.is_heartbeat {
+                        {
                             let nodes_increased = self.graph.node_count() > before_nodes;
                             match self.graph_phase {
                                 GraphPhase::Seeding => {
@@ -1917,8 +1915,6 @@ impl GraphLoop {
         &mut self,
         errors: Vec<GraphError>,
     ) -> LoopState {
-        use crate::agent::cascade::CascadeBacktracker;
-
         warn!(
             count = errors.len(),
             "graph_loop: auto-replanning after sub-agent graph errors"
@@ -1949,6 +1945,7 @@ impl GraphLoop {
 
             // Ask the Proposer to re-plan the failed node.
             let evidence = err.detail();
+            let mut cascade_start = failed_id.clone();
             match self.proposer.replan_failed_node(
                 failed_id,
                 &evidence,
@@ -1957,6 +1954,9 @@ impl GraphLoop {
                 &self.conversation,
             ).await {
                 Ok(patch) => {
+                    if let Some(replacement) = patch.add_nodes.first() {
+                        cascade_start = replacement.id.clone();
+                    }
                     if let Err(e) = self.graph.apply_patch(patch) {
                         warn!(error = %e, "re-plan patch rejected by graph");
                         self.pending = Pending::AwaitingRepair;
@@ -1984,7 +1984,7 @@ impl GraphLoop {
 
             // Cascade backtrack if configured.
             if let (Some(cascade), Some(l)) = (&cascade, &loader) {
-                match cascade.backtrack_from(failed_id, &self.graph, &self.task, l.as_ref()).await {
+                match cascade.backtrack_from(&cascade_start, &self.graph, &self.task, l.as_ref()).await {
                     Ok(result) => {
                         info!(
                             preserved = result.preserved.len(),
@@ -2010,6 +2010,18 @@ impl GraphLoop {
                             return Box::pin(
                                 self.handle_task_phase_graph_errors(vec![sub_err])
                             ).await;
+                        }
+                        if !result.needs_reexec.is_empty() {
+                            let ids = result
+                                .needs_reexec
+                                .iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            self.conversation.add_user(format!(
+                                "Cascade: predecessor outputs need re-execution: {ids}. \
+                                 Re-enter Graph phase and run the task graph from the top-level A/D plan."
+                            ));
                         }
                     }
                     Err(e) => {
@@ -2871,7 +2883,7 @@ mod tests {
             reg.register(Arc::new(BashTool::new()));
             reg
         });
-        let empty = Arc::new(ToolRegistry::new());
+        let _empty = Arc::new(ToolRegistry::new());
 
         // `with_subagent_tools` is the production wiring shape:
         // main = empty, subagent = full. `tools` and
@@ -3001,17 +3013,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poisoned_state_is_sticky() {
+    async fn malformed_model_response_salvages_to_pause() {
         let mut gl = build_loop_with(vec!["not even valid JSON"]);
-        // First call returns Error
+        // Malformed model output is salvaged as a pause so heartbeat/web
+        // drivers can auto-answer and keep the loop alive.
         match gl.step().await {
-            LoopState::Error(_) => {}
-            other => panic!("expected Error from malformed JSON, got {other:?}"),
+            LoopState::Paused { question, .. } => {
+                assert!(question.contains("valid JSON"));
+            }
+            other => panic!("expected Paused salvage from malformed JSON, got {other:?}"),
         }
-        // Subsequent calls keep returning Error
+        // Until the caller resumes, the pending pause is stable.
         match gl.step().await {
-            LoopState::Error(_) => {}
-            other => panic!("expected Error sticky, got {other:?}"),
+            LoopState::Paused { .. } => {}
+            other => panic!("expected Paused sticky, got {other:?}"),
         }
     }
 
@@ -3268,14 +3283,22 @@ mod tests {
         }"#;
         let ready_json = r#"{"step":"ready_for_verify"}"#;
 
+        let l1_json_d = r#"{
+            "responsibility":"goal for X",
+            "implementation":"goal node",
+            "design_intent":"complete X",
+            "constraints":"reachable from A",
+            "confidence":0.8
+        }"#;
         let shared: Arc<dyn Model> =
-            Arc::new(ScriptedModel::new(vec![patch_json, l1_json, ready_json]));
+            Arc::new(ScriptedModel::new(vec![patch_json, l1_json, l1_json_d, ready_json]));
         let tools = Arc::new(ToolRegistry::new());
         let proposer = GraphProposer::new(shared.clone(), tools.clone(), None);
         let verifier = Verifier::structural_only();
 
         let mut sources = std::collections::HashMap::new();
-        sources.insert(NodeId::from("x"), "pub struct X;\n".into());
+        sources.insert(NodeId::from("A"), "pub struct X;\n".into());
+        sources.insert(NodeId::from("D"), "// goal\n".into());
         let loader = Arc::new(crate::context::InMemorySources(sources));
         let enricher = crate::agent::enricher::L1Enricher::new(shared.clone(), loader);
 
@@ -3285,13 +3308,13 @@ mod tests {
 
         // Step 1: proposer returns patch → apply → auto-enrich
         assert!(matches!(gl.step().await, LoopState::Running));
-        assert_eq!(gl.graph.node_count(), 1);
+        assert_eq!(gl.graph.node_count(), 2);
         // L1 store should have been populated by auto_enrich
         let l1 = gl
             .graph
             .l1
-            .get(&NodeId::from("x"))
-            .expect("auto-enrichment should have written L1 for x");
+            .get(&NodeId::from("A"))
+            .expect("auto-enrichment should have written L1 for A");
         assert_eq!(l1.responsibility, "holds X");
         assert!((l1.confidence - 0.9).abs() < 1e-9);
 
@@ -3315,9 +3338,10 @@ mod tests {
         // No .with_l1_enricher
 
         assert!(matches!(gl.step().await, LoopState::Running));
-        assert_eq!(gl.graph.node_count(), 1);
+        assert_eq!(gl.graph.node_count(), 2);
         // No L1 entry — auto_enrich was a no-op
-        assert!(gl.graph.l1.get(&NodeId::from("x")).is_none());
+        assert!(gl.graph.l1.get(&NodeId::from("A")).is_none());
+        assert!(gl.graph.l1.get(&NodeId::from("D")).is_none());
 
         assert!(matches!(drive_to_terminal(&mut gl).await, LoopState::Done(_)));
     }

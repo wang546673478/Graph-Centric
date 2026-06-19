@@ -47,6 +47,12 @@ pub struct SubAgentPool {
     /// `ScopeGuard` derived from its task's `involved_nodes`. Set to
     /// false if the caller is providing scope at a different layer.
     pub auto_scope: bool,
+    /// Opt-in checkpoint commits after successful sub-agent work.
+    ///
+    /// Default is false: task execution should not mutate git history as a
+    /// hidden side effect. Failed work is reported through the graph/result
+    /// flow rather than being reverted with reset/checkout.
+    pub auto_git_checkpoint: bool,
 }
 
 impl SubAgentPool {
@@ -55,6 +61,7 @@ impl SubAgentPool {
             agent,
             max_concurrent: max_concurrent.max(1),
             auto_scope: true,
+            auto_git_checkpoint: false,
         }
     }
 
@@ -63,6 +70,11 @@ impl SubAgentPool {
     /// that manage scope at a higher layer.
     pub fn with_auto_scope(mut self, yes: bool) -> Self {
         self.auto_scope = yes;
+        self
+    }
+
+    pub fn with_auto_git_checkpoint(mut self, yes: bool) -> Self {
+        self.auto_git_checkpoint = yes;
         self
     }
 
@@ -86,6 +98,7 @@ impl SubAgentPool {
         let mut handles = Vec::with_capacity(batch.len());
 
         let auto_scope = self.auto_scope;
+        let auto_git_checkpoint = self.auto_git_checkpoint;
         for task_id in batch.iter().cloned() {
             let agent = self.agent.clone();
             let task_graph = task_graph.clone();
@@ -117,10 +130,11 @@ impl SubAgentPool {
                     agent.as_ref().clone()
                 };
                 let result = agent.execute(&sub_task, &world_graph, loader.as_ref()).await;
+                if auto_git_checkpoint {
                 // Git safety: commit on success, reset on failure.
                 match &result {
                     Ok(r) if r.success => {
-                        let add = std::process::Command::new("git").args(["add", "-A"]).output();
+                        let _ = std::process::Command::new("git").args(["add", "-A"]).output();
                         let diff = std::process::Command::new("git").args(["diff", "--cached", "--stat"]).output();
                         // Only commit if there are actual changes.
                         if let Ok(ref d) = diff {
@@ -132,8 +146,7 @@ impl SubAgentPool {
                                 if let Ok(out) = check {
                                     if !out.status.success() {
                                         // Build failed — revert this commit.
-                                        let _ = std::process::Command::new("git").args(["reset", "--hard", "HEAD~1"]).output();
-                                        tracing::warn!(task = %task_id, "subagent changes failed cargo check; reverted");
+                                        tracing::warn!(task = %task_id, "subagent changes failed cargo check; leaving workspace untouched");
                                     }
                                 }
                             }
@@ -141,8 +154,9 @@ impl SubAgentPool {
                     }
                     _ => {
                         // Failed task — discard any uncommitted changes.
-                        let _ = std::process::Command::new("git").args(["checkout", "--", "."]).output();
+                        tracing::warn!(task = %task_id, "subagent failed; leaving workspace untouched");
                     }
+                }
                 }
                 result
             });
@@ -707,7 +721,7 @@ mod tests {
         let agent = Arc::new(SubAgent::new(model).with_max_steps(2));
         let d = Dispatcher::new(agent).with_max_concurrent(1);
 
-        let mut st = SubTask {
+        let st = SubTask {
             id: NodeId::from("t1"),
             description: "find auth".into(),
             involved_nodes: vec![],
