@@ -45,7 +45,7 @@ use super::verifier::{Severity, VerificationResult, VerifyIssue, Verifier};
 use super::Conversation;
 use crate::context::SourceLoader;
 use crate::error::{HarnessError, Result};
-use crate::graph::{Graph, NodeId, NodeKind};
+use crate::graph::{Edge, Graph, Node, NodeId, NodeKind, RelationType};
 use crate::tools::{ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -320,6 +320,22 @@ enum Phase {
     Poisoned,
 }
 
+/// Sub-phase within the Graph phase — the orchestration layer that
+/// guides the model through the "Start→Goal → fill middle → expand
+/// complex nodes → verify" workflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GraphPhase {
+    /// First step: build only Start (anchor, immutable) + Goal (target)
+    /// with a single DependsOn edge Goal→Start.
+    Seeding,
+    /// The model explores and fills intermediate nodes between Start and Goal.
+    Filling,
+    /// Cascade-expand abstract Task nodes into sub-graphs of concrete sub-nodes.
+    Expanding,
+    /// Model emitted ready_for_verify — verifier runs, then Task phase.
+    Verifying,
+}
+
 /// Pending caller-facing operations that block `step()` until `resume*` is called.
 #[derive(Debug, Clone)]
 enum Pending {
@@ -449,6 +465,9 @@ pub struct GraphLoopConfig {
     /// Optional graph structure constraints. When `Some`, every ProposePatch
     /// is validated before application.
     pub graph_schema: Option<GraphSchema>,
+    /// When true, the proposer's system prompt includes autonomous-mode
+    /// blocks (no ask_user, direct execution). Set for heartbeat runs.
+    pub is_heartbeat: bool,
 
     // Stagnation detection thresholds
     pub stagnation_soft_hint: u32,
@@ -475,6 +494,7 @@ impl GraphLoopConfig {
             tool_policy: Arc::new(crate::tools::AllowAll),
             auto_apply_skills: true,
             graph_schema: None,
+            is_heartbeat: false,
             stagnation_soft_hint: 4,
             stagnation_hard_hint: 6,
             stagnation_terminate: 8,
@@ -542,6 +562,9 @@ pub struct GraphLoop {
     pub conversation: Conversation,
     pub graph: Graph,
     pub round: usize,
+    /// Current sub-phase within the Graph phase — drives the orchestration
+    /// flow: Seeding → Filling → Expanding → Verifying.
+    pub graph_phase: GraphPhase,
     pub last_verification: Option<VerificationResult>,
     pub task_outcome: Option<DispatchOutcome>,
     pub review_result: Option<ReviewResult>,
@@ -594,6 +617,10 @@ pub struct GraphLoop {
     /// can surface it on a `Status` event for cost / progress
     /// visibility.
     pub tokens_used: u64,
+    /// In Filling phase, how many consecutive rounds passed without
+    /// adding new nodes. After 3 rounds, auto-inject a suggested
+    /// intermediate node to break the research-only loop.
+    filling_rounds_without_nodes: u32,
 
     phase: Phase,
     pending: Pending,
@@ -722,7 +749,12 @@ impl GraphLoop {
         config: GraphLoopConfig,
     ) -> Self {
         let task = task.into();
-        let conversation = proposer.make_conversation(&task);
+        let conversation = if config.is_heartbeat {
+            let system = proposer.build_system_prompt_heartbeat(&task);
+            Conversation::new(system, task.clone())
+        } else {
+            proposer.make_conversation(&task)
+        };
         Self {
             proposer,
             verifier,
@@ -746,6 +778,8 @@ impl GraphLoop {
             conversation,
             graph: Graph::new(),
             round: 0,
+            graph_phase: GraphPhase::Seeding,
+            filling_rounds_without_nodes: 0,
             last_verification: None,
             task_outcome: None,
             review_result: None,
@@ -1028,6 +1062,17 @@ impl GraphLoop {
         // we don't have to plumb a callback through the type.
         self.last_step = Some(step.clone());
 
+        // ── Orchestration: track Filling rounds without new nodes ──
+        let is_patch_step = matches!(step, ProposerStep::ProposePatch { .. });
+        if self.config.is_heartbeat && self.graph_phase == GraphPhase::Filling && !is_patch_step {
+            self.filling_rounds_without_nodes += 1;
+            if self.filling_rounds_without_nodes >= 3 {
+                self.filling_rounds_without_nodes = 0; // reset
+                let hint = self.build_filling_hint();
+                self.conversation.add_user(hint);
+            }
+        }
+
         match step {
             ProposerStep::AskUser { question, options: _, rationale } => {
                 self.pending = Pending::AwaitingAnswer { question: question.clone() };
@@ -1264,11 +1309,141 @@ impl GraphLoop {
                 }
                 Ok(LoopState::Running)
             }
-            ProposerStep::ProposePatch { patch, rationale: _ } => {
+            ProposerStep::ProposePatch { mut patch, rationale: _ } => {
+                // ──────────────────────────────────────────────
+                // Orchestration layer: enforce the "Start→Goal first,
+                // then fill middle" workflow based on graph_phase.
+                // ──────────────────────────────────────────────
+                if self.config.is_heartbeat {
+                    // ── Seeding phase: enforce 2-node Start+Goal patch ──
+                    if self.graph_phase == GraphPhase::Seeding && self.graph.node_count() == 0 {
+                        if patch.add_nodes.len() > 2 {
+                            warn!(
+                                count = patch.add_nodes.len(),
+                                "seeding: reducing patch to 2 nodes (Start + Goal)"
+                            );
+                            // Keep only the first and last nodes as Start/Goal.
+                            // Re-identify them as A (anchor) and D (goal).
+                            let mut kept = Vec::with_capacity(2);
+                            if let Some(first) = patch.add_nodes.first().cloned() {
+                                kept.push(first);
+                            }
+                            if let Some(last) = patch.add_nodes.last().cloned() {
+                                if kept.len() < 2 || last.id != kept[0].id {
+                                    kept.push(last);
+                                }
+                            }
+                            // Ensure exactly 2 nodes.
+                            if kept.len() < 2 {
+                                // Model only provided 1 node; synthesize Goal.
+                                kept.push(Node {
+                                    id: NodeId::from("D"),
+                                    kind: NodeKind::Task,
+                                    path: "D".into(),
+                                    summary: "Goal: task completed successfully".into(),
+                                    metadata: Default::default(),
+                                    immutable: false,
+                                    expanded: false,
+                                });
+                            }
+                            // Re-identify: first node → A (anchor), last → D (goal).
+                            kept[0].id = NodeId::from("A");
+                            kept[0].immutable = true;
+                            kept[0].kind = NodeKind::Task;
+                            if kept[0].summary.trim().is_empty() {
+                                kept[0].summary = "Start: current problem or initial state".into();
+                            }
+                            if kept.len() > 1 {
+                                kept[1].id = NodeId::from("D");
+                                kept[1].kind = NodeKind::Task;
+                                if kept[1].summary.trim().is_empty() {
+                                    kept[1].summary = "Goal: desired outcome".into();
+                                }
+                            }
+                            patch.add_nodes = kept;
+                            // Enforce single DependsOn edge: D→A.
+                            patch.add_edges = vec![Edge::new(
+                                NodeId::from("D"),
+                                NodeId::from("A"),
+                                RelationType::DependsOn,
+                                0.9,
+                                "goal depends on start",
+                            )];
+                            patch.remove_edge_indices.clear();
+                            patch.remove_node_ids.clear();
+                        }
+                        // Ensure at least 1 DependsOn edge exists.
+                        if patch.add_edges.is_empty() && patch.add_nodes.len() >= 2 {
+                            patch.add_edges.push(Edge::new(
+                                NodeId::from("D"),
+                                NodeId::from("A"),
+                                RelationType::DependsOn,
+                                0.9,
+                                "goal depends on start",
+                            ));
+                        }
+                    }
+
+                    // Standard auto-fix for common model mistakes.
+                    for node in &mut patch.add_nodes {
+                        // Auto-set immutable:true on anchor-like nodes.
+                        // Matches: "A", "a", "anchor-*", "A-*", "A_*", "A.*"
+                        let id_lower = node.id.as_str().to_lowercase();
+                        let is_anchor = id_lower == "a"
+                            || id_lower.contains("anchor")
+                            || id_lower.starts_with("a-")
+                            || id_lower.starts_with("a_")
+                            || id_lower.starts_with("a.")
+                            || id_lower.starts_with("anchor");
+                        if is_anchor {
+                            node.immutable = true;
+                        }
+                        // Auto-set kind:Task if schema requires it.
+                        if let Some(ref schema) = self.config.graph_schema {
+                            if !schema.allowed_node_kinds.is_empty()
+                                && !schema.allowed_node_kinds.contains(&node.kind)
+                            {
+                                node.kind = NodeKind::Task;
+                            }
+                        }
+                        // Fill empty summary.
+                        if node.summary.trim().is_empty() {
+                            node.summary = format!("Task node: {}", node.id.as_str());
+                        }
+                    }
+                    for edge in &mut patch.add_edges {
+                        // Auto-set relation:DependsOn if schema requires it.
+                        if let Some(ref schema) = self.config.graph_schema {
+                            if let Some(ref required_rel) = schema.required_edge_relation {
+                                if edge.relation != *required_rel {
+                                    edge.relation = required_rel.clone();
+                                }
+                            }
+                        }
+                        // Ensure source/target are set.
+                        if edge.source.as_str().is_empty() || edge.target.as_str().is_empty() {
+                            // Can't fix — skip this edge.
+                            continue;
+                        }
+                    }
+                }
+
                 // Schema validation: if a GraphSchema is configured, reject
                 // patches that would violate structural constraints.
                 if let Some(ref schema) = self.config.graph_schema {
                     if let Err(reason) = validate_patch_schema(&self.graph, &patch, schema) {
+                        if self.config.is_heartbeat {
+                            warn!(
+                                reason = %reason,
+                                "GraphSchema rejected patch even after auto-fix; injecting hint"
+                            );
+                            self.conversation.add_user(format!(
+                                "⚠️ GraphSchema rejected your patch: {reason}\n\
+                                 The patch was NOT applied. Fix the issues above \
+                                 and emit a corrected propose_patch.",
+                            ));
+                            return Ok(LoopState::Running);
+                        }
                         return Err(HarnessError::model(format!(
                             "GraphSchema violation: {reason}\n\
                              The patch was NOT applied. Correct your patch to follow \
@@ -1292,10 +1467,39 @@ impl GraphLoop {
                             self.graph.node_count(),
                             self.graph.edge_count()
                         ));
+                        // ── Orchestration: phase transitions after patch ──
+                        if self.config.is_heartbeat {
+                            let nodes_increased = self.graph.node_count() > before_nodes;
+                            match self.graph_phase {
+                                GraphPhase::Seeding => {
+                                    // First patch applied — transition to Filling.
+                                    self.graph_phase = GraphPhase::Filling;
+                                    self.filling_rounds_without_nodes = 0;
+                                    info!("orchestration: Seeding → Filling ({}n/{}e)",
+                                        self.graph.node_count(), self.graph.edge_count());
+                                    self.conversation.add_user(
+                                        "✅ Start→Goal established. Now explore to understand \
+                                         what intermediate steps are needed between A and D. \
+                                         Use `explore` to read relevant files, then \
+                                         `propose_patch` to insert intermediate Task nodes."
+                                    );
+                                }
+                                GraphPhase::Filling => {
+                                    if nodes_increased {
+                                        self.filling_rounds_without_nodes = 0;
+                                    }
+                                    // If graph has >= 4 nodes, suggest cascade expansion.
+                                    if self.graph.node_count() >= 4 {
+                                        self.graph_phase = GraphPhase::Expanding;
+                                        info!("orchestration: Filling → Expanding ({}n/{}e)",
+                                            self.graph.node_count(), self.graph.edge_count());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
                         // L0 → L1 linkage: auto-enrich brand-new nodes.
-                        // Per design doc v2.0, L1 is the enricher's job, not
-                        // the proposer's; this is where that responsibility
-                        // is discharged.
                         if !new_node_ids.is_empty() {
                             self.auto_enrich(&new_node_ids).await;
                         }
@@ -1486,6 +1690,31 @@ impl GraphLoop {
             "Task phase: decomposed into {} sub-task(s).",
             task_graph.node_count()
         ));
+
+        // 1.5 Cascade expansion: recursively expand abstract Task nodes
+        // into concrete sub-nodes with file paths and actions (L0→L1→L2).
+        // This builds the 3D multi-layer graph — when a node is too
+        // complex, it becomes the anchor of its own sub-graph.
+        let expanded_graph = crate::agent::cascade_expand::expand_graph(
+            &*self.proposer.model,
+            task_graph.clone(),
+            &self.task,
+            2, // max depth: L0 → L1 → L2
+        ).await;
+        let task_graph = match expanded_graph {
+            Ok(expanded) => {
+                info!(
+                    before = task_graph.node_count(),
+                    after = expanded.node_count(),
+                    "graph_loop: cascade expansion complete"
+                );
+                expanded
+            }
+            Err(e) => {
+                warn!(error = %e, "graph_loop: cascade expansion failed, using original graph");
+                task_graph // fall back to unexpanded graph
+            }
+        };
 
         // Empty decomposition → still valid, skip to Review.
         if task_graph.node_count() == 0 {
@@ -1814,6 +2043,28 @@ impl GraphLoop {
     /// conversation gets a single user message containing
     /// each subagent's summary. The main agent is not
     /// exposed to the raw file contents — that's the
+    /// Build a concrete hint for the Filling phase: suggest specific
+    /// intermediate Task nodes to insert between A and D, based on the
+    /// task description and current graph state. Called when the model
+    /// has spent several rounds researching without adding nodes.
+    fn build_filling_hint(&self) -> String {
+        let node_info: Vec<String> = self.graph.nodes.values().map(|n| {
+            format!("- {} (kind={:?}, summary=\"{}\")", n.id.as_str(), n.kind, n.summary)
+        }).collect();
+        format!(
+            "🔧 You have spent several rounds exploring but haven't added \
+             intermediate nodes between A and D. Based on your research, \
+             NOW add at least one intermediate Task node. Example:\n\
+             - Add node T1: \"read Transcript.vue and main.css to identify \
+             exact lines to change\"\n\
+             - Connect: A → T1 → D with DependsOn edges\n\n\
+             You MUST emit a `propose_patch` now with intermediate nodes. \
+             Do NOT explore again — you already have enough information.\n\n\
+             Current graph:\n{node_info}",
+            node_info = node_info.join("\n")
+        )
+    }
+
     /// whole point of the subagent: keep the main context
     /// clean.
     async fn dispatch_explore_subagents(

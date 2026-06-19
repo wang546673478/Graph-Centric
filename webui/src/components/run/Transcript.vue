@@ -58,8 +58,8 @@ function roleLabel(r: string): string {
 <style scoped>
 .transcript { flex: 1; overflow-y: auto; padding: 12px; }
 .empty { color: var(--text-muted); font-size: 0.85rem; padding: 24px; text-align: center; }
-.msg { margin: 4px 0; border-radius: 6px; padding: 6px 10px; }
-.msg.user { background: var(--bg-hover); }
+.msg { margin: 8px 12px; border-radius: 6px; padding: 6px 10px; }
+.msg.user { background: blue; text-align: right; }
 .msg.assistant { background: transparent; }
 .msg.tool { background: transparent; }
 .msg.tool .body { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }

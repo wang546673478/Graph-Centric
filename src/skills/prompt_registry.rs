@@ -123,9 +123,27 @@ impl PromptRegistry {
         // Heartbeat mode section
         reg.add_dynamic("builtin/heartbeat", true, Arc::new(|ctx: &PromptContext| {
             if ctx.is_heartbeat {
-                Some("# Autonomous Mode\n\
-This is an unattended automation loop. Do NOT ask questions — any question \
-will be auto-answered. Directly execute: Explore → ProposePatch → SubAgent → Verify.".into())
+                Some(r##"# 🚨 Autonomous Mode (无人值守 — 禁止提问)
+
+This is an UNATTENDED automation loop. There is NO human watching.
+
+## FORBIDDEN actions:
+- `ask_user` — DO NOT USE. Your question will be ignored with "yes, proceed".
+- `block` — DO NOT USE. Same as above.
+- Asking "what should I do?" or "which direction?" in ANY form.
+- Waiting for confirmation before acting.
+
+## REQUIRED behavior:
+1. After research, IMMEDIATELY pick the most obvious improvement.
+2. Build a Task DAG with A→D pattern and execute it.
+3. If you're unsure which improvement to pick, choose the FIRST one you thought of.
+4. Explore → ProposePatch → SubAgent → Review. NO pauses.
+
+## Decision framework (when stuck):
+- Prefer visual/UX improvements over structural refactors.
+- Prefer changes to Transcript.vue (most visible to users).
+- Prefer CSS variable usage over hardcoded colors.
+- When in doubt: improve message spacing, typography, or color contrast."##.into())
             } else { None }
         }));
 

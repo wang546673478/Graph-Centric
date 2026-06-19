@@ -353,13 +353,75 @@ pub async fn create_branch(
 
 // --- Run driver ---
 
+/// Loop engineering: when the main agent is stuck (ask_user), instead of
+/// a generic "yes, proceed", spawn a "virtual user" model call that analyzes
+/// the task + question + graph state and gives a concrete, actionable answer.
+///
+/// This is "大模型告诉大模型" — the model tells itself what to do next,
+/// decomposing the task into the next concrete step.
+async fn self_decompose_answer(
+    model: &dyn crate::model::Model,
+    task: &str,
+    question: &str,
+    graph_nodes: usize,
+    graph_edges: usize,
+) -> String {
+    let prompt = format!(
+        "\
+你是任务拆解助手。主 Agent 正在执行一个自动化任务，但它卡住了。\
+你的职责是分析当前情况，给出具体、可执行的方向来推动工作继续。\
+**注意：不要提供 JSON 格式示例（你自己也不知道正确格式），只给方向性指导。**
+
+## 当前任务
+{task}
+
+## Agent 的问题
+{question}
+
+## 当前图状态
+{graph_nodes} 个节点, {graph_edges} 条边
+
+## 具体指引
+1. 如果图是空的（0节点）：告诉 Agent 立即建图。用 task 描述中的 A 和 D 作为锚点和目标，\
+   加至少1个中间 Task 节点。所有节点 kind 必须是 Task，所有边 relation 必须是 DependsOn，\
+   A 节点必须设 immutable:true。
+2. 如果 Agent 的 JSON 格式错误：告诉它\"简化你的输出，先生成一个最小可用的图（A→T1→D），\
+   确保 add_nodes 数组有至少3个节点，add_edges 数组有至少2条边，每条边有 source 和 target 字段。\
+   kind 固定为 Task，relation 固定为 DependsOn。\"
+3. 如果 Agent 问方向/做什么：从任务描述中直接提取 A 和 D，不要犹豫，直接选。
+4. 在任何情况下：禁止建议 Agent 使用 ask_user 或 block — 这是无人值守循环。
+
+用中文回答，控制在 200 字以内。不要反问，不要确认，直接给出决定。"
+    );
+    let req = crate::model::ModelRequest {
+        messages: vec![crate::model::Message::user(prompt)],
+        tools: vec![],
+        temperature: 0.3,
+        max_tokens: Some(512),
+        stop: vec![],
+    };
+    match model.complete(req).await {
+        Ok(resp) => {
+            let answer = resp.content.trim().to_string();
+            if answer.is_empty() {
+                "立即建图执行。A=当前问题, D=目标效果, 中间加 Task 节点。不要犹豫，直接 propose_patch。".to_string()
+            } else {
+                answer
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "self_decompose: model call failed, using fallback");
+            "继续执行。根据你的任务描述选择最明显的改进点，建 A→D 图，propose_patch 然后 SubAgent 执行。".to_string()
+        }
+    }
+}
+
 /// Trigger graceful shutdown so the external launcher (loop.ps1) restarts
 /// us with the latest binary. Saves the heartbeat state first.
-fn heartbeat_trigger_shutdown(state: &Arc<WebState>) {
-    let rt = tokio::runtime::Handle::current();
+async fn heartbeat_trigger_shutdown(state: &Arc<WebState>) {
     let hb_active = {
-        let hb_guard = rt.block_on(state.heartbeat.lock());
-        hb_guard.as_ref().map(|hb| hb.active).unwrap_or(false)
+        state.heartbeat.lock().await.as_ref()
+            .map(|hb| hb.active).unwrap_or(false)
     };
     if !hb_active { return; }
     info!("heartbeat: round complete — triggering graceful shutdown for restart");
@@ -485,6 +547,13 @@ pub async fn drive_run(
         crate::agent::cascade::CascadeStep,
     >();
 
+    // Async-safe: check heartbeat status once with .await (not block_on).
+    // When heartbeat is active:
+    //   - enforce strict A→D Task DAG pattern (graph_schema)
+    //   - inject autonomous-mode system prompt blocks (is_heartbeat → no ask_user)
+    let is_heartbeat_active = state.heartbeat.lock().await.as_ref()
+        .map(|hb| hb.active).unwrap_or(false);
+
     let loop_cfg = GraphLoopConfig {
         max_rounds: state.config.engine.loop_tuning.max_rounds,
         max_repair_rounds: 3,
@@ -500,7 +569,20 @@ pub async fn drive_run(
         stuck_terminate: state.config.engine.loop_tuning.stuck_terminate,
         tool_failure_warn_after: state.config.engine.loop_tuning.tool_failure_warn_after,
         tool_failure_halt_after: state.config.engine.loop_tuning.tool_failure_halt_after,
-        graph_schema: None,
+        is_heartbeat: is_heartbeat_active,
+        graph_schema: if is_heartbeat_active {
+            Some(crate::agent::graph_loop::GraphSchema {
+                allowed_node_kinds: vec![crate::graph::NodeKind::Task],
+                required_edge_relation: Some(crate::graph::RelationType::DependsOn),
+                require_immutable_anchor: true,
+                // Flexible: model decides the graph structure naturally.
+                // A complex task may need A→B→C→D→E, a simple one just A→D.
+                min_nodes: 1,
+                min_edges: 0,
+            })
+        } else {
+            None
+        },
     };
 
     let mut gl = GraphLoop::new(
@@ -692,17 +774,27 @@ pub async fn drive_run(
                     role: "ask_user".into(),
                     content: question.clone(),
                 });
-                // Heartbeat: auto-answer "proceed" so the loop continues.
+                // Heartbeat: loop engineering — instead of a generic
+                // "yes, proceed", spawn a "virtual user" model call that
+                // analyzes the task + question + graph and gives concrete,
+                // actionable direction. This is "大模型告诉大模型".
                 let is_heartbeat = state.heartbeat.lock().await.as_ref()
                     .map(|hb| hb.active).unwrap_or(false);
                 let answer = if is_heartbeat {
-                    info!("heartbeat: auto-answering paused question");
+                    info!("heartbeat: self-decompose via virtual user model call");
                     *session.status.write().await = RunStatus::Running;
+                    let answer = self_decompose_answer(
+                        &*fast_model,
+                        &session.task,
+                        &question,
+                        gl.graph.node_count(),
+                        gl.graph.edge_count(),
+                    ).await;
                     session.emit(RunEvent::Transcript {
                         role: "user".into(),
-                        content: "yes, proceed".into(),
+                        content: answer.clone(),
                     });
-                    "yes, proceed".to_string()
+                    answer
                 } else {
                     session.await_answer().await
                 };
@@ -804,7 +896,7 @@ pub async fn drive_run(
                         if hb.active { hb.round_complete() } else { false }
                     } else { false }
                 };
-                if do_spawn { heartbeat_trigger_shutdown(&state); }
+                if do_spawn { heartbeat_trigger_shutdown(&state).await; }
                 return;
             }
             LoopState::Error(msg) => {
@@ -818,7 +910,7 @@ pub async fn drive_run(
                         if hb.active { hb.round_complete() } else { false }
                     } else { false }
                 };
-                if do_spawn { heartbeat_trigger_shutdown(&state); }
+                if do_spawn { heartbeat_trigger_shutdown(&state).await; }
                 return;
             }
             LoopState::TaskFailed { failures } => {
@@ -834,7 +926,7 @@ pub async fn drive_run(
                         if hb.active { hb.round_complete() } else { false }
                     } else { false }
                 };
-                if do_spawn { heartbeat_trigger_shutdown(&state); }
+                if do_spawn { heartbeat_trigger_shutdown(&state).await; }
                 return;
             }
             LoopState::Running => {
