@@ -15,6 +15,8 @@
 
 ## 已确认的设计决策
 
+> **一句话不变量**:唯一固定的是 `start --LeadsTo--> deliverable` 这条主轴用 `LeadsTo`。中间插入的所有步骤节点之间怎么连(LeadsTo / DependsOn / Contains、要不要环)——**全部交给模型按任务类型自主判断**,系统只提供关系图谱和约束,不预设中间结构。
+
 1. **`start → deliverable` 主链固定用 `LeadsTo`**(流向);锚点 id 从 `A`/`D` 改为语义化的 `start` / `deliverable`。
 2. **中间过程步骤的边类型交给模型判断**:模型先判断任务类型,再从关系图谱(LeadsTo/DependsOn/Contains/...)挑合适的边自己连接。流程先后→LeadsTo;真正依赖→DependsOn;包含→Contains。
 3. **关系类型并存**:新增 `LeadsTo`;`DependsOn`/`Contains` 等全部保留。**彻底不再把 `DependsOn` 当作主链默认**(主链改 LeadsTo)。
