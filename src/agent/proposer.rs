@@ -895,15 +895,44 @@ fn proposer_tools(has_advisor: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "propose_patch",
-                "description": "Add/remove nodes and edges on the relationship graph. Use this for ALL graph modifications.",
+                "description": "Add/remove nodes and edges on the relationship graph. Use this for ALL graph modifications. Example of a minimal Start→Goal seed: {\"patch\":{\"add_nodes\":[{\"id\":\"A\",\"kind\":\"Task\",\"summary\":\"Start: current state\",\"immutable\":true},{\"id\":\"D\",\"kind\":\"Task\",\"summary\":\"Goal: desired outcome\"}],\"add_edges\":[{\"source\":\"D\",\"target\":\"A\",\"relation\":\"DependsOn\",\"confidence\":0.9}],\"reason\":\"seed Start and Goal\"},\"rationale\":\"establish the anchor and goal\"}",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "patch": {
                             "type": "object",
                             "properties": {
-                                "add_nodes": {"type": "array", "items": {"type": "object"}},
-                                "add_edges": {"type": "array", "items": {"type": "object"}},
+                                "add_nodes": {
+                                    "type": "array",
+                                    "description": "Nodes to add. Each node: id (string, required), kind (one of File/Function/Class/Module/Config/Task/Other), summary (string, what it is), and optional path, immutable (bool), expanded (bool).",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "id": {"type": "string"},
+                                            "kind": {"type": "string", "enum": ["File", "Function", "Class", "Module", "Config", "Task", "Other"]},
+                                            "summary": {"type": "string"},
+                                            "path": {"type": "string"},
+                                            "immutable": {"type": "boolean"},
+                                            "expanded": {"type": "boolean"}
+                                        },
+                                        "required": ["id", "kind", "summary"]
+                                    }
+                                },
+                                "add_edges": {
+                                    "type": "array",
+                                    "description": "Edges to add. Each edge: source (node id, required), target (node id, required), relation (one of Contains/BelongsTo/Imports/Exports/DependsOn/Calls/Triggers/Reads/Writes/Other), confidence (0..1).",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "source": {"type": "string"},
+                                            "target": {"type": "string"},
+                                            "relation": {"type": "string", "enum": ["Contains", "BelongsTo", "Imports", "Exports", "DependsOn", "Calls", "Triggers", "Reads", "Writes", "Other"]},
+                                            "confidence": {"type": "number"},
+                                            "evidence": {"type": "string"}
+                                        },
+                                        "required": ["source", "target", "relation"]
+                                    }
+                                },
                                 "remove_node_ids": {"type": "array", "items": {"type": "string"}},
                                 "remove_edge_indices": {"type": "array", "items": {"type": "integer"}},
                                 "set_l1": {"type": "object"},
@@ -1012,8 +1041,14 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
     let tc = &tool_calls[0];
     match tc.name.as_str() {
         "propose_patch" => {
-            let patch: crate::graph::GraphPatch = serde_json::from_value(tc.arguments.clone())
-                .map_err(|e| HarnessError::model(format!("propose_patch tool_call: invalid patch: {e}")))?;
+            // Route through the tolerant `parse_patch` (same as the text
+            // path) instead of strict serde deserialization. Strict
+            // deserialization rejected patches missing optional fields
+            // (e.g. "missing field `add_nodes`") — which any model that
+            // omits an empty array would trigger. The tolerant parser
+            // treats every field as optional and maps common aliases.
+            let patch_val = tc.arguments.get("patch").unwrap_or(&tc.arguments);
+            let patch = parse_patch(patch_val)?;
             Ok(ProposerStep::ProposePatch {
                 patch,
                 rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -1356,16 +1391,21 @@ fn parse_node_kind(s: &str) -> NodeKind {
 }
 
 fn parse_edge(v: &serde_json::Value) -> Result<Edge> {
+    // Accept common aliases: some models emit `from`/`to` instead of
+    // `source`/`target`.
     let source = v
         .get("source")
+        .or_else(|| v.get("from"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| HarnessError::model("proposer: edge missing 'source'".to_string()))?;
     let target = v
         .get("target")
+        .or_else(|| v.get("to"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| HarnessError::model("proposer: edge missing 'target'".to_string()))?;
     let relation_str = v
         .get("relation")
+        .or_else(|| v.get("type"))
         .and_then(|v| v.as_str())
         .unwrap_or("Other");
     let relation = parse_relation_type(relation_str);
@@ -1873,6 +1913,51 @@ mod tests {
                 assert!(context.is_empty());
             }
             other => panic!("expected ConsultAdvisor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn propose_patch_tool_call_tolerates_missing_add_nodes() {
+        // Regression: MiniMax M3 emitted a patch with only add_edges (no
+        // add_nodes), which strict serde deserialization rejected with
+        // "missing field `add_nodes`". The tolerant parser must accept it.
+        let tc = crate::model::ToolCall {
+            id: "1".into(),
+            name: "propose_patch".into(),
+            arguments: serde_json::json!({
+                "patch": { "reason": "seed", "add_edges": [{"from": "D", "to": "A", "relation": "DependsOn"}] },
+                "rationale": "r"
+            }),
+        };
+        match parse_step_from_tool_calls(&[tc]).unwrap() {
+            ProposerStep::ProposePatch { patch, .. } => {
+                assert!(patch.add_nodes.is_empty());
+                assert_eq!(patch.add_edges.len(), 1, "from/to aliases should map to source/target");
+                assert_eq!(patch.add_edges[0].source.as_str(), "D");
+                assert_eq!(patch.add_edges[0].target.as_str(), "A");
+            }
+            other => panic!("expected ProposePatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn propose_patch_tool_call_accepts_flat_args_without_patch_wrapper() {
+        // Some models emit the patch fields at the top level instead of
+        // under a "patch" key. parse_patch falls back to the whole args.
+        let tc = crate::model::ToolCall {
+            id: "1".into(),
+            name: "propose_patch".into(),
+            arguments: serde_json::json!({
+                "reason": "seed",
+                "add_nodes": [{"id": "A", "kind": "Task", "summary": "start"}]
+            }),
+        };
+        match parse_step_from_tool_calls(&[tc]).unwrap() {
+            ProposerStep::ProposePatch { patch, .. } => {
+                assert_eq!(patch.add_nodes.len(), 1);
+                assert_eq!(patch.add_nodes[0].id.as_str(), "A");
+            }
+            other => panic!("expected ProposePatch, got {other:?}"),
         }
     }
 
