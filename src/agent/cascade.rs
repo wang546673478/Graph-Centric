@@ -283,11 +283,15 @@ fn dependency_predecessors_of<'a>(
     graph: &'a Graph,
     node: &NodeId,
 ) -> Vec<(&'a Edge, &'a Node)> {
+    // Upstream = nodes whose structural edge points INTO `node` (they feed
+    // it). With the start→deliverable flow, an edge source→target means
+    // source flows to target, so `node`'s upstream are edges with
+    // target == node. Walk LeadsTo/DependsOn/Contains (structural) edges.
     graph
         .edges
         .iter()
-        .filter(|e| e.relation == RelationType::DependsOn && e.source == *node)
-        .filter_map(|e| graph.nodes.get(&e.target).map(|n| (e, n)))
+        .filter(|e| e.relation.is_structural() && e.target == *node)
+        .filter_map(|e| graph.nodes.get(&e.source).map(|n| (e, n)))
         .collect()
 }
 
@@ -335,12 +339,14 @@ mod tests {
         g.add_node(a);
         g.add_node(Node::task("b", "middle"));
         g.add_node(Node::task("c", "leaf"));
+        // Forward flow: source → target means source feeds target.
+        // a feeds b feeds c, so edges are a→b and b→c.
         g.add_edge(Edge::new(
-            "c", "b", RelationType::DependsOn, 1.0, "",
+            "a", "b", RelationType::DependsOn, 1.0, "",
         ))
         .unwrap();
         g.add_edge(Edge::new(
-            "b", "a", RelationType::DependsOn, 1.0, "",
+            "b", "c", RelationType::DependsOn, 1.0, "",
         ))
         .unwrap();
         g
