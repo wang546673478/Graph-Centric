@@ -134,6 +134,20 @@ pub enum ProposerStep {
         items: Vec<ExploreItem>,
         rationale: String,
     },
+    /// Consult the independent **advisor** model with a question. Use
+    /// when the main (task) model wants a second opinion on a design or
+    /// knowledge question. The advisor only answers — it never modifies
+    /// the graph. Its answer is injected into the conversation and the
+    /// main model decides what to do next. No-op (with a hint) when no
+    /// advisor backend is configured.
+    ConsultAdvisor {
+        /// The question to ask the advisor.
+        question: String,
+        /// Optional extra context to give the advisor (relevant graph
+        /// state, what was tried, constraints). May be empty.
+        context: String,
+        rationale: String,
+    },
 }
 
 impl ProposerStep {
@@ -146,6 +160,7 @@ impl ProposerStep {
             Self::ReadyForVerify { .. } => "ready_for_verify",
             Self::Block { .. } => "block",
             Self::Explore { .. } => "explore",
+            Self::ConsultAdvisor { .. } => "consult_advisor",
         }
     }
 }
@@ -170,6 +185,10 @@ pub struct GraphProposer {
     pub temperature: f64,
     /// Output cap for proposer responses (mostly structured JSON, so small).
     pub max_tokens: Option<usize>,
+    /// Optional independent advisor model. When set, the `consult_advisor`
+    /// step routes its question to this model. When None, consult_advisor
+    /// degrades gracefully (a hint is injected, no crash).
+    pub advisor: Option<Arc<dyn Model>>,
 }
 
 impl GraphProposer {
@@ -185,11 +204,18 @@ impl GraphProposer {
             prompt_registry: None,
             temperature: 0.2,
             max_tokens: Some(32768),
+            advisor: None,
         }
     }
 
     pub fn with_temperature(mut self, t: f64) -> Self {
         self.temperature = t;
+        self
+    }
+
+    /// Attach an independent advisor model for the `consult_advisor` step.
+    pub fn with_advisor(mut self, advisor: Arc<dyn Model>) -> Self {
+        self.advisor = Some(advisor);
         self
     }
 
@@ -424,7 +450,7 @@ regular Task nodes.");
             }
         }
         // Enable native function calling (OpenAI tool_calls).
-        req.tools = proposer_tools();
+        req.tools = proposer_tools(self.advisor.is_some());
 
         let resp = self.model.complete(req).await?;
         let tokens = resp.usage.total_tokens as u64;
@@ -863,8 +889,8 @@ fn extract_salvage_question(parse_error: &str) -> String {
     default_q.to_string()
 }
 
-fn proposer_tools() -> Vec<serde_json::Value> {
-    vec![
+fn proposer_tools(has_advisor: bool) -> Vec<serde_json::Value> {
+    let mut tools = vec![
         serde_json::json!({
             "type": "function",
             "function": {
@@ -959,7 +985,26 @@ fn proposer_tools() -> Vec<serde_json::Value> {
                 }
             }
         }),
-    ]
+    ];
+    if has_advisor {
+        tools.push(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "consult_advisor",
+                "description": "Ask the independent advisor model a design or knowledge question and get a second opinion. The advisor only answers — it does NOT modify the graph. Use when you're genuinely unsure how to proceed and a second perspective would help. The answer is added to the conversation; you then decide the next step.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question for the advisor"},
+                        "context": {"type": "string", "description": "Optional relevant context: what you've tried, constraints, current graph state"},
+                        "rationale": {"type": "string"}
+                    },
+                    "required": ["question", "rationale"]
+                }
+            }
+        }));
+    }
+    tools
 }
 
 /// Parse a ProposerStep from native OpenAI tool_calls.
@@ -1025,6 +1070,13 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
             Ok(ProposerStep::Block {
                 reason: tc.arguments.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 needed_from_user: tc.arguments.get("needed_from_user").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            })
+        }
+        "consult_advisor" => {
+            Ok(ProposerStep::ConsultAdvisor {
+                question: tc.arguments.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                context: tc.arguments.get("context").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             })
         }
@@ -1196,6 +1248,21 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                 ));
             }
             Ok(ProposerStep::Explore { items, rationale })
+        }
+        "consult_advisor" => {
+            let question = value
+                .get("question")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    HarnessError::model("proposer: consult_advisor requires 'question'".to_string())
+                })?
+                .to_string();
+            let context = value
+                .get("context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(ProposerStep::ConsultAdvisor { question, context, rationale })
         }
         other => Err(HarnessError::model(format!(
             "proposer: unknown step '{other}'"
@@ -1779,6 +1846,42 @@ mod tests {
             }
             other => panic!("expected CallTool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_step_consult_advisor() {
+        let s = r#"{"step":"consult_advisor","question":"which algo?","context":"sorting 1M items","rationale":"unsure"}"#;
+        match parse_step(s).unwrap() {
+            ProposerStep::ConsultAdvisor { question, context, .. } => {
+                assert_eq!(question, "which algo?");
+                assert_eq!(context, "sorting 1M items");
+            }
+            other => panic!("expected ConsultAdvisor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_step_consult_advisor_from_tool_call() {
+        let tc = crate::model::ToolCall {
+            id: "1".into(),
+            name: "consult_advisor".into(),
+            arguments: serde_json::json!({"question":"q","rationale":"r"}),
+        };
+        match parse_step_from_tool_calls(&[tc]).unwrap() {
+            ProposerStep::ConsultAdvisor { question, context, .. } => {
+                assert_eq!(question, "q");
+                assert!(context.is_empty());
+            }
+            other => panic!("expected ConsultAdvisor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proposer_tools_includes_advisor_only_when_enabled() {
+        let without = proposer_tools(false);
+        assert!(!without.iter().any(|t| t["function"]["name"] == "consult_advisor"));
+        let with = proposer_tools(true);
+        assert!(with.iter().any(|t| t["function"]["name"] == "consult_advisor"));
     }
 
     #[test]

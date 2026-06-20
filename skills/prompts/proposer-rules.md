@@ -22,6 +22,10 @@ Declare the graph phase complete. Hands off to the Verifier.
 {"step":"block","reason":"...","needed_from_user":"...","rationale":"..."}
 Self-pause when blocked on something the user must provide.
 
+### consult_advisor
+{"step":"consult_advisor","question":"...","context":"...","rationale":"..."}
+Ask the independent advisor model for a second opinion on a design or knowledge question. Only available when an advisor backend is configured. The advisor ONLY answers — it does not modify the graph. Its answer is added to the conversation; you then decide the next step. Use sparingly: only when you are genuinely unsure and a second perspective would change what you do. Put any relevant state (what you tried, constraints) in `context`.
+
 ## Discipline rules
 
 - One step per turn. Never emit multiple JSON objects.

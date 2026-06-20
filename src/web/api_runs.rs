@@ -509,12 +509,20 @@ pub async fn drive_run(
     );
 
     // Proposer (with skills + dynamic prompt blocks).
-    let proposer = GraphProposer::new(
+    let mut proposer = GraphProposer::new(
         fast_model.clone(),
         main_tool_registry.clone(),
         Some(state.skills.clone()),
     )
     .with_prompt_registry(prompt_registry.clone());
+
+    // Optional advisor backend (consult_advisor). Wrapped so its output
+    // streams to the UI under the "advisor" label.
+    if let Some(advisor) = cfg.advisor_model() {
+        let advisor =
+            ModelWithEvents::wrap(advisor, session.event_tx.clone(), "advisor".into());
+        proposer = proposer.with_advisor(advisor);
+    }
 
     // Verifier, enricher, repairer.
     let verifier = Verifier::with_model(fast_model.clone());
@@ -985,7 +993,8 @@ fn step_transcripts(
         | ProposerStep::ProposePatch { rationale, .. }
         | ProposerStep::ReadyForVerify { rationale, .. }
         | ProposerStep::Block { rationale, .. }
-        | ProposerStep::Explore { rationale, .. } => rationale.trim().to_string(),
+        | ProposerStep::Explore { rationale, .. }
+        | ProposerStep::ConsultAdvisor { rationale, .. } => rationale.trim().to_string(),
     };
     if !rationale.is_empty() {
         out.push(("assistant".into(), rationale));
@@ -1075,6 +1084,13 @@ fn step_transcripts(
         }
         ProposerStep::ReadyForVerify { .. } => {
             Some(("assistant".into(), "✅ ready for verification".into()))
+        }
+        ProposerStep::ConsultAdvisor { question, .. } => {
+            if question.trim().is_empty() {
+                None
+            } else {
+                Some(("consult_advisor".into(), format!("💬 consulting advisor: {question}")))
+            }
         }
     };
     if let Some((role, content)) = action {

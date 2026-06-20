@@ -46,6 +46,18 @@ pub struct ModelConfig {
     /// DeepSeek-style reasoning effort ("high"/"max"). Ignored by backends
     /// that don't use it.
     pub reasoning_effort: Option<String>,
+    /// Optional independent advisor backend: (base_url, api_key, model).
+    /// When set, `advisor_model()` returns a client for it so the main
+    /// model can `consult_advisor`. Fully independent of the task backend.
+    pub advisor: Option<AdvisorConfig>,
+}
+
+/// Configuration for an independent advisor backend.
+#[derive(Debug, Clone)]
+pub struct AdvisorConfig {
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub model: String,
 }
 
 impl ModelConfig {
@@ -96,11 +108,30 @@ impl ModelConfig {
             deep,
             thinking_enabled: true,
             reasoning_effort: None,
+            advisor: Self::advisor_from_env(),
         })
+    }
+
+    /// Read the optional advisor backend from `ADVISOR_*` env vars.
+    /// Returns None unless both base_url and model are set.
+    fn advisor_from_env() -> Option<AdvisorConfig> {
+        let base_url = std::env::var("ADVISOR_BASE_URL").ok().filter(|s| !s.is_empty())?;
+        let model = std::env::var("ADVISOR_MODEL").ok().filter(|s| !s.is_empty())?;
+        let api_key = std::env::var("ADVISOR_API_KEY").ok().filter(|s| !s.is_empty());
+        Some(AdvisorConfig { base_url, api_key, model })
     }
 
     /// Build from web engine config (JSON file) — bypasses env vars entirely.
     pub fn from_engine_config(cfg: &crate::web::state::ModelTierConfig) -> Self {
+        let advisor = if !cfg.advisor_base_url.is_empty() && !cfg.advisor_model.is_empty() {
+            Some(AdvisorConfig {
+                base_url: cfg.advisor_base_url.clone(),
+                api_key: if cfg.advisor_api_key.is_empty() { None } else { Some(cfg.advisor_api_key.clone()) },
+                model: cfg.advisor_model.clone(),
+            })
+        } else {
+            None
+        };
         Self {
             base_url: cfg.base_url.clone(),
             api_key: if cfg.api_key.is_empty() { None } else { Some(cfg.api_key.clone()) },
@@ -108,6 +139,7 @@ impl ModelConfig {
             deep: cfg.deep_model.clone(),
             thinking_enabled: true,
             reasoning_effort: None,
+            advisor,
         }
     }
 
@@ -126,7 +158,18 @@ impl ModelConfig {
             deep: deep.into(),
             thinking_enabled: true,
             reasoning_effort: None,
+            advisor: None,
         }
+    }
+
+    /// Set an advisor backend programmatically.
+    pub fn with_advisor(mut self, base_url: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
+        self.advisor = Some(AdvisorConfig {
+            base_url: base_url.into(),
+            api_key,
+            model: model.into(),
+        });
+        self
     }
 
     /// Set thinking behavior (chain-of-thought on/off + DeepSeek effort).
@@ -144,6 +187,21 @@ impl ModelConfig {
     /// Build the **deep-tier** model client.
     pub fn deep_model(&self) -> Arc<dyn Model> {
         Arc::new(self.build(&self.deep))
+    }
+
+    /// Build the optional **advisor** model client. Returns None when no
+    /// advisor backend is configured. The advisor uses its own base_url +
+    /// key + model, and automatically gets the right per-backend request
+    /// format via `ModelCapabilities::from_model_name` (so a MiniMax
+    /// advisor speaks MiniMax, a DeepSeek advisor speaks DeepSeek).
+    pub fn advisor_model(&self) -> Option<Arc<dyn Model>> {
+        let a = self.advisor.as_ref()?;
+        let mut m = OpenAICompatModel::new(a.base_url.clone(), a.model.clone())
+            .with_thinking(self.thinking_enabled, self.reasoning_effort.clone());
+        if let Some(k) = &a.api_key {
+            m = m.with_api_key(k.clone());
+        }
+        Some(Arc::new(m))
     }
 
     fn build(&self, name: &str) -> OpenAICompatModel {
@@ -287,5 +345,19 @@ mod tests {
         assert_eq!(fast.name(), "a");
         let deep = cfg.deep_model();
         assert_eq!(deep.name(), "b");
+    }
+
+    #[test]
+    fn advisor_model_none_when_unconfigured() {
+        let cfg = ModelConfig::new("https://x/v1", None, "a", "b");
+        assert!(cfg.advisor_model().is_none());
+    }
+
+    #[test]
+    fn advisor_model_built_when_configured() {
+        let cfg = ModelConfig::new("https://x/v1", None, "a", "b")
+            .with_advisor("https://api.deepseek.com/v1", Some("sk-adv".into()), "deepseek-v4-pro");
+        let advisor = cfg.advisor_model().expect("advisor should be Some");
+        assert_eq!(advisor.name(), "deepseek-v4-pro");
     }
 }

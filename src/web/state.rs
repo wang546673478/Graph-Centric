@@ -70,6 +70,18 @@ pub struct ModelTierConfig {
     pub deep_model: String,
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Optional independent **advisor** backend. When `advisor_base_url`
+    /// and `advisor_model` are non-empty, the main (task) model can emit a
+    /// `consult_advisor` step to ask this separate model a question. Fully
+    /// independent of the task backend — different vendor, key, model.
+    #[serde(default)]
+    pub advisor_base_url: String,
+    #[serde(default)]
+    pub advisor_api_key: String,
+    #[serde(default)]
+    pub advisor_api_key_masked: String,
+    #[serde(default)]
+    pub advisor_model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +187,10 @@ impl EngineConfig {
                 fast_model,
                 deep_model,
                 default_model: None,
+                advisor_base_url: std::env::var("ADVISOR_BASE_URL").unwrap_or_default(),
+                advisor_api_key: std::env::var("ADVISOR_API_KEY").unwrap_or_default(),
+                advisor_api_key_masked: String::new(),
+                advisor_model: std::env::var("ADVISOR_MODEL").unwrap_or_default(),
             },
             ..Default::default()
         }
@@ -191,6 +207,15 @@ impl EngineConfig {
         unsafe {
             std::env::set_var("MODEL_NAME_FAST", &self.model.fast_model);
             std::env::set_var("MODEL_NAME_DEEP", &self.model.deep_model);
+        }
+        if !self.model.advisor_base_url.is_empty() {
+            unsafe { std::env::set_var("ADVISOR_BASE_URL", &self.model.advisor_base_url); }
+        }
+        if !self.model.advisor_api_key.is_empty() {
+            unsafe { std::env::set_var("ADVISOR_API_KEY", &self.model.advisor_api_key); }
+        }
+        if !self.model.advisor_model.is_empty() {
+            unsafe { std::env::set_var("ADVISOR_MODEL", &self.model.advisor_model); }
         }
     }
 
@@ -214,6 +239,10 @@ impl Default for EngineConfig {
                 fast_model: "deepseek-v4-flash".into(),
                 deep_model: "deepseek-v4-pro".into(),
                 default_model: None,
+                advisor_base_url: String::new(),
+                advisor_api_key: String::new(),
+                advisor_api_key_masked: String::new(),
+                advisor_model: String::new(),
             },
             policy: ToolPolicyConfig {
                 deny_patterns: vec![],

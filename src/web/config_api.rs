@@ -201,6 +201,11 @@ pub async fn get_config(
     } else {
         cfg.model.api_key_masked = String::new();
     }
+    cfg.model.advisor_api_key_masked = if cfg.model.advisor_api_key.is_empty() {
+        String::new()
+    } else {
+        mask_key(&cfg.model.advisor_api_key)
+    };
     Json(cfg)
 }
 
@@ -225,6 +230,18 @@ pub async fn post_config(
         }
         if let Some(v) = model.get("deep_model").and_then(|v| v.as_str()) {
             config.model.deep_model = v.to_string();
+        }
+        // Optional advisor backend (consult_advisor).
+        if let Some(v) = model.get("advisor_base_url").and_then(|v| v.as_str()) {
+            config.model.advisor_base_url = v.to_string();
+        }
+        if let Some(v) = model.get("advisor_api_key_masked").and_then(|v| v.as_str()) {
+            if !v.is_empty() && !v.contains("***") && v != "***" {
+                config.model.advisor_api_key = v.to_string();
+            }
+        }
+        if let Some(v) = model.get("advisor_model").and_then(|v| v.as_str()) {
+            config.model.advisor_model = v.to_string();
         }
     }
     if let Some(policy) = update.get("policy") {
@@ -280,6 +297,9 @@ pub async fn post_config(
     let mut response = config.clone();
     if !response.model.api_key.is_empty() {
         response.model.api_key_masked = mask_key(&response.model.api_key);
+    }
+    if !response.model.advisor_api_key.is_empty() {
+        response.model.advisor_api_key_masked = mask_key(&response.model.advisor_api_key);
     }
 
     Ok(Json(response))

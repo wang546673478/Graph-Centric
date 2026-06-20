@@ -1622,7 +1622,85 @@ impl GraphLoop {
                 Ok(LoopState::Running)
             }
             ProposerStep::ReadyForVerify { rationale: _ } => self.run_verify_and_maybe_repair().await,
+            ProposerStep::ConsultAdvisor { question, context, rationale: _ } => {
+                self.handle_consult_advisor(question, context).await
+            }
         }
+    }
+
+    /// Handle a `consult_advisor` step: route the question to the
+    /// independent advisor model and inject its answer into the
+    /// conversation. The advisor only answers — it never touches the
+    /// graph. Degrades gracefully (hint, no crash) when no advisor is
+    /// configured.
+    async fn handle_consult_advisor(
+        &mut self,
+        question: String,
+        context: String,
+    ) -> Result<LoopState> {
+        // Consulting is progress — reset the stuck detector.
+        self.stuck_repeat_count = 0;
+        self.last_stuck_signature = None;
+
+        let advisor = match self.proposer.advisor.clone() {
+            Some(a) => a,
+            None => {
+                self.conversation.add_user(
+                    "No advisor model is configured, so consult_advisor is unavailable. \
+                     Decide for yourself based on what you know, or use `explore` to \
+                     gather more information.",
+                );
+                return Ok(LoopState::Running);
+            }
+        };
+
+        let advisor_name = advisor.name().to_string();
+        let prompt = if context.trim().is_empty() {
+            format!(
+                "You are an expert advisor to another AI agent that is building a plan \
+                 graph for a task. Answer the agent's question directly and concretely. \
+                 Do not ask for clarification — give your best expert answer.\n\n\
+                 Question: {question}"
+            )
+        } else {
+            format!(
+                "You are an expert advisor to another AI agent that is building a plan \
+                 graph for a task. Answer the agent's question directly and concretely. \
+                 Do not ask for clarification — give your best expert answer.\n\n\
+                 Context: {context}\n\nQuestion: {question}"
+            )
+        };
+        let req = crate::model::ModelRequest {
+            messages: vec![crate::model::Message::user(prompt)],
+            tools: Vec::new(),
+            temperature: 0.3,
+            max_tokens: Some(4096),
+            stop: Vec::new(),
+        };
+        match advisor.complete(req).await {
+            Ok(resp) => {
+                self.tokens_used = self.tokens_used.saturating_add(resp.usage.total_tokens as u64);
+                let answer = if resp.content.trim().is_empty() {
+                    resp.reasoning_content.clone().unwrap_or_default()
+                } else {
+                    resp.content.clone()
+                };
+                info!(advisor = %advisor_name, answer_len = answer.len(), "advisor consulted");
+                self.conversation.add_user(format!(
+                    "Advisor ({advisor_name}) answered your question:\n\n{answer}\n\n\
+                     Use this to decide your next step. The advisor does not modify the \
+                     graph — you do."
+                ));
+            }
+            Err(e) => {
+                warn!(error = %e, advisor = %advisor_name, "advisor call failed");
+                self.conversation.add_user(format!(
+                    "The advisor call failed ({e}). Proceed using your own judgment or \
+                     try `explore` instead."
+                ));
+            }
+        }
+        Ok(LoopState::Running)
     }
 
     async fn run_verify_and_maybe_repair(&mut self) -> Result<LoopState> {
@@ -2992,6 +3070,12 @@ fn render_step_as_json(step: &ProposerStep) -> String {
             })).collect::<Vec<_>>(),
             "rationale": rationale,
         }),
+        ProposerStep::ConsultAdvisor { question, context, rationale } => serde_json::json!({
+            "step": "consult_advisor",
+            "question": question,
+            "context": context,
+            "rationale": rationale,
+        }),
     };
     v.to_string()
 }
@@ -4164,6 +4248,37 @@ mod tests {
 
     #[allow(dead_code)]
     fn _silence_unused(_k: NodeKind) {}
+
+    #[tokio::test]
+    async fn consult_advisor_degrades_gracefully_without_advisor() {
+        // No advisor configured → handler injects a hint and stays Running.
+        let mut gl = build_loop_with(vec!["{}"]);
+        let state = gl
+            .handle_consult_advisor("which approach?".into(), String::new())
+            .await
+            .unwrap();
+        assert!(matches!(state, LoopState::Running));
+        assert!(
+            gl.conversation.transcript().contains("No advisor model is configured"),
+            "should inject the graceful-degradation hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn consult_advisor_routes_to_advisor_and_injects_answer() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        let advisor: Arc<dyn Model> =
+            Arc::new(ScriptedModel::new(vec!["Use a merge sort for stability."]));
+        gl.proposer = gl.proposer.with_advisor(advisor);
+        let state = gl
+            .handle_consult_advisor("which sort?".into(), "1M items".into())
+            .await
+            .unwrap();
+        assert!(matches!(state, LoopState::Running));
+        let transcript = gl.conversation.transcript();
+        assert!(transcript.contains("Advisor"), "answer should be injected");
+        assert!(transcript.contains("merge sort"), "advisor's answer text present");
+    }
 
     // ── Self-optimization laws: helpers ──
 
