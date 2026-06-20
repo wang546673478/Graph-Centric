@@ -52,8 +52,11 @@ pub struct OpenAICompatModel {
 
 impl OpenAICompatModel {
     pub fn new(base_url: impl Into<String>, model_name: impl Into<String>) -> Self {
+        // 180s timeout: reasoning models (MiniMax M3, DeepSeek) with thinking
+        // enabled can take well over 30s for a single completion. The old 30s
+        // cap caused spurious `operation timed out` errors mid-run.
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(180))
             .build()
             .expect("reqwest client builds with default settings");
         let model_name = model_name.into();

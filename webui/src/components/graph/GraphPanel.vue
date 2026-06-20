@@ -130,6 +130,7 @@ function updateGraph() {
 
   // Add new nodes (and refresh classes on existing ones).
   const addedIds = new Set(props.fx?.added || [])
+  let structuralChange = false
   for (const n of visibleNodes.value) {
     const klass = [
       scopeSet.value.has(n.id) ? 'in-scope' : '',
@@ -141,6 +142,7 @@ function updateGraph() {
       existing.classes(klass)
       continue
     }
+    structuralChange = true
     const el = cy.add({ group: 'nodes', data: { id: n.id, label: n.summary || n.id }, classes: klass })
     // Entrance animation: fade in (faster flash when this came from a failure-replan).
     if (addedIds.has(n.id)) {
@@ -155,6 +157,7 @@ function updateGraph() {
     if (cy.getElementById(id).nonempty()) continue
     const dup = cy.edges().some((ed: any) => `${ed.data('source')}->${ed.data('target')}` === `${e.source}->${e.target}`)
     if (dup) continue
+    structuralChange = true
     cy.add({
       group: 'edges',
       data: { id, source: e.source, target: e.target, label: e.relation },
@@ -165,7 +168,18 @@ function updateGraph() {
     })
   }
 
-  cy.layout({ name: 'cose', animate: true, idealEdgeLength: 100, nodeRepulsion: 6000 }).run()
+  // Only re-layout when the graph structure actually changed (nodes/edges
+  // added or removed). Lock pre-existing nodes so they keep their positions
+  // — only the new nodes get placed — and `fit: false` so the viewport
+  // doesn't recenter/zoom. This removes the "whole panel refreshes" flicker:
+  // a class-only change (scope/selected) no longer triggers a full re-layout.
+  if (structuralChange) {
+    const existingNodes = cy.nodes().filter((n: any) => !addedIds.has(n.id()))
+    existingNodes.lock()
+    cy.layout({ name: 'cose', animate: true, fit: false, randomize: false, idealEdgeLength: 100, nodeRepulsion: 6000 })
+      .run()
+    existingNodes.unlock()
+  }
 }
 </script>
 
