@@ -188,7 +188,7 @@ impl Graph {
     }
 }
 
-const ACYCLIC_RELATIONS: &[RelationType] = &[RelationType::DependsOn];
+const ACYCLIC_RELATIONS: &[RelationType] = &[RelationType::DependsOn, RelationType::Contains];
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -275,6 +275,39 @@ mod tests {
             .iter()
             .any(|i| matches!(i, Inconsistency::Cycle { relation, .. } if relation == &RelationType::DependsOn));
         assert!(has_cycle, "expected Cycle in {issues:?}");
+    }
+
+    #[test]
+    fn leadsto_cycle_is_allowed() {
+        let mut g = Graph::new();
+        g.add_node(Node::task("x", "X"));
+        g.add_node(Node::task("y", "Y"));
+        g.add_edge(Edge::new("x", "y", RelationType::LeadsTo, 1.0, ""))
+            .unwrap();
+        g.add_edge(Edge::new("y", "x", RelationType::LeadsTo, 1.0, ""))
+            .unwrap();
+        // LeadsTo cycles must NOT be reported as inconsistencies.
+        let issues = g.find_inconsistencies();
+        assert!(
+            !issues.iter().any(|i| matches!(i, Inconsistency::Cycle { relation, .. } if *relation == RelationType::LeadsTo)),
+            "LeadsTo cycle should not be reported, but got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn detects_cycle_in_contains() {
+        let mut g = Graph::new();
+        g.add_node(Node::task("a", "A"));
+        g.add_node(Node::task("b", "B"));
+        g.add_edge(Edge::new("a", "b", RelationType::Contains, 1.0, ""))
+            .unwrap();
+        g.add_edge(Edge::new("b", "a", RelationType::Contains, 1.0, ""))
+            .unwrap();
+        let issues = g.find_inconsistencies();
+        assert!(
+            issues.iter().any(|i| matches!(i, Inconsistency::Cycle { relation, .. } if *relation == RelationType::Contains)),
+            "expected Contains Cycle in {issues:?}"
+        );
     }
 
     #[test]
