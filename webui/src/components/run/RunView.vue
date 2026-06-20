@@ -8,6 +8,7 @@ import GraphPanel3D from '../graph/GraphPanel3D.vue'
 import GraphPanel from '../graph/GraphPanel.vue'
 import { useSplitter } from '../../composables/useSplitter'
 import DebugTimeline from './DebugTimeline.vue'
+import RunDashboard from './RunDashboard.vue'
 
 const { t } = useI18n()
 const tab = ref('graph')
@@ -30,6 +31,12 @@ const nodes = computed(() => store.value?.nodes || [])
 const edges = computed(() => store.value?.edges || [])
 const status = computed(() => store.value?.status || 'idle')
 const errorMsg = computed(() => store.value?.error || '')
+const tokensUsed = computed(() => store.value?.tokensUsed || 0)
+const round = computed(() => store.value?.round || 0)
+const durationSec = computed(() => {
+  const r = activeRunId.value ? findRun(activeRunId.value) : null
+  return r?.duration_sec || 0
+})
 
 // Compute scope: nodes with edges in the graph are "in scope".
 const scopeNodeIds = computed(() => {
@@ -70,7 +77,11 @@ function connectToRun(id: string) {
       case 'error': s.error = d.message || 'Unknown error'; s.status = 'Error'; break
       case 'cascade_step': s.transcript.push({ role: 'cascade', content: `🔍 ${d.changed_node} ← ${d.predecessor}: ${d.verdict} — ${d.rationale}` }); break
       case 'model_call': s.transcript.push({ role: 'model', content: `🤖 ${d.component} (${d.completion_tokens || 0}t, ${d.duration_ms || 0}ms): ${(d.response_content || '').slice(0, 200)}` }); break
-      case 'checkpoint': s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` }); break
+      case 'checkpoint':
+        s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` })
+        if (typeof d.round === 'number') s.round = d.round
+        if (typeof d.index === 'number') s.lastCheckpoint = d.index
+        break
       case 'stream_chunk': {
         const comp = d.component || 'model'
         const streamRole = 'stream:' + comp
@@ -138,6 +149,27 @@ async function stopRun() {
   if (s) s.status = 'Cancelled'
 }
 
+async function branchRerun() {
+  const id = activeRunId.value
+  if (!id) return
+  const s = getRunStore(id)
+  const fromCp = s && s.lastCheckpoint >= 0 ? s.lastCheckpoint : 0
+  try {
+    const resp = await fetch(`/api/runs/${id}/branch`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ from_checkpoint: fromCp }),
+    }).then(r => r.json())
+    if (resp?.id) {
+      activeRunId.value = resp.id
+      const ns = getRunStore(resp.id)
+      ns.status = 'Running'
+      connectToRun(resp.id)
+    }
+  } catch (e: any) {
+    if (s) s.error = '分支重跑失败: ' + String(e)
+  }
+}
+
 async function submitTask(task: string) {
   if (sending.value) return
   sending.value = true
@@ -201,6 +233,7 @@ async function submitTask(task: string) {
         <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
+      <RunDashboard v-if="activeRunId" :status="status" :tokensUsed="tokensUsed" :round="round" :durationSec="durationSec" />
       <template v-if="tab === 'graph'">
         <GraphPanel v-if="graphView === '2d'" :key="(activeRunId || 'empty') + '-2d'"
           :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" :fx="graphFx" />
@@ -217,7 +250,8 @@ async function submitTask(task: string) {
     <div class="chat-panel" :style="{ width: chatWidth + 'px' }">
       <Transcript :messages="transcript" :status="status" :error="errorMsg" />
       <div class="toolbar">
-        <button v-if="status === 'Running'" class="danger" @click="stopRun">{{ t('run.stop') }}</button>
+        <button v-if="status === 'Running' || status === 'graph'" class="danger" @click="stopRun">{{ t('run.stop') }}</button>
+        <button v-if="activeRunId && (status === 'Done' || status === 'Error' || status === 'Cancelled' || status === 'paused')" class="secondary" @click="branchRerun">⑂ 分支重跑</button>
         <span class="run-label" v-if="activeRunId">{{ activeRunId.slice(0,8) }}… · {{ status }}</span>
       </div>
       <Composer :disabled="sending" @send="submitTask" />
