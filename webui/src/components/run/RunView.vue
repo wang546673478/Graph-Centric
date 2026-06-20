@@ -170,6 +170,21 @@ async function branchRerun() {
   }
 }
 
+async function confirmStart() {
+  const id = activeRunId.value
+  if (!id) return
+  try {
+    await fetch(`/api/runs/${id}/answer`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ answer: '__CONFIRM_START__' }),
+    })
+    const s = getRunStore(id)
+    if (s) s.status = 'Running'
+  } catch (e: any) {
+    const s = getRunStore(id); if (s) s.error = String(e)
+  }
+}
+
 async function submitTask(task: string) {
   if (sending.value) return
   sending.value = true
@@ -254,7 +269,7 @@ async function submitTask(task: string) {
         <button v-if="activeRunId && (status === 'Done' || status === 'Error' || status === 'Cancelled' || status === 'paused')" class="secondary" @click="branchRerun">⑂ 分支重跑</button>
         <span class="run-label" v-if="activeRunId">{{ activeRunId.slice(0,8) }}… · {{ status }}</span>
       </div>
-      <Composer :disabled="sending" @send="submitTask" />
+      <Composer :disabled="sending" :paused="status === 'paused' || status === 'Paused'" @send="submitTask" @confirmStart="confirmStart" />
     </div>
   </div>
 </template>
