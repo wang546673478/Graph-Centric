@@ -39,6 +39,13 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
     pub fast: String,
     pub deep: String,
+    /// Whether to request chain-of-thought from backends that support a
+    /// thinking toggle (DeepSeek reasoning_effort, MiniMax thinking object).
+    /// Default true.
+    pub thinking_enabled: bool,
+    /// DeepSeek-style reasoning effort ("high"/"max"). Ignored by backends
+    /// that don't use it.
+    pub reasoning_effort: Option<String>,
 }
 
 impl ModelConfig {
@@ -87,6 +94,8 @@ impl ModelConfig {
             api_key,
             fast,
             deep,
+            thinking_enabled: true,
+            reasoning_effort: None,
         })
     }
 
@@ -97,6 +106,8 @@ impl ModelConfig {
             api_key: if cfg.api_key.is_empty() { None } else { Some(cfg.api_key.clone()) },
             fast: cfg.fast_model.clone(),
             deep: cfg.deep_model.clone(),
+            thinking_enabled: true,
+            reasoning_effort: None,
         }
     }
 
@@ -113,7 +124,16 @@ impl ModelConfig {
             api_key,
             fast: fast.into(),
             deep: deep.into(),
+            thinking_enabled: true,
+            reasoning_effort: None,
         }
+    }
+
+    /// Set thinking behavior (chain-of-thought on/off + DeepSeek effort).
+    pub fn with_thinking(mut self, enabled: bool, reasoning_effort: Option<String>) -> Self {
+        self.thinking_enabled = enabled;
+        self.reasoning_effort = reasoning_effort;
+        self
     }
 
     /// Build the **fast-tier** model client.
@@ -127,7 +147,8 @@ impl ModelConfig {
     }
 
     fn build(&self, name: &str) -> OpenAICompatModel {
-        let mut m = OpenAICompatModel::new(self.base_url.clone(), name.to_string());
+        let mut m = OpenAICompatModel::new(self.base_url.clone(), name.to_string())
+            .with_thinking(self.thinking_enabled, self.reasoning_effort.clone());
         if let Some(k) = &self.api_key {
             m = m.with_api_key(k.clone());
         }

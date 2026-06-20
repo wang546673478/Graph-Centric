@@ -13,6 +13,7 @@
 //! - `MODEL_API_KEY`   optional; sent as `Authorization: Bearer …`
 
 use super::{FinishReason, Message, Model, ModelRequest, ModelResponse, Role, ToolCall, Usage};
+use super::capabilities::{ModelCapabilities, ReasoningField, ThinkingStyle};
 use crate::error::{HarnessError, Result};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -26,6 +27,17 @@ pub struct OpenAICompatModel {
     pub model_name: String,
     pub api_key: Option<String>,
     client: Client,
+    /// Per-model behavioral knobs (reasoning field, thinking style,
+    /// temperature ceiling, token field). Inferred from `model_name` at
+    /// construction; the agent core never sees these.
+    pub capabilities: ModelCapabilities,
+    /// Whether to request chain-of-thought ("thinking"). Default true,
+    /// matching backends where omitting the toggle means thinking on.
+    /// Only emitted when `capabilities.supports_thinking_toggle`.
+    pub thinking_enabled: bool,
+    /// DeepSeek-style reasoning effort ("high"/"max"). Only used when
+    /// `thinking_style == DeepSeek`.
+    pub reasoning_effort: Option<String>,
     /// Maximum number of attempts for a single model call (initial +
     /// retries). Transient HTTP errors (timeout, connect) trigger
     /// retries with exponential backoff up to this many attempts.
@@ -44,29 +56,97 @@ impl OpenAICompatModel {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client builds with default settings");
+        let model_name = model_name.into();
+        let capabilities = ModelCapabilities::from_model_name(&model_name);
         Self {
             base_url: base_url.into(),
-            model_name: model_name.into(),
+            model_name,
             api_key: None,
             client,
+            capabilities,
+            thinking_enabled: true,
+            reasoning_effort: None,
             retry_max_attempts: 1,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
         }
     }
 
+    /// Override the inferred capabilities (e.g. for a custom backend the
+    /// name-based inference doesn't recognize).
+    pub fn with_capabilities(mut self, caps: ModelCapabilities) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
+    /// Configure thinking: whether it's on, and (DeepSeek) the effort level.
+    pub fn with_thinking(mut self, enabled: bool, reasoning_effort: Option<String>) -> Self {
+        self.thinking_enabled = enabled;
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
     fn build_request_body(&self, request: &ModelRequest) -> OpenAIChatRequest {
+        let caps = &self.capabilities;
+        let temperature = request.temperature.min(caps.temperature_max).max(0.0);
+        // Token field: newer backends prefer max_completion_tokens.
+        let (max_tokens, max_completion_tokens) = if caps.prefers_max_completion_tokens {
+            (None, request.max_tokens)
+        } else {
+            (request.max_tokens, None)
+        };
+        // Thinking / reasoning fields, shaped per backend.
+        let (thinking, reasoning_effort, reasoning_split) = self.thinking_fields();
         OpenAIChatRequest {
             model: self.model_name.clone(),
             messages: request.messages.iter().map(|m| OpenAIMessage {
                 role: role_to_str(m.role).to_string(),
                 content: m.content.clone(),
             }).collect(),
-            temperature: Some(request.temperature),
-            max_tokens: request.max_tokens,
+            temperature: Some(temperature),
+            max_tokens,
+            max_completion_tokens,
             stop: request.stop.clone(),
             tools: request.tools.clone(),
             stream: false,
+            thinking,
+            reasoning_effort,
+            reasoning_split,
+        }
+    }
+
+    /// Produce the (thinking, reasoning_effort, reasoning_split) request
+    /// fields for this model's thinking style. All three are Option so
+    /// they serialize only when relevant.
+    fn thinking_fields(
+        &self,
+    ) -> (Option<serde_json::Value>, Option<String>, Option<bool>) {
+        let caps = &self.capabilities;
+        if !caps.supports_thinking_toggle {
+            return (None, None, None);
+        }
+        match caps.thinking_style {
+            ThinkingStyle::None => (None, None, None),
+            ThinkingStyle::DeepSeek => {
+                // DeepSeek toggles via reasoning_effort presence.
+                let effort = if self.thinking_enabled {
+                    Some(self.reasoning_effort.clone().unwrap_or_else(|| "high".into()))
+                } else {
+                    None
+                };
+                (None, effort, None)
+            }
+            ThinkingStyle::MiniMax => {
+                // MiniMax M3: thinking object + reasoning_split so the
+                // chain-of-thought returns in `reasoning_content` instead
+                // of polluting `content` with <think> tags.
+                let ty = if self.thinking_enabled { "adaptive" } else { "disabled" };
+                (
+                    Some(serde_json::json!({ "type": ty })),
+                    None,
+                    Some(true),
+                )
+            }
         }
     }
 
@@ -122,12 +202,24 @@ struct OpenAIChatRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     stop: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    /// MiniMax M3 thinking object `{"type":"adaptive"|"disabled"}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
+    /// DeepSeek reasoning effort ("high"/"max").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    /// MiniMax: route reasoning into `reasoning_content` instead of
+    /// `<think>` tags inside `content`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_split: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +245,9 @@ struct OpenAIChoice {
 struct OpenAIResponseMessage {
     #[serde(default)]
     content: Option<String>,
+    /// DeepSeek / MiniMax(reasoning_split) chain-of-thought channel.
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCall>>,
 }
@@ -192,24 +287,7 @@ impl Model for OpenAICompatModel {
     }
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
-        let messages: Vec<OpenAIMessage> = request
-            .messages
-            .into_iter()
-            .map(|m| OpenAIMessage {
-                role: role_to_str(m.role).to_string(),
-                content: m.content,
-            })
-            .collect();
-
-        let body = OpenAIChatRequest {
-            model: self.model_name.clone(),
-            messages,
-            temperature: Some(request.temperature),
-            max_tokens: request.max_tokens,
-            stop: request.stop,
-            tools: request.tools,
-            stream: false,
-        };
+        let body = self.build_request_body(&request);
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let url_for_error = url.clone();
@@ -266,7 +344,17 @@ impl Model for OpenAICompatModel {
             .next()
             .ok_or_else(|| HarnessError::model("no choices in model response"))?;
 
-        let content = first.message.content.unwrap_or_default();
+        let raw_content = first.message.content.unwrap_or_default();
+        // Reasoning channel: prefer the dedicated field; if the backend
+        // returned <think> tags inline (MiniMax native / reasoning_split
+        // off), split them out so `content` is clean for JSON parsing.
+        let (content, reasoning_content) = match self.capabilities.reasoning_field {
+            ReasoningField::ReasoningContent => {
+                (raw_content, first.message.reasoning_content)
+            }
+            ReasoningField::ThinkTag => split_think_tags(&raw_content),
+            ReasoningField::None => (raw_content, first.message.reasoning_content),
+        };
         let tool_calls: Vec<ToolCall> = first
             .message
             .tool_calls
@@ -304,7 +392,7 @@ impl Model for OpenAICompatModel {
 
         Ok(ModelResponse {
             content,
-            reasoning_content: None,
+            reasoning_content,
             tool_calls,
             finish_reason,
             usage,
@@ -539,6 +627,29 @@ fn role_to_str(role: Role) -> &'static str {
     }
 }
 
+/// Split `<think>...</think>` reasoning out of an inline content string
+/// (MiniMax native mode / reasoning_split off). Returns (clean_content,
+/// reasoning). If no think tags are present, returns the content unchanged
+/// with `None` reasoning. Handles a single leading think block, which is
+/// the shape these backends produce.
+fn split_think_tags(raw: &str) -> (String, Option<String>) {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    if let Some(open_idx) = raw.find(OPEN) {
+        if let Some(close_rel) = raw[open_idx + OPEN.len()..].find(CLOSE) {
+            let reasoning_start = open_idx + OPEN.len();
+            let reasoning = raw[reasoning_start..reasoning_start + close_rel].trim().to_string();
+            let mut clean = String::with_capacity(raw.len());
+            clean.push_str(&raw[..open_idx]);
+            clean.push_str(&raw[reasoning_start + close_rel + CLOSE.len()..]);
+            let clean = clean.trim().to_string();
+            let reasoning = if reasoning.is_empty() { None } else { Some(reasoning) };
+            return (clean, reasoning);
+        }
+    }
+    (raw.to_string(), None)
+}
+
 // ---------------------------------------------------------------------------
 // Retry + error formatting
 // ---------------------------------------------------------------------------
@@ -656,6 +767,79 @@ mod tests {
         assert_eq!(m.name(), "qwen3");
         assert_eq!(m.base_url, "http://localhost:11434/v1");
         assert!(m.api_key.is_none());
+    }
+
+    fn req(temperature: f64, max_tokens: Option<usize>) -> ModelRequest {
+        ModelRequest {
+            messages: vec![Message { role: Role::User, content: "hi".into() }],
+            tools: vec![],
+            temperature,
+            max_tokens,
+            stop: vec![],
+        }
+    }
+
+    #[test]
+    fn split_think_tags_extracts_reasoning() {
+        let (clean, reasoning) =
+            split_think_tags("<think>let me reason</think>{\"step\":\"x\"}");
+        assert_eq!(clean, "{\"step\":\"x\"}");
+        assert_eq!(reasoning.as_deref(), Some("let me reason"));
+    }
+
+    #[test]
+    fn split_think_tags_passthrough_without_tags() {
+        let (clean, reasoning) = split_think_tags("{\"step\":\"x\"}");
+        assert_eq!(clean, "{\"step\":\"x\"}");
+        assert!(reasoning.is_none());
+    }
+
+    #[test]
+    fn minimax_request_uses_thinking_object_and_completion_tokens() {
+        let m = OpenAICompatModel::new("https://api.minimaxi.com/v1", "MiniMax-M3");
+        let body = m.build_request_body(&req(0.7, Some(1000)));
+        // MiniMax prefers max_completion_tokens, not max_tokens.
+        assert_eq!(body.max_completion_tokens, Some(1000));
+        assert_eq!(body.max_tokens, None);
+        // thinking object + reasoning_split present.
+        assert!(body.thinking.is_some());
+        assert_eq!(body.reasoning_split, Some(true));
+        assert!(body.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn minimax_thinking_disabled_sets_type_disabled() {
+        let m = OpenAICompatModel::new("https://api.minimaxi.com/v1", "MiniMax-M3")
+            .with_thinking(false, None);
+        let body = m.build_request_body(&req(0.7, Some(1000)));
+        assert_eq!(body.thinking, Some(serde_json::json!({"type": "disabled"})));
+    }
+
+    #[test]
+    fn deepseek_request_uses_reasoning_effort() {
+        let m = OpenAICompatModel::new("https://api.deepseek.com/v1", "deepseek-v4-pro")
+            .with_thinking(true, Some("max".into()));
+        let body = m.build_request_body(&req(0.5, Some(800)));
+        assert_eq!(body.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(body.max_tokens, Some(800)); // legacy field
+        assert!(body.max_completion_tokens.is_none());
+        assert!(body.thinking.is_none());
+    }
+
+    #[test]
+    fn unknown_model_emits_no_thinking_fields() {
+        let m = OpenAICompatModel::new("http://localhost:11434/v1", "llama3");
+        let body = m.build_request_body(&req(0.7, Some(500)));
+        assert!(body.thinking.is_none());
+        assert!(body.reasoning_effort.is_none());
+        assert!(body.reasoning_split.is_none());
+    }
+
+    #[test]
+    fn temperature_clamped_to_capability_max() {
+        let m = OpenAICompatModel::new("https://api.minimaxi.com/v1", "MiniMax-M3");
+        let body = m.build_request_body(&req(5.0, None));
+        assert_eq!(body.temperature, Some(2.0));
     }
 
     #[test]

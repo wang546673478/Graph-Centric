@@ -3,10 +3,12 @@
 //! Per design principle #1 (model-agnostic), the harness only depends on
 //! the `Model` trait. Concrete backends plug in here.
 
+pub mod capabilities;
 pub mod config;
 pub mod openai_compat;
 pub mod streaming;
 
+pub use capabilities::{ModelCapabilities, ReasoningField, ThinkingStyle};
 pub use config::ModelConfig;
 pub use openai_compat::OpenAICompatModel;
 pub use streaming::ModelWithEvents;

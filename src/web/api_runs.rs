@@ -450,7 +450,14 @@ pub async fn drive_run(
     let _ = state.persistence.save_run_meta(&session.metadata().await);
 
     // Build the GraphLoop. This mirrors what bin/agent_a does.
-    let cfg = ModelConfig::from_engine_config(&state.config.engine.model);
+    let cfg = ModelConfig::from_engine_config(&state.config.engine.model).with_thinking(
+        state.config.engine.loop_tuning.thinking_enabled,
+        if state.config.engine.loop_tuning.reasoning_effort.is_empty() {
+            None
+        } else {
+            Some(state.config.engine.loop_tuning.reasoning_effort.clone())
+        },
+    );
     let fast_model =
         ModelWithEvents::wrap(cfg.fast_model(), session.event_tx.clone(), "fast".into());
     let deep_model =
