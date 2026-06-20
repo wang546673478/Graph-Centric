@@ -687,7 +687,23 @@ pub async fn drive_run(
             }
         }
 
-        let state_clone = gl.step().await;
+        // Race the step against the cancel token so a stop click during a
+        // long in-flight step (a model call can take up to ~180s) interrupts
+        // immediately instead of waiting for the step to finish. Without this,
+        // the cancel check at the top of the loop only fires between steps, so
+        // "stop" appeared to do nothing for many seconds.
+        let state_clone = tokio::select! {
+            biased;
+            _ = session.cancel.cancelled() => {
+                *session.status.write().await = RunStatus::Cancelled;
+                let _ = state.persistence.save_run_meta(&session.metadata().await);
+                session.emit(RunEvent::Done {
+                    final_result: serde_json::json!({"status": "cancelled"}),
+                });
+                return;
+            }
+            s = gl.step() => s,
+        };
 
         // v2: push checkpoint after each step.
         {
