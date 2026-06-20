@@ -4,9 +4,11 @@ import StatusPill from './StatusPill.vue'
 import { useI18n, locale } from '../../composables/useI18n'
 import { activeRunId } from '../../composables/useRunSocket'
 import { useRouter } from 'vue-router'
+import { useTheme } from '../../composables/useTheme'
 
 const { t } = useI18n()
 const router = useRouter()
+const { theme, toggleTheme } = useTheme()
 
 function newChat() {
   activeRunId.value = null
@@ -30,6 +32,10 @@ function toggleLang() {
       <button class="primary new-chat-btn" @click="newChat">{{ t('run.newChat') }}</button>
       <button class="lang-btn" @click="toggleLang" :title="locale === 'en' ? '切换到中文' : 'Switch to English'">
         {{ locale === 'en' ? '中文' : 'EN' }}
+      </button>
+      <button class="theme-btn" @click="toggleTheme"
+        :title="theme === 'dark' ? '切换到浅色' : '切换到深色'">
+        {{ theme === 'dark' ? '☀️' : '🌙' }}
       </button>
       <DetailModeToggle />
       <StatusPill />
@@ -57,4 +63,10 @@ nav a:hover, nav a.router-link-active {
   padding: 2px 8px; border-radius: 4px; font-size: 0.7rem; cursor: pointer;
 }
 .lang-btn:hover { color: var(--text); border-color: var(--accent); }
+.theme-btn {
+  background: var(--bg-hover); border: 1px solid var(--border);
+  padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; cursor: pointer;
+  line-height: 1;
+}
+.theme-btn:hover { border-color: var(--accent); }
 </style>
