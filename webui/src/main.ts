@@ -7,6 +7,7 @@ import SkillsView from './components/skills/SkillsView.vue'
 import FilesView from './components/files/FilesView.vue'
 import SettingsView from './components/config/SettingsView.vue'
 import UsageView from './components/usage/UsageView.vue'
+import { applyTheme } from './composables/useTheme'
 import './styles/main.css'
 
 const routes = [
@@ -19,4 +20,5 @@ const routes = [
 ]
 
 const router = createRouter({ history: createWebHashHistory(), routes })
+applyTheme() // 在挂载前应用主题,避免首帧闪白
 createApp(App).use(router).mount('#app')
