@@ -137,6 +137,7 @@ function updateGraph() {
 
   // Add new nodes (and refresh classes on existing ones).
   const addedIds = new Set(props.fx?.added || [])
+  const animatingIds = new Set<string>()  // nodes whose fade-in we start this round
   let structuralChange = false
   let staggerIdx = 0  // position of each new node within this batch
   for (const n of visibleNodes.value) {
@@ -156,11 +157,23 @@ function updateGraph() {
     // one rather than all at once. Each subsequent new node starts 90ms
     // later (capped). Failure-replan replacements flash in faster with no
     // stagger.
+    //
+    // Robustness: `style('opacity', 0)` sets an inline bypass. If the
+    // animation is interrupted (re-render / watch re-fire / re-layout),
+    // the node would be stranded at opacity 0 and stay invisible (only
+    // its edges would show). So on completion we removeStyle('opacity')
+    // to fall back to the stylesheet default (1), and we capture `el` so
+    // a stale closure can't matter.
     if (addedIds.has(n.id)) {
-      el.style('opacity', 0)
+      const node = el
+      node.style('opacity', 0)
+      animatingIds.add(n.id)
       const replaced = props.fx?.replaced
       const delay = replaced ? 0 : Math.min(staggerIdx * 90, 900)
-      el.animate({ style: { opacity: 1 } }, { duration: replaced ? 120 : 260, delay })
+      node.animate(
+        { style: { opacity: 1 } },
+        { duration: replaced ? 120 : 260, delay, complete: () => node.removeStyle('opacity') },
+      )
       staggerIdx++
     }
   }
@@ -199,6 +212,19 @@ function updateGraph() {
       .run()
     existingNodes.unlock()
   }
+
+  // Safety sweep: clear any stranded opacity bypass on nodes that are NOT
+  // animating this round. The entrance animation sets opacity:0 then fades
+  // to 1 via a `complete` callback — but if a subsequent updateGraph()
+  // (e.g. the snapshot that follows every patch) interrupts the animation
+  // before it completes, the callback never fires and the node stays
+  // invisible at opacity 0 forever (only its edges show). This guarantees
+  // every settled node is visible regardless of animation interruption.
+  cy.nodes().forEach((n: any) => {
+    if (!animatingIds.has(n.id()) && n.style('opacity') !== '1') {
+      n.removeStyle('opacity')
+    }
+  })
 }
 </script>
 
