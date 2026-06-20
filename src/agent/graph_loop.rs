@@ -325,6 +325,10 @@ enum Phase {
 /// complex nodes → verify" workflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphPhase {
+    /// Pre-build: confirm the goal WITH the user. The Proposer only emits
+    /// AskUser (options + "other", or free text) and never builds the graph
+    /// until the user sends the confirm sentinel. Skipped in heartbeat mode.
+    Clarifying,
     /// First step: build only Start (anchor, immutable) + Goal (target)
     /// with a single DependsOn edge Goal→Start.
     Seeding,
@@ -335,6 +339,11 @@ pub enum GraphPhase {
     /// Model emitted ready_for_verify — verifier runs, then Task phase.
     Verifying,
 }
+
+/// When the user sends this exact answer during the Clarifying phase, the
+/// loop treats the goal as confirmed and advances to Seeding. The frontend's
+/// "✅ 确认开始" button posts this via /answer.
+pub const CONFIRM_START_SENTINEL: &str = "__CONFIRM_START__";
 
 /// Pending caller-facing operations that block `step()` until `resume*` is called.
 #[derive(Debug, Clone)]
