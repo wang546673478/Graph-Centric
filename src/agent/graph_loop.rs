@@ -1498,51 +1498,51 @@ impl GraphLoop {
                             }
                             // Ensure exactly 2 nodes.
                             if kept.len() < 2 {
-                                // Model only provided 1 node; synthesize Goal.
+                                // Model only provided 1 node; synthesize deliverable.
                                 kept.push(Node {
-                                    id: NodeId::from("D"),
+                                    id: NodeId::from("deliverable"),
                                     kind: NodeKind::Task,
-                                    path: "D".into(),
-                                    summary: "Goal: task completed successfully".into(),
+                                    path: "deliverable".into(),
+                                    summary: "Deliverable: the desired outcome".into(),
                                     metadata: Default::default(),
                                     immutable: false,
                                     expanded: false,
                                 });
                             }
-                            // Re-identify: first node → A (anchor), last → D (goal).
-                            kept[0].id = NodeId::from("A");
+                            // Re-identify: first node → start (anchor), last → deliverable (goal).
+                            kept[0].id = NodeId::from("start");
                             kept[0].immutable = true;
                             kept[0].kind = NodeKind::Task;
                             if kept[0].summary.trim().is_empty() {
                                 kept[0].summary = "Start: current problem or initial state".into();
                             }
                             if kept.len() > 1 {
-                                kept[1].id = NodeId::from("D");
+                                kept[1].id = NodeId::from("deliverable");
                                 kept[1].kind = NodeKind::Task;
                                 if kept[1].summary.trim().is_empty() {
-                                    kept[1].summary = "Goal: desired outcome".into();
+                                    kept[1].summary = "Deliverable: desired outcome".into();
                                 }
                             }
                             patch.add_nodes = kept;
-                            // Enforce single DependsOn edge: D→A.
+                            // Enforce single LeadsTo edge: start→deliverable.
                             patch.add_edges = vec![Edge::new(
-                                NodeId::from("D"),
-                                NodeId::from("A"),
-                                RelationType::DependsOn,
+                                NodeId::from("start"),
+                                NodeId::from("deliverable"),
+                                RelationType::LeadsTo,
                                 0.9,
-                                "goal depends on start",
+                                "start leads to deliverable",
                             )];
                             patch.remove_edge_indices.clear();
                             patch.remove_node_ids.clear();
                         }
-                        // Ensure at least 1 DependsOn edge exists.
+                        // Ensure at least 1 LeadsTo edge exists.
                         if patch.add_edges.is_empty() && patch.add_nodes.len() >= 2 {
                             patch.add_edges.push(Edge::new(
-                                NodeId::from("D"),
-                                NodeId::from("A"),
-                                RelationType::DependsOn,
+                                NodeId::from("start"),
+                                NodeId::from("deliverable"),
+                                RelationType::LeadsTo,
                                 0.9,
-                                "goal depends on start",
+                                "start leads to deliverable",
                             ));
                         }
                     }
@@ -1550,10 +1550,12 @@ impl GraphLoop {
                     // Standard auto-fix for common model mistakes.
                     for node in &mut patch.add_nodes {
                         // Auto-set immutable:true on anchor-like nodes.
-                        // Matches: "A", "a", "anchor-*", "A-*", "A_*", "A.*"
+                        // Matches: "start", "a", "anchor-*", "A-*", "A_*", "A.*", "start*"
                         let id_lower = node.id.as_str().to_lowercase();
-                        let is_anchor = id_lower == "a"
+                        let is_anchor = id_lower == "start"
+                            || id_lower == "a"
                             || id_lower.contains("anchor")
+                            || id_lower.starts_with("start")
                             || id_lower.starts_with("a-")
                             || id_lower.starts_with("a_")
                             || id_lower.starts_with("a.")
@@ -2342,25 +2344,26 @@ impl GraphLoop {
         )
     }
 
-    /// Seeding stall: deterministically create the two-node Start(A)→Goal(D)
-    /// seed when the model refuses to. A is the immutable anchor (the
-    /// starting state); D is the goal. One DependsOn edge D→A wires the
-    /// minimal plan, matching the seed the Proposer would have produced.
+    /// Seeding stall: deterministically create the two-node start→deliverable
+    /// seed when the model refuses to. `start` is the immutable anchor (the
+    /// starting state); `deliverable` is the goal. One LeadsTo edge
+    /// start→deliverable wires the minimal plan, matching the seed the
+    /// Proposer would have produced.
     /// Guarantees the loop always leaves the empty-graph state.
     fn auto_seed_start_goal(&mut self) {
         use crate::graph::{Edge, Node, NodeId, NodeKind, RelationType};
         let mut anchor =
-            Node::new("A", NodeKind::Task, "A", "Start: current state / the task to accomplish");
+            Node::new("start", NodeKind::Task, "start", "Start: current state / the task to accomplish");
         anchor.immutable = true;
-        let goal = Node::new("D", NodeKind::Task, "D", "Goal: the task completed successfully");
+        let goal = Node::new("deliverable", NodeKind::Task, "deliverable", "Deliverable: the desired outcome");
         self.graph.add_node(anchor);
         self.graph.add_node(goal);
         let _ = self.graph.add_edge(Edge::new(
-            NodeId::from("D"),
-            NodeId::from("A"),
-            RelationType::DependsOn,
+            NodeId::from("start"),
+            NodeId::from("deliverable"),
+            RelationType::LeadsTo,
             0.9,
-            "goal depends on start",
+            "start leads to deliverable",
         ));
     }
 
@@ -2374,7 +2377,7 @@ impl GraphLoop {
         let goal_summary = self
             .graph
             .nodes
-            .get(&NodeId::from("D"))
+            .get(&NodeId::from("deliverable"))
             .map(|n| n.summary.clone())
             .unwrap_or_else(|| self.task.clone());
         let task = self.task.clone();
@@ -2981,10 +2984,10 @@ impl GraphLoop {
             .values()
             .find(|n| n.immutable)
             .map(|n| n.id.clone());
-        // Goal: prefer the conventional "D" id, else any non-immutable
+        // Goal: prefer the conventional "deliverable" id, else any non-immutable
         // sink the seed produced.
-        let goal = if self.graph.nodes.contains_key(&NodeId::from("D")) {
-            Some(NodeId::from("D"))
+        let goal = if self.graph.nodes.contains_key(&NodeId::from("deliverable")) {
+            Some(NodeId::from("deliverable"))
         } else {
             self.graph
                 .nodes
