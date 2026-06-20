@@ -15,6 +15,18 @@ pub enum RunEvent {
     Transcript { role: String, content: String },
     /// Full snapshot of the graph at this point in time.
     GraphSnapshot { nodes: Vec<NodeDto>, edges: Vec<EdgeDto> },
+    /// Incremental graph change since the previous step. Drives the
+    /// real-time build animation in the UI (new nodes fade/scale in,
+    /// removed nodes fade out). `replaced` is a heuristic flag: true when
+    /// this step both removed and added nodes (a likely failure-replan),
+    /// so the UI can flash the change instead of a plain fade.
+    GraphPatch {
+        added_nodes: Vec<NodeDto>,
+        removed_node_ids: Vec<String>,
+        added_edges: Vec<EdgeDto>,
+        removed_edges: Vec<EdgeDto>,
+        replaced: bool,
+    },
     /// Loop state transition.
     LoopState { kind: String, payload: serde_json::Value },
     /// Review verdict.
@@ -94,6 +106,7 @@ impl RunEvent {
         match self {
             Self::Transcript { .. } => "transcript",
             Self::GraphSnapshot { .. } => "graph",
+            Self::GraphPatch { .. } => "graph_patch",
             Self::LoopState { .. } => "loop_state",
             Self::Review { .. } => "review",
             Self::SkillCaptured { .. } => "skill_captured",
@@ -351,5 +364,33 @@ mod tests {
         let g = dto.into_graph();
         assert_eq!(g.node_count(), 1);
         assert_eq!(g.edge_count(), 0, "dangling edge should be silently dropped");
+    }
+
+    #[test]
+    fn graph_patch_event_name_is_graph_patch() {
+        let e = RunEvent::GraphPatch {
+            added_nodes: vec![],
+            removed_node_ids: vec![],
+            added_edges: vec![],
+            removed_edges: vec![],
+            replaced: false,
+        };
+        assert_eq!(e.event_name(), "graph_patch");
+    }
+
+    #[test]
+    fn graph_patch_serializes_with_type() {
+        let e = RunEvent::GraphPatch {
+            added_nodes: vec![NodeDto { id: "a".into(), kind: "Task".into(), summary: "A".into(), l1: None, l1_confidence: None }],
+            removed_node_ids: vec!["old".into()],
+            added_edges: vec![],
+            removed_edges: vec![],
+            replaced: true,
+        };
+        let v: serde_json::Value = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["type"], "graph_patch");
+        assert_eq!(v["data"]["added_nodes"][0]["id"], "a");
+        assert_eq!(v["data"]["removed_node_ids"][0], "old");
+        assert_eq!(v["data"]["replaced"], true);
     }
 }
