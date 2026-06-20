@@ -117,6 +117,13 @@ watch(() => [props.nodes, props.edges, props.scopeNodeIds, breadcrumb.value, pro
 
 function updateGraph() {
   if (!cy) return
+  // Node ids that already exist in the graph BEFORE this update. Used to
+  // lock only genuinely-pre-existing nodes during re-layout (so their
+  // positions are preserved) while letting newly-added nodes be placed.
+  // Must NOT rely on the patch event's `added` list: on the snapshot path
+  // (opening a run, first load) that list is empty, which previously caused
+  // every just-added node to be locked at (0,0) → all nodes overlapped.
+  const priorNodeIds = new Set<string>(cy.nodes().map((n: any) => n.id()))
   const wantNodeIds = new Set(visibleNodes.value.map((n: any) => n.id))
   const wantEdgeKeys = new Map<string, any>()
   visibleEdges.value.forEach((e: any, i: number) => wantEdgeKeys.set(`${e.source}->${e.target}`, { e, i }))
@@ -181,7 +188,12 @@ function updateGraph() {
   // doesn't recenter/zoom. This removes the "whole panel refreshes" flicker:
   // a class-only change (scope/selected) no longer triggers a full re-layout.
   if (structuralChange) {
-    const existingNodes = cy.nodes().filter((n: any) => !addedIds.has(n.id()))
+    // Lock only nodes that existed before this update (preserve their
+    // positions); newly-added nodes are left free so the layout places
+    // them. Using priorNodeIds — not the patch `added` list — ensures
+    // snapshot-path additions (where `added` is empty) still get placed
+    // instead of being locked at the origin and overlapping.
+    const existingNodes = cy.nodes().filter((n: any) => priorNodeIds.has(n.id()))
     existingNodes.lock()
     cy.layout({ name: 'cose', animate: true, fit: false, randomize: false, idealEdgeLength: 100, nodeRepulsion: 6000 })
       .run()
