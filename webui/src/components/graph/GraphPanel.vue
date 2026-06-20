@@ -3,7 +3,7 @@ import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
 import { useGraphColors } from '../../composables/useGraphColors'
 import { theme } from '../../composables/useTheme'
 
-const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[] }>()
+const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[]; fx?: { added: string[]; removed: string[]; replaced: boolean; ts: number } }>()
 const container = ref<HTMLElement>()
 let cy: any = null
 const breadcrumb = ref<string[]>([])  // stack of node IDs: ['project', 'auth.rs', 'login']
@@ -113,28 +113,58 @@ watch(theme, () => { if (cy) { cy.style(cyStyle()) } })
 
 onUnmounted(() => { if (cy) cy.destroy() })
 
-watch(() => [props.nodes, props.edges, props.scopeNodeIds, breadcrumb.value], updateGraph, { deep: true })
+watch(() => [props.nodes, props.edges, props.scopeNodeIds, breadcrumb.value, props.fx?.ts], updateGraph, { deep: true })
 
 function updateGraph() {
   if (!cy) return
-  cy.elements().remove()
-  cy.add([
-    ...visibleNodes.value.map((n: any) => ({
-      data: { id: n.id, label: n.summary || n.id },
-      classes: [
-        scopeSet.value.has(n.id) ? 'in-scope' : '',
-        hasChildren(n.id) ? 'complex' : '',
-        selectedNode.value?.id === n.id ? 'selected' : '',
-      ].filter(Boolean).join(' '),
-    })),
-    ...visibleEdges.value.map((e: any, i: number) => ({
-      data: { id: `e${i}`, source: e.source, target: e.target, label: e.relation },
+  const wantNodeIds = new Set(visibleNodes.value.map((n: any) => n.id))
+  const wantEdgeKeys = new Map<string, any>()
+  visibleEdges.value.forEach((e: any, i: number) => wantEdgeKeys.set(`${e.source}->${e.target}`, { e, i }))
+
+  // Remove nodes/edges no longer present.
+  cy.nodes().forEach((n: any) => { if (!wantNodeIds.has(n.id())) n.remove() })
+  cy.edges().forEach((ed: any) => {
+    const k = `${ed.data('source')}->${ed.data('target')}`
+    if (!wantEdgeKeys.has(k)) ed.remove()
+  })
+
+  // Add new nodes (and refresh classes on existing ones).
+  const addedIds = new Set(props.fx?.added || [])
+  for (const n of visibleNodes.value) {
+    const klass = [
+      scopeSet.value.has(n.id) ? 'in-scope' : '',
+      hasChildren(n.id) ? 'complex' : '',
+      selectedNode.value?.id === n.id ? 'selected' : '',
+    ].filter(Boolean).join(' ')
+    const existing = cy.getElementById(n.id)
+    if (existing.nonempty()) {
+      existing.classes(klass)
+      continue
+    }
+    const el = cy.add({ group: 'nodes', data: { id: n.id, label: n.summary || n.id }, classes: klass })
+    // Entrance animation: fade in (faster flash when this came from a failure-replan).
+    if (addedIds.has(n.id)) {
+      el.style('opacity', 0)
+      el.animate({ style: { opacity: 1 } }, { duration: props.fx?.replaced ? 120 : 300 })
+    }
+  }
+
+  // Add new edges.
+  for (const [, { e, i }] of wantEdgeKeys) {
+    const id = `e${i}`
+    if (cy.getElementById(id).nonempty()) continue
+    const dup = cy.edges().some((ed: any) => `${ed.data('source')}->${ed.data('target')}` === `${e.source}->${e.target}`)
+    if (dup) continue
+    cy.add({
+      group: 'edges',
+      data: { id, source: e.source, target: e.target, label: e.relation },
       classes: [
         scopeSet.value.has(e.source) && scopeSet.value.has(e.target) ? 'in-scope' : '',
         e.relation === 'Contains' ? 'Contains' : '',
       ].filter(Boolean).join(' '),
-    })),
-  ])
+    })
+  }
+
   cy.layout({ name: 'cose', animate: true, idealEdgeLength: 100, nodeRepulsion: 6000 }).run()
 }
 </script>
