@@ -80,7 +80,7 @@ fn expand_prompt(
     }}
   ],
   "edges": [
-    {{"source": "{id}-s1", "target": "{id}-s2", "relation": "DependsOn"}}
+    {{"source": "{id}-s1", "target": "{id}-s2", "relation": "LeadsTo"}}
   ],
   "rationale": "<为什么这样拆解，1句话>"
 }}
@@ -90,7 +90,7 @@ fn expand_prompt(
 1. 每个子节点 metadata 必须包含 files (数组)、action (字符串)
 2. files 使用相对于项目根的路径，如 "webui/src/components/run/Transcript.vue"
 3. expected_change 写具体的 CSS 属性或代码改动
-4. 子节点之间用 DependsOn 边连接
+4. 子节点之间用 LeadsTo 边连接(流程顺序);若有真正的依赖关系可用 DependsOn
 5. 至少 2 个子节点，最多 5 个
 6. 只输出 JSON，不要其他文字"##,
         id = node.id.as_str(),
@@ -288,7 +288,7 @@ fn parse_expansion_response(
                 edges.push(Edge::new(
                     src,
                     tgt,
-                    RelationType::DependsOn,
+                    RelationType::LeadsTo,
                     0.8,
                     "cascade expansion",
                 ));
@@ -353,7 +353,7 @@ mod tests {
     {"id": "t1-s2", "summary": "add line-height", "metadata": {"files": ["a.vue"], "action": "edit"}}
   ],
   "edges": [
-    {"source": "t1-s1", "target": "t1-s2", "relation": "DependsOn"}
+    {"source": "t1-s1", "target": "t1-s2", "relation": "LeadsTo"}
   ],
   "rationale": "two-step style fix"
 }

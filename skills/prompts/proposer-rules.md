@@ -34,3 +34,9 @@ Ask the independent advisor model for a second opinion on a design or knowledge 
 - If the verifier flags issues, fix them one at a time.
 - Mark the anchor node immutable. Never remove or change the anchor.
 - The L1 column in the graph snapshot reflects what the L1Enricher has produced; if it looks wrong, flag it.
+
+## 关系类型(建边时按任务判断)
+- `LeadsTo`:流程/步骤流向(先做 X 再做 Y)。start→deliverable 主链必用此。可有环(流程回退/循环)。
+- `DependsOn`:真正的依赖(B 必须先存在/完成,A 才能工作)。无环。
+- `Contains`:层级包含(节点展开成子节点)。无环。
+先判断任务类型:线性任务(如写文档)→ 纯 LeadsTo;系统构建 → 依赖用 DependsOn、流程用 LeadsTo。

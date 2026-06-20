@@ -383,11 +383,11 @@ async fn self_decompose_answer(
 
 ## 具体指引
 1. 如果图是空的（0节点）：告诉 Agent 立即建图。用 task 描述中的 A 和 D 作为锚点和目标，\
-   加至少1个中间 Task 节点。所有节点 kind 必须是 Task，所有边 relation 必须是 DependsOn，\
+   加至少1个中间 Task 节点。所有节点 kind 必须是 Task，主链边 relation 用 LeadsTo，\
    A 节点必须设 immutable:true。
 2. 如果 Agent 的 JSON 格式错误：告诉它\"简化你的输出，先生成一个最小可用的图（A→T1→D），\
    确保 add_nodes 数组有至少3个节点，add_edges 数组有至少2条边，每条边有 source 和 target 字段。\
-   kind 固定为 Task，relation 固定为 DependsOn。\"
+   kind 固定为 Task，主链用 LeadsTo；中间步骤按需选 LeadsTo(流程)/DependsOn(依赖)/Contains(包含)。\"
 3. 如果 Agent 问方向/做什么：从任务描述中直接提取 A 和 D，不要犹豫，直接选。
 4. 在任何情况下：禁止建议 Agent 使用 ask_user 或 block — 这是无人值守循环。
 
@@ -590,7 +590,7 @@ pub async fn drive_run(
         graph_schema: if is_heartbeat_active {
             Some(crate::agent::graph_loop::GraphSchema {
                 allowed_node_kinds: vec![crate::graph::NodeKind::Task],
-                required_edge_relation: Some(crate::graph::RelationType::DependsOn),
+                required_edge_relation: Some(crate::graph::RelationType::LeadsTo),
                 require_immutable_anchor: true,
                 // Flexible: model decides the graph structure naturally.
                 // A complex task may need A→B→C→D→E, a simple one just A→D.

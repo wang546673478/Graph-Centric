@@ -305,20 +305,22 @@ fn build_task_graph(parsed: Vec<ParsedTask>, world_graph: &Graph) -> Result<Grap
     for t in &parsed {
         let src = NodeId::from(t.id.as_str());
         for dep in &t.dependencies {
-            // dependent -DependsOn-> dependency (matches scheduler convention)
+            // subtask flow: src --LeadsTo--> dep (process sequence; may cycle)
             let tgt = NodeId::from(dep.as_str());
             g.add_edge(Edge::new(
                 src.clone(),
                 tgt,
-                RelationType::DependsOn,
+                RelationType::LeadsTo,
                 1.0,
                 "decomposer-declared dependency",
             ))?;
         }
     }
 
-    // Validation 4: catch cycles early (the scheduler would catch this too,
-    // but a clearer error here saves the loop a round-trip).
+    // Validation 4: DependsOn must stay acyclic (true hard dependencies).
+    // LeadsTo edges (flow/sequencing, used for subtask chains) may cycle and
+    // are NOT checked here — so this check naturally won't fire on the normal
+    // subtask flow chain which is now built with LeadsTo.
     if let Some(cycle) = g.find_cycle_in_relation(RelationType::DependsOn) {
         return Err(HarnessError::model(format!(
             "decomposer: cycle in task DAG via DependsOn: {:?}",
@@ -471,12 +473,12 @@ mod tests {
         let d = Decomposer::new(Arc::new(MockModel::new(resp)));
         let tg = d.decompose(&three_node_world(), "produce a report", None).await.unwrap();
         assert_eq!(tg.node_count(), 3);
-        // t3 -DependsOn-> t1, t3 -DependsOn-> t2 (2 edges)
+        // t3 -LeadsTo-> t1, t3 -LeadsTo-> t2 (2 flow edges)
         assert_eq!(tg.edge_count(), 2);
-        // Check that DagScheduler can handle this output.
-        let s = crate::scheduler::DagScheduler::new().plan(&tg).unwrap();
-        assert_eq!(s.depth(), 2); // [t1,t2], [t3]
-        assert_eq!(s.task_count(), 3);
+        // Verify edges are LeadsTo (flow/sequencing), not DependsOn.
+        for e in &tg.edges {
+            assert_eq!(e.relation, RelationType::LeadsTo, "subtask edges must be LeadsTo");
+        }
     }
 
     #[tokio::test]
@@ -530,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn decompose_detects_cycle_in_task_dag() {
-        // t1 -> t2 -> t1 (cycle)
+        // t1 -> t2 -> t1 (cycle via LeadsTo — now allowed for flow edges)
         let resp = r#"{
           "tasks": [
             {"id":"t1","description":"x","involved_nodes":["a"],"dependencies":["t2"],"needs":{}},
@@ -538,8 +540,10 @@ mod tests {
           ]
         }"#;
         let d = Decomposer::new(Arc::new(MockModel::new(resp)));
-        let err = d.decompose(&three_node_world(), "x", None).await.unwrap_err();
-        assert!(format!("{err}").contains("cycle"));
+        // LeadsTo cycles are valid (flow may loop); decompose should succeed.
+        let tg = d.decompose(&three_node_world(), "x", None).await.unwrap();
+        assert_eq!(tg.node_count(), 2);
+        assert_eq!(tg.edge_count(), 2);
     }
 
     #[tokio::test]
