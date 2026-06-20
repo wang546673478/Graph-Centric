@@ -3769,8 +3769,8 @@ mod tests {
         let verifier = Verifier::structural_only();
 
         let mut sources = std::collections::HashMap::new();
-        sources.insert(NodeId::from("A"), "pub struct X;\n".into());
-        sources.insert(NodeId::from("D"), "// goal\n".into());
+        sources.insert(NodeId::from("start"), "pub struct X;\n".into());
+        sources.insert(NodeId::from("deliverable"), "// goal\n".into());
         let loader = Arc::new(crate::context::InMemorySources(sources));
         let enricher = crate::agent::enricher::L1Enricher::new(shared.clone(), loader);
 
@@ -3787,8 +3787,8 @@ mod tests {
         let l1 = gl
             .graph
             .l1
-            .get(&NodeId::from("A"))
-            .expect("auto-enrichment should have written L1 for A");
+            .get(&NodeId::from("start"))
+            .expect("auto-enrichment should have written L1 for start");
         assert_eq!(l1.responsibility, "holds X");
         assert!((l1.confidence - 0.9).abs() < 1e-9);
 
@@ -4289,9 +4289,9 @@ mod tests {
             .values()
             .find(|n| n.immutable)
             .expect("anchor must exist");
-        assert_eq!(anchor.id.as_str(), "A");
-        // Goal D must reach A via the DependsOn edge.
-        assert!(gl.path_exists(&crate::graph::NodeId::from("D"), &crate::graph::NodeId::from("A")));
+        assert_eq!(anchor.id.as_str(), "start");
+        // start must reach deliverable via the LeadsTo edge.
+        assert!(gl.path_exists(&crate::graph::NodeId::from("start"), &crate::graph::NodeId::from("deliverable")));
     }
 
     #[tokio::test]
@@ -4347,29 +4347,30 @@ mod tests {
 
     // ── Self-optimization laws: helpers ──
 
-    /// Build an A→…→D chain graph: anchor A (immutable), goal D, plus
-    /// intermediate task nodes. DependsOn edges run successor→predecessor
-    /// (D depends on the last middle, …, first middle depends on A).
+    /// Build a start→…→deliverable chain graph: anchor "start" (immutable),
+    /// goal "deliverable", plus intermediate task nodes. LeadsTo edges run
+    /// predecessor→successor (start leads to first middle, …, last middle
+    /// leads to deliverable) — forward flow.
     fn build_chain_graph(gl: &mut GraphLoop, middles: &[&str], enrich_all: bool) {
         use crate::graph::{Edge, L1Description, Node, NodeId, RelationType};
-        let mut anchor = Node::task("A", "Start");
+        let mut anchor = Node::task("start", "Start");
         anchor.immutable = true;
         gl.graph.add_node(anchor);
-        gl.graph.add_node(Node::task("D", "Goal"));
+        gl.graph.add_node(Node::task("deliverable", "Goal"));
         for m in middles {
             gl.graph.add_node(Node::task(*m, *m));
         }
-        // Chain: D -> last middle -> ... -> first middle -> A
+        // Chain: start -> first middle -> ... -> last middle -> deliverable
         let mut chain: Vec<&str> = Vec::new();
-        chain.push("D");
-        chain.extend(middles.iter().rev());
-        chain.push("A");
+        chain.push("start");
+        chain.extend(middles.iter());
+        chain.push("deliverable");
         for pair in chain.windows(2) {
             gl.graph
                 .add_edge(Edge::new(
                     NodeId::from(pair[0]),
                     NodeId::from(pair[1]),
-                    RelationType::DependsOn,
+                    RelationType::LeadsTo,
                     0.9,
                     "",
                 ))
@@ -4396,12 +4397,12 @@ mod tests {
     fn anchor_goal_connected_false_when_path_broken() {
         use crate::graph::Node;
         let mut gl = build_loop_with(vec!["{}"]);
-        let mut anchor = Node::task("A", "Start");
+        let mut anchor = Node::task("start", "Start");
         anchor.immutable = true;
         gl.graph.add_node(anchor);
-        gl.graph.add_node(Node::task("D", "Goal"));
+        gl.graph.add_node(Node::task("deliverable", "Goal"));
         gl.graph.add_node(Node::task("B", "B"));
-        // No edges at all → D cannot reach A.
+        // No edges at all → start cannot reach deliverable.
         assert!(!gl.anchor_goal_connected());
     }
 
@@ -4410,7 +4411,7 @@ mod tests {
         use crate::graph::Node;
         let mut gl = build_loop_with(vec!["{}"]);
         build_chain_graph(&mut gl, &["B"], false);
-        // Add an orphan node with no path back to A.
+        // Add an orphan node that start cannot reach.
         gl.graph.add_node(Node::task("ORPHAN", "dangling"));
         let orphans = gl.replay_from_anchor();
         assert_eq!(orphans, vec![crate::graph::NodeId::from("ORPHAN")]);
