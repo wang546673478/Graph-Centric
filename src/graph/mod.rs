@@ -201,6 +201,8 @@ pub enum RelationType {
     Imports,
     Exports,
     DependsOn,
+    // Flow — process / sequencing ("start leads to deliverable"). May cycle.
+    LeadsTo,
     // Behavioral
     Calls,
     Triggers,
@@ -222,6 +224,7 @@ impl RelationType {
             Self::Imports => "Imports",
             Self::Exports => "Exports",
             Self::DependsOn => "DependsOn",
+            Self::LeadsTo => "LeadsTo",
             Self::Calls => "Calls",
             Self::Triggers => "Triggers",
             Self::Reads => "Reads",
@@ -239,6 +242,7 @@ impl RelationType {
             "Imports" => Self::Imports,
             "Exports" => Self::Exports,
             "DependsOn" => Self::DependsOn,
+            "LeadsTo" => Self::LeadsTo,
             "Calls" => Self::Calls,
             "Triggers" => Self::Triggers,
             "Reads" => Self::Reads,
@@ -247,6 +251,19 @@ impl RelationType {
             "InvalidatedBy" => Self::InvalidatedBy,
             _ => Self::Other(s.to_string()),
         }
+    }
+
+    /// Structural relations participate in graph connectivity/replay
+    /// traversal (start → deliverable flow, dependencies, containment).
+    /// Meta-relations (provenance) do not. Used by path_exists/replay to
+    /// decide which edges are walkable.
+    pub fn is_structural(&self) -> bool {
+        matches!(
+            self,
+            Self::Contains | Self::BelongsTo | Self::Imports | Self::Exports
+                | Self::DependsOn | Self::LeadsTo | Self::Calls | Self::Triggers
+                | Self::Reads | Self::Writes
+        )
     }
 }
 
@@ -1074,5 +1091,20 @@ mod tests {
         g.add_node(Node::task("a", "anchor"));
         g.set_anchor(&NodeId::from("a"));
         assert!(g.anchor().unwrap().immutable);
+    }
+
+    #[test]
+    fn leadsto_wire_roundtrips() {
+        assert_eq!(RelationType::LeadsTo.as_wire(), "LeadsTo");
+        assert!(matches!(RelationType::parse_wire("LeadsTo"), RelationType::LeadsTo));
+    }
+
+    #[test]
+    fn is_structural_classifies_relations() {
+        assert!(RelationType::LeadsTo.is_structural());
+        assert!(RelationType::DependsOn.is_structural());
+        assert!(RelationType::Contains.is_structural());
+        assert!(!RelationType::RevealedBy.is_structural());
+        assert!(!RelationType::InvalidatedBy.is_structural());
     }
 }
