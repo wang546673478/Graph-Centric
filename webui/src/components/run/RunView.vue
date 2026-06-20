@@ -5,10 +5,17 @@ import { useI18n } from '../../composables/useI18n'
 import Transcript from './Transcript.vue'
 import Composer from './Composer.vue'
 import GraphPanel3D from '../graph/GraphPanel3D.vue'
+import GraphPanel from '../graph/GraphPanel.vue'
+import { useSplitter } from '../../composables/useSplitter'
 import DebugTimeline from './DebugTimeline.vue'
 
 const { t } = useI18n()
 const tab = ref('graph')
+const graphView = ref<'2d' | '3d'>('2d')
+const { size: chatWidth, startDrag } = useSplitter(
+  { storageKey: 'gc-chat-width', initial: 380, min: 280, max: 720 },
+  true,
+)
 const sending = ref(false)
 let socket: ReturnType<typeof useRunSocket> | null = null
 
@@ -175,7 +182,30 @@ async function submitTask(task: string) {
 
 <template>
   <div class="run-view">
-    <div class="chat-panel">
+    <!-- 图主舞台 -->
+    <div class="graph-stage">
+      <div class="stage-tabs">
+        <div class="view-toggle">
+          <button :class="{ active: graphView === '2d' }" @click="graphView = '2d'">2D</button>
+          <button :class="{ active: graphView === '3d' }" @click="graphView = '3d'">3D</button>
+        </div>
+        <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
+        <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
+      </div>
+      <template v-if="tab === 'graph'">
+        <GraphPanel v-if="graphView === '2d'" :key="(activeRunId || 'empty') + '-2d'"
+          :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
+        <GraphPanel3D v-else :key="(activeRunId || 'empty') + '-3d'"
+          :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
+      </template>
+      <DebugTimeline v-else-if="tab === 'debug'" />
+    </div>
+
+    <!-- 可拖拽分隔条 -->
+    <div class="splitter" @mousedown="startDrag"></div>
+
+    <!-- 对话右栏(可调宽) -->
+    <div class="chat-panel" :style="{ width: chatWidth + 'px' }">
       <Transcript :messages="transcript" :status="status" :error="errorMsg" />
       <div class="toolbar">
         <button v-if="status === 'Running'" class="danger" @click="stopRun">{{ t('run.stop') }}</button>
@@ -183,27 +213,22 @@ async function submitTask(task: string) {
       </div>
       <Composer :disabled="sending" @send="submitTask" />
     </div>
-    <div class="side-panel">
-      <div class="tabs">
-        <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
-        <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
-      </div>
-      <GraphPanel3D v-if="tab === 'graph'" :key="activeRunId || 'empty'" :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
-      <DebugTimeline v-else-if="tab === 'debug'" />
-      <div v-else class="placeholder">{{ t('files.empty') }}</div>
-    </div>
   </div>
 </template>
 
 <style scoped>
 .run-view { display: flex; flex: 1; min-height: 0; }
-.chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.graph-stage { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+.stage-tabs { display: flex; align-items: center; gap: 4px; border-bottom: 1px solid var(--border); background: var(--bg-panel); padding: 0 6px; }
+.stage-tabs > button { padding: 8px 10px; background: none; color: var(--text-muted); border-radius: 0; font-size: 0.8rem; }
+.stage-tabs > button.active { color: var(--accent); border-bottom: 2px solid var(--accent); font-weight: 500; }
+.view-toggle { display: flex; gap: 2px; margin-right: auto; padding: 4px 0; }
+.view-toggle button { padding: 2px 10px; font-size: 0.7rem; border: 1px solid var(--border); background: var(--bg); color: var(--text-muted); border-radius: 4px; }
+.view-toggle button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.splitter { width: 5px; flex-shrink: 0; cursor: col-resize; background: var(--border); transition: background 0.1s; }
+.splitter:hover { background: var(--accent); }
+.chat-panel { flex-shrink: 0; display: flex; flex-direction: column; min-width: 0; border-left: 1px solid var(--border); background: var(--bg-panel); }
 .toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-top: 1px solid var(--border); background: var(--bg); }
 .toolbar button { font-size: 0.75rem; padding: 4px 10px; }
 .run-label { font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono); }
-.side-panel { width: 420px; border-left: 1px solid var(--border); display: flex; flex-direction: column; background: var(--bg-panel); }
-.tabs { display: flex; border-bottom: 1px solid var(--border); }
-.tabs button { flex: 1; padding: 8px; background: none; color: var(--text-muted); border-radius: 0; font-size: 0.8rem; }
-.tabs button.active { color: var(--accent); border-bottom: 2px solid var(--accent); font-weight: 500; }
-.placeholder { padding: 24px; color: var(--text-muted); font-size: 0.85rem; }
 </style>
