@@ -1,5 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
+import { useGraphColors } from '../../composables/useGraphColors'
+import { theme } from '../../composables/useTheme'
 
 const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[] }>()
 const container = ref<HTMLElement>()
@@ -72,23 +74,25 @@ function goRoot() {
 }
 
 // ---- Cytoscape ----
-const NODE_COLOR = '#7c3aed'
-const COMPLEX_RING = '#f59e0b'
-const SCOPE_COLOR = '#059669'
+const C = useGraphColors()
+
+function cyStyle() {
+  return [
+    { selector: 'node', style: { 'background-color': C.node, 'label': 'data(label)', 'color': C.text, 'text-wrap': 'wrap', 'text-max-width': '100px', 'font-size': '9px', 'border-width': 1, 'border-color': C.node } },
+    { selector: 'node.in-scope', style: { 'background-color': C.scope, 'border-color': C.scope, 'border-width': 3, 'text-outline-color': C.scope, 'text-outline-width': 1 } },
+    { selector: 'node.complex', style: { 'border-width': 3, 'border-color': C.complex, 'border-style': 'double' } },
+    { selector: 'node.selected', style: { 'border-color': C.text, 'border-width': 3, 'text-outline-color': C.text, 'text-outline-width': 1 } },
+    { selector: 'edge', style: { 'width': 1.5, 'line-color': C.edge, 'target-arrow-color': C.edge, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '7px', 'color': C.text } },
+    { selector: 'edge.in-scope', style: { 'line-color': C.edgeScope, 'target-arrow-color': C.edgeScope, 'width': 2 } },
+    { selector: 'edge.Contains', style: { 'line-style': 'dashed', 'line-color': C.complex, 'target-arrow-color': C.complex } },
+  ]
+}
 
 onMounted(() => {
   if (container.value && (window as any).cytoscape) {
     cy = (window as any).cytoscape({
       container: container.value,
-      style: [
-        { selector: 'node', style: { 'background-color': NODE_COLOR, 'label': 'data(label)', 'color': '#1a1a2e', 'text-wrap': 'wrap', 'text-max-width': '100px', 'font-size': '9px', 'border-width': 1, 'border-color': NODE_COLOR } },
-        { selector: 'node.in-scope', style: { 'background-color': SCOPE_COLOR, 'border-color': SCOPE_COLOR, 'border-width': 3, 'text-outline-color': '#d1fae5', 'text-outline-width': 2 } },
-        { selector: 'node.complex', style: { 'border-width': 3, 'border-color': COMPLEX_RING, 'border-style': 'double' } },
-        { selector: 'node.selected', style: { 'border-color': '#fff', 'border-width': 3, 'text-outline-color': '#fff', 'text-outline-width': 2 } },
-        { selector: 'edge', style: { 'width': 1.5, 'line-color': '#c4b5e0', 'target-arrow-color': '#a78bda', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'label': 'data(label)', 'font-size': '7px', 'color': '#787878' } },
-        { selector: 'edge.in-scope', style: { 'line-color': SCOPE_COLOR, 'target-arrow-color': SCOPE_COLOR, 'width': 2 } },
-        { selector: 'edge.Contains', style: { 'line-style': 'dashed', 'line-color': COMPLEX_RING, 'target-arrow-color': COMPLEX_RING } },
-      ],
+      style: cyStyle(),
       layout: { name: 'cose', animate: true, idealEdgeLength: 100, nodeRepulsion: 6000 },
     })
     // Click: drill down or show detail
@@ -104,6 +108,8 @@ onMounted(() => {
     updateGraph()
   }
 })
+
+watch(theme, () => { if (cy) { cy.style(cyStyle()) } })
 
 onUnmounted(() => { if (cy) cy.destroy() })
 
