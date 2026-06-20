@@ -6,7 +6,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRe
 import { useGraphColors } from '../../composables/useGraphColors'
 import { theme } from '../../composables/useTheme'
 
-const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[] }>()
+const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[]; fx?: { added: string[]; removed: string[]; replaced: boolean; ts: number } }>()
 const container = ref<HTMLElement>()
 const emit = defineEmits(['drillDown'])
 
