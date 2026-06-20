@@ -3013,6 +3013,7 @@ impl GraphLoop {
         seen.insert(from.clone());
         while let Some(cur) = queue.pop_front() {
             for edge in self.graph.outgoing(&cur) {
+                if !edge.relation.is_structural() { continue; }
                 if &edge.target == to {
                     return true;
                 }
@@ -3025,18 +3026,18 @@ impl GraphLoop {
     }
 
     /// Gap 2: re-walk the whole graph from the layer-1 Start (the
-    /// immutable anchor) and report any node whose dependency chain no
-    /// longer reaches the anchor — i.e. a structural break introduced when
-    /// an upstream node was re-planned or removed. This is the
-    /// deterministic counterpart to the (semantic, model-driven)
-    /// CascadeBacktracker: after a node is redesigned, the cascade checks
-    /// whether each *direct* predecessor still fits, while this replay
-    /// checks the *global* property the user described — "start from the
-    /// first-layer Start and walk the whole graph; wherever the path back
-    /// to Start is broken, that node's upstream needs re-planning."
+    /// immutable anchor) flowing *forward* along structural edges, and
+    /// report any node that `start` cannot reach — i.e. a structural break
+    /// introduced when a downstream node was re-planned or removed. Orphan
+    /// = start cannot flow TO the node. This is the deterministic
+    /// counterpart to the (semantic, model-driven) CascadeBacktracker:
+    /// after a node is redesigned, the cascade checks whether each *direct*
+    /// predecessor still fits, while this replay checks the *global*
+    /// property — "walk forward from Start; wherever Start can no longer
+    /// reach a node, that node's upstream needs re-planning."
     ///
     /// Returns the ids of orphaned non-anchor nodes, in stable order.
-    /// Empty result means the graph is fully wired back to Start.
+    /// Empty result means the graph is fully wired from Start.
     fn replay_from_anchor(&self) -> Vec<NodeId> {
         let anchor = match self.graph.nodes.values().find(|n| n.immutable) {
             Some(a) => a.id.clone(),
@@ -3047,7 +3048,7 @@ impl GraphLoop {
             .nodes
             .values()
             .filter(|n| !n.immutable && n.id != anchor)
-            .filter(|n| !self.path_exists(&n.id, &anchor))
+            .filter(|n| !self.path_exists(&anchor, &n.id))
             .map(|n| n.id.clone())
             .collect();
         orphaned.sort_by(|a, b| a.as_str().cmp(b.as_str()));
