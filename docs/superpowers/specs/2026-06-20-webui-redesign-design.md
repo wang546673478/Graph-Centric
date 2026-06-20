@@ -57,14 +57,17 @@
 - 手动编辑图节点 → 三期(本设计不含)。
 
 ## 数据流
-- 所有实时数据继续走 `useRunSocket` 的 WebSocket(`StreamChunk`/`Status`/图 patch/`advisor` 事件)。
+- 所有实时数据继续走 `useRunSocket` 的 WebSocket(`StreamChunk`/`Status`/图事件/`advisor` 事件)。
 - 主题、折叠状态、面包屑层栈为前端本地状态,不涉后端。
-- 图 patch 事件需后端确认会推送增量(若现在只推全量,后端加增量事件 → 在实现计划中核实)。
+- **图事件(已核实)**:后端当前**只推全量** `RunEvent::GraphSnapshot { nodes, edges }`(`run_session.rs:96`,每轮 step 后在 `api_runs.rs:727` 调一次),**没有增量 patch 事件**。
+- **决策:P2 给后端加一个增量事件** `RunEvent::GraphPatch`,携带语义:新增节点/边、删除节点/边、以及"失败重规划替换"标记(`reason: added | removed | replaced_after_failure`)。这样前端动画能精准区分"正常新增"vs"失败替换闪红",而不是靠 diff 推断。全量 `GraphSnapshot` 保留作为首帧/重连同步。
+  - 后端改动:`events.rs` 加 `GraphPatch` 变体;`graph_loop` 在 apply_patch / 重规划 / cascade 处发出对应增量(复用已有的 patch 数据 + 失败路径)。
+  - 前端:`useRunSocket` 收 `GraphPatch` → 驱动 d3-force 的 enter/update/exit 动画;`GraphSnapshot` 仍用于首帧。
 
 ## 分期(便于分阶段验收)
 
-- **P1 · 地基**:双主题系统 + 三栏布局骨架 + 顶栏主题切换。现有功能全部保留可用。
-- **P2 · 关系图主舞台**:GraphStage + 实时构建动画 + 着色 + 多层钻取/面包屑 + 节点详情卡。
+- **P1 · 地基**:双主题系统 + 三栏布局骨架 + 顶栏主题切换。现有功能全部保留可用。纯前端。
+- **P2 · 关系图主舞台**:后端新增 `GraphPatch` 增量事件(含失败替换语义)+ 前端 GraphStage + 实时构建动画 + 着色 + 多层钻取/面包屑 + 节点详情卡。**前后端都动**。
 - **P3 · 新功能**:对话渲染增强 + 顾问面板 + 运行仪表盘 + 交互式控制。
 
 ## 验证
