@@ -724,6 +724,9 @@ pub async fn drive_run(
             });
         }
 
+        // Emit the incremental diff BEFORE the snapshot — patch diffs
+        // against the previous last_graph, then the snapshot updates it.
+        session.emit_graph_patch(&gl.graph).await;
         session.emit_graph_snapshot(&gl.graph).await;
         // Status update — fires after every step so the UI can show
         // cumulative token cost + current phase. Cheap (one small
