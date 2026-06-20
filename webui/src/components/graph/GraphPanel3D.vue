@@ -3,6 +3,8 @@ import { ref, watch, onMounted, onUnmounted, computed, nextTick } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js'
+import { useGraphColors } from '../../composables/useGraphColors'
+import { theme } from '../../composables/useTheme'
 
 const props = defineProps<{ nodes: any[]; edges: any[]; scopeNodeIds?: string[] }>()
 const container = ref<HTMLElement>()
@@ -14,13 +16,14 @@ let nodeGroups: Map<string, THREE.Group> = new Map()
 let edgeGroups: Map<string, THREE.Group> = new Map()
 let animFrame: number
 const scopeSet = computed(() => new Set(props.scopeNodeIds || []))
+const C = useGraphColors()
 const NODE_R = 0.25, SCOPE_R = 0.35
 
-function labelDiv(text: string, size = '10px', color = '#1a1a2e'): CSS2DObject {
+function labelDiv(text: string, size = '10px', color = C.text): CSS2DObject {
   const div = document.createElement('div')
   div.textContent = text.length > 22 ? text.slice(0, 22) + '…' : text
   div.style.fontSize = size; div.style.color = color
-  div.style.fontWeight = '500'; div.style.textShadow = '0 0 4px #fff'
+  div.style.fontWeight = '500'; div.style.textShadow = `0 0 4px ${C.bg}`
   div.style.whiteSpace = 'nowrap'; div.style.fontFamily = 'system-ui, sans-serif'
   return new CSS2DObject(div)
 }
@@ -33,8 +36,8 @@ function posForNode(idx: number): THREE.Vector3 {
 function initScene() {
   if (!container.value) return
   const w = container.value.clientWidth, h = container.value.clientHeight
-  scene = new THREE.Scene(); scene.background = new THREE.Color('#f5f5f0')
-  scene.fog = new THREE.Fog('#f5f5f0', 15, 40)
+  scene = new THREE.Scene(); scene.background = new THREE.Color(C.bg)
+  scene.fog = new THREE.Fog(C.bg, 15, 40)
   camera = new THREE.PerspectiveCamera(50, w / h, 0.5, 60)
   camera.position.set(6, 4, 8); camera.lookAt(0, 0, 0)
   renderer = new THREE.WebGLRenderer({ antialias: true }); renderer.setSize(w, h); renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
@@ -46,7 +49,7 @@ function initScene() {
   controls.enableDamping = true; controls.dampingFactor = 0.08; controls.target.set(0, 0, 0)
   scene.add(new THREE.AmbientLight(0xffffff, 2))
   const d = new THREE.DirectionalLight(0xffffff, 3); d.position.set(10, 20, 10); scene.add(d)
-  scene.add(new THREE.GridHelper(20, 20, '#e0ddd6', '#e8e5df'))
+  scene.add(new THREE.GridHelper(20, 20, C.grid, C.grid))
   animate()
 }
 
@@ -61,17 +64,17 @@ function makeNodeGroup(id: string, label: string, inScope: boolean, hasKids: boo
   const g = new THREE.Group(); g.name = id
   g.userData = { id, label, inScope, hasKids }
   const r = inScope ? SCOPE_R : NODE_R
-  const c = inScope ? '#059669' : hasKids ? '#f59e0b' : '#7c3aed'
+  const c = inScope ? C.scope : hasKids ? C.complex : C.node
   g.add(new THREE.Mesh(new THREE.SphereGeometry(r, 32, 16), new THREE.MeshStandardMaterial({ color: c, roughness: 0.3, metalness: 0.1, emissive: c, emissiveIntensity: 0.2 })))
-  if (hasKids) g.add(new THREE.Mesh(new THREE.TorusGeometry(r + 0.08, 0.04, 16, 32), new THREE.MeshStandardMaterial({ color: '#f59e0b', emissive: '#f59e0b', emissiveIntensity: 0.4 })))
-  if (inScope) g.add(new THREE.Mesh(new THREE.SphereGeometry(r + 0.2, 32, 16), new THREE.MeshBasicMaterial({ color: '#059669', transparent: true, opacity: 0.15 })))
+  if (hasKids) g.add(new THREE.Mesh(new THREE.TorusGeometry(r + 0.08, 0.04, 16, 32), new THREE.MeshStandardMaterial({ color: C.complex, emissive: C.complex, emissiveIntensity: 0.4 })))
+  if (inScope) g.add(new THREE.Mesh(new THREE.SphereGeometry(r + 0.2, 32, 16), new THREE.MeshBasicMaterial({ color: C.scope, transparent: true, opacity: 0.15 })))
   const lbl = labelDiv(label || id); lbl.position.y = r + 0.4; g.add(lbl)
   return g
 }
 
 function makeEdgeGroup(from: THREE.Vector3, to: THREE.Vector3, inScope: boolean, label: string): THREE.Group {
   const g = new THREE.Group(); g.userData = { inScope }
-  const color = inScope ? '#059669' : '#c4b5e0'
+  const color = inScope ? C.scope : C.edge
   // Line
   const lGeo = new THREE.BufferGeometry().setFromPoints([from, to])
   g.add(new THREE.Line(lGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: inScope ? 0.7 : 0.3 })))
@@ -181,6 +184,13 @@ function onClick(e: MouseEvent) {
 
 watch(() => [props.nodes, props.edges], () => nextTick(updateGraph), { deep: true })
 onMounted(() => { initScene(); updateGraph(); animLoop(); container.value?.addEventListener('click', onClick) })
+watch(theme, () => {
+  if (!scene) return
+  scene.background = new THREE.Color(C.bg)
+  scene.fog = new THREE.Fog(C.bg, 15, 40)
+  clearAll()
+  updateGraph()
+})
 onUnmounted(() => { cancelAnimationFrame(animFrame); renderer?.dispose(); container.value?.removeEventListener('click', onClick) })
 </script>
 
@@ -197,7 +207,7 @@ onUnmounted(() => { cancelAnimationFrame(animFrame); renderer?.dispose(); contai
 <style scoped>
 .graph-3d { flex: 1; min-height: 300px; position: relative; cursor: grab; }
 .graph-3d:active { cursor: grabbing; }
-.legend-3d { position: absolute; bottom: 10px; right: 10px; z-index: 10; display: flex; gap: 12px; font-size: 0.65rem; color: #787878; background: #fff; padding: 4px 10px; border-radius: 6px; box-shadow: var(--shadow); }
+.legend-3d { position: absolute; bottom: 10px; right: 10px; z-index: 10; display: flex; gap: 12px; font-size: 0.65rem; color: var(--text-muted); background: var(--bg-panel); padding: 4px 10px; border-radius: 6px; box-shadow: var(--shadow); }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 3px; }
-.dot.scope { background: #059669; } .dot.node { background: #7c3aed; } .dot.complex { background: #f59e0b; border: 1px solid #f59e0b; }
+.dot.scope { background: var(--success); } .dot.node { background: var(--accent); } .dot.complex { background: var(--warning); border: 1px solid var(--warning); }
 </style>
