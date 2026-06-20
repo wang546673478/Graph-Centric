@@ -131,6 +131,7 @@ function updateGraph() {
   // Add new nodes (and refresh classes on existing ones).
   const addedIds = new Set(props.fx?.added || [])
   let structuralChange = false
+  let staggerIdx = 0  // position of each new node within this batch
   for (const n of visibleNodes.value) {
     const klass = [
       scopeSet.value.has(n.id) ? 'in-scope' : '',
@@ -144,10 +145,16 @@ function updateGraph() {
     }
     structuralChange = true
     const el = cy.add({ group: 'nodes', data: { id: n.id, label: n.summary || n.id }, classes: klass })
-    // Entrance animation: fade in (faster flash when this came from a failure-replan).
+    // Entrance animation: stagger so a batch of new nodes appears one by
+    // one rather than all at once. Each subsequent new node starts 90ms
+    // later (capped). Failure-replan replacements flash in faster with no
+    // stagger.
     if (addedIds.has(n.id)) {
       el.style('opacity', 0)
-      el.animate({ style: { opacity: 1 } }, { duration: props.fx?.replaced ? 120 : 300 })
+      const replaced = props.fx?.replaced
+      const delay = replaced ? 0 : Math.min(staggerIdx * 90, 900)
+      el.animate({ style: { opacity: 1 } }, { duration: replaced ? 120 : 260, delay })
+      staggerIdx++
     }
   }
 
