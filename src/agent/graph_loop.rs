@@ -3773,6 +3773,8 @@ mod tests {
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         let mut gl = GraphLoop::new("add module X", proposer, verifier, None, tools, cfg)
             .with_l1_enricher(enricher);
+        // Skip Clarifying — this test exercises the enricher, not the phase gate.
+        gl.graph_phase = GraphPhase::Seeding;
 
         // Step 1: proposer returns patch → apply → auto-enrich
         assert!(matches!(gl.step().await, LoopState::Running));
@@ -3803,6 +3805,8 @@ mod tests {
         }"#;
         let ready_json = r#"{"step":"ready_for_verify"}"#;
         let mut gl = build_loop_with(vec![patch_json, ready_json]);
+        // Skip Clarifying — this test exercises enricher absence, not the phase gate.
+        gl.graph_phase = GraphPhase::Seeding;
         // No .with_l1_enricher
 
         assert!(matches!(gl.step().await, LoopState::Running));
@@ -4291,6 +4295,7 @@ mod tests {
         // Model always emits an explore step (never a seed patch).
         let explore = r#"{"step":"explore","items":[{"scope":"x","question":"y"}],"rationale":"r"}"#;
         let mut gl = build_loop_with(vec![explore, explore, explore, explore]);
+        gl.graph_phase = GraphPhase::Seeding;
         assert_eq!(gl.graph_phase, GraphPhase::Seeding);
         // Rounds 1 & 2: still Seeding, empty graph, hint injected.
         let _ = gl.step_graph().await.unwrap();
@@ -4458,5 +4463,40 @@ mod tests {
             gl.check_convergence_hint();
         }
         assert!(!gl.convergence_hint_sent);
+    }
+
+    // ── Clarifying phase tests ──
+
+    #[tokio::test]
+    async fn non_heartbeat_run_starts_in_clarifying() {
+        let gl = build_loop_with(vec!["{}"]);
+        assert_eq!(gl.graph_phase, GraphPhase::Clarifying);
+    }
+
+    #[tokio::test]
+    async fn confirm_sentinel_advances_clarifying_to_seeding() {
+        let ask = r#"{"step":"ask_user","question":"目标是什么?","rationale":"r"}"#;
+        let mut gl = build_loop_with(vec![ask, ask]);
+        assert_eq!(gl.graph_phase, GraphPhase::Clarifying);
+        // Round 1: model asks → Paused, still Clarifying.
+        let s1 = gl.step_graph().await.unwrap();
+        assert!(matches!(s1, LoopState::Paused { .. }));
+        assert_eq!(gl.graph_phase, GraphPhase::Clarifying);
+        // User confirms via sentinel → next step advances to Seeding.
+        gl.resume(CONFIRM_START_SENTINEL);
+        let _ = gl.step_graph().await.unwrap();
+        assert_eq!(gl.graph_phase, GraphPhase::Seeding);
+    }
+
+    #[test]
+    fn heartbeat_run_starts_in_seeding() {
+        let model: Arc<dyn Model> = Arc::new(ScriptedModel::new(vec!["{}"]));
+        let tools = Arc::new(ToolRegistry::new());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
+        let verifier = Verifier::structural_only();
+        let mut cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
+        cfg.is_heartbeat = true;
+        let gl = GraphLoop::new("hb task", proposer, verifier, None, tools, cfg);
+        assert_eq!(gl.graph_phase, GraphPhase::Seeding);
     }
 }
