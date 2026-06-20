@@ -793,6 +793,11 @@ impl GraphLoop {
         } else {
             proposer.make_conversation(&task)
         };
+        let initial_phase = if config.is_heartbeat {
+            GraphPhase::Seeding
+        } else {
+            GraphPhase::Clarifying
+        };
         Self {
             proposer,
             verifier,
@@ -816,7 +821,7 @@ impl GraphLoop {
             conversation,
             graph: Graph::new(),
             round: 0,
-            graph_phase: GraphPhase::Seeding,
+            graph_phase: initial_phase,
             filling_rounds_without_nodes: 0,
             convergence_stable_count: 0,
             convergence_hint_sent: false,
