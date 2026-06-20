@@ -5,6 +5,8 @@ export interface WSEvent {
   type: string; data?: any
   role?: string; content?: string
   nodes?: any[]; edges?: any[]
+  added_nodes?: any[]; removed_node_ids?: string[]
+  added_edges?: any[]; removed_edges?: any[]; replaced?: boolean
   phase?: string; message?: string; tokens_used?: number
   kind?: string; payload?: any
   verdict?: string; rationale?: string

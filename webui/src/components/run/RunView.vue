@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, reactive } from 'vue'
 import { activeRunId, runs, findRun, createRun, useRunSocket, detailMode, WSEvent, getRunStore, loadRunData } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 import Transcript from './Transcript.vue'
@@ -15,6 +15,9 @@ const graphView = ref<'2d' | '3d'>('2d')
 const { size: chatWidth, startDrag } = useSplitter(
   { storageKey: 'gc-chat-width', initial: 380, min: 280, max: 720 },
   true,
+)
+const graphFx = reactive<{ added: string[]; removed: string[]; replaced: boolean; ts: number }>(
+  { added: [], removed: [], replaced: false, ts: 0 },
 )
 const sending = ref(false)
 let socket: ReturnType<typeof useRunSocket> | null = null
@@ -51,6 +54,12 @@ function connectToRun(id: string) {
     switch (e.type) {
       case 'transcript': s.transcript.push({ role: d.role || 'assistant', content: d.content || '' }); break
       case 'graph': case 'graph_snapshot': if (d.nodes) s.nodes = d.nodes; if (d.edges) s.edges = d.edges; break
+      case 'graph_patch':
+        graphFx.added = d.added_nodes?.map((n: any) => n.id) || []
+        graphFx.removed = d.removed_node_ids || []
+        graphFx.replaced = !!d.replaced
+        graphFx.ts = Date.now()
+        break
       case 'status': if (d.phase) s.status = d.phase; s.tokensUsed = d.tokens_used || s.tokensUsed; break
       case 'loop_state':
         if (d.kind === 'Paused') s.status = 'paused'
@@ -194,9 +203,9 @@ async function submitTask(task: string) {
       </div>
       <template v-if="tab === 'graph'">
         <GraphPanel v-if="graphView === '2d'" :key="(activeRunId || 'empty') + '-2d'"
-          :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
+          :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" :fx="graphFx" />
         <GraphPanel3D v-else :key="(activeRunId || 'empty') + '-3d'"
-          :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" />
+          :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" :fx="graphFx" />
       </template>
       <DebugTimeline v-else-if="tab === 'debug'" />
     </div>
