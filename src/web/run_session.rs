@@ -206,6 +206,18 @@ impl RunSession {
         self.pending_repair.notify_one();
     }
 
+    /// Freeze the elapsed duration into `persisted_duration_ms`. Call this
+    /// when the run reaches a terminal state (Done/Error/Cancelled) so the
+    /// reported duration stops growing — otherwise `metadata()` keeps using
+    /// the live `started_at.elapsed()` and a finished run appears to "still
+    /// be timing".
+    pub async fn freeze_duration(&self) {
+        let mut persisted = self.persisted_duration_ms.lock().await;
+        if *persisted == 0 {
+            *persisted = self.started_at.elapsed().as_millis() as u64;
+        }
+    }
+
     /// Snapshot of the run for the `GET /api/runs/{id}` endpoint.
     pub async fn metadata(&self) -> RunMetadata {
         let status = self.status.read().await.clone();

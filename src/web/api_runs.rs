@@ -671,6 +671,7 @@ pub async fn drive_run(
     loop {
         if session.cancel.is_cancelled() {
             *session.status.write().await = RunStatus::Cancelled;
+            session.freeze_duration().await;
             let _ = state.persistence.save_run_meta(&session.metadata().await);
             session.emit(RunEvent::Done {
                 final_result: serde_json::json!({"status": "cancelled"}),
@@ -696,6 +697,7 @@ pub async fn drive_run(
             biased;
             _ = session.cancel.cancelled() => {
                 *session.status.write().await = RunStatus::Cancelled;
+                session.freeze_duration().await;
                 let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Done {
                     final_result: serde_json::json!({"status": "cancelled"}),
@@ -864,6 +866,7 @@ pub async fn drive_run(
             }
             LoopState::Done(final_result) => {
                 *session.status.write().await = RunStatus::Done;
+                session.freeze_duration().await;
                 // Persist run metadata so it survives restarts.
                 let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Done {
@@ -937,6 +940,7 @@ pub async fn drive_run(
             }
             LoopState::Error(msg) => {
                 *session.status.write().await = RunStatus::Error(msg.clone());
+                session.freeze_duration().await;
                 let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Error { message: msg });
                 // Heartbeat: error counts as learning — advance to next round.
@@ -952,6 +956,7 @@ pub async fn drive_run(
             LoopState::TaskFailed { failures } => {
                 *session.status.write().await =
                     RunStatus::Error(format!("task failed: {failures:?}"));
+                session.freeze_duration().await;
                 let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Error {
                     message: format!("task failed: {failures:?}"),
