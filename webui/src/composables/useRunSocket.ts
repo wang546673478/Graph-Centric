@@ -35,6 +35,7 @@ const runStores = new Map<string, {
   transcript: { role: string; content: string }[]
   nodes: any[]; edges: any[]
   status: string; tokensUsed: number; error: string
+  round: number; lastCheckpoint: number
 }>()
 
 function getStore(id: string) {
@@ -43,6 +44,7 @@ function getStore(id: string) {
       transcript: [] as { role: string; content: string }[],
       nodes: [] as any[], edges: [] as any[],
       status: 'idle', tokensUsed: 0, error: '',
+      round: 0, lastCheckpoint: -1,
     }))
   }
   return runStores.get(id)!
