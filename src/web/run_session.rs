@@ -108,6 +108,72 @@ impl RunSession {
         self.emit(RunEvent::GraphSnapshot { nodes, edges });
     }
 
+    /// Diff the current graph against the last snapshot and emit a
+    /// `GraphPatch` with the added/removed nodes and edges. No-op when
+    /// nothing changed. Does NOT update `last_graph` — the caller's
+    /// subsequent `emit_graph_snapshot` does that. Edges are identified
+    /// by (source, target, relation) since they have no id.
+    pub async fn emit_graph_patch(&self, graph: &Graph) {
+        use std::collections::HashSet;
+        let prev = self.last_graph.read().await.clone();
+
+        let prev_node_ids: HashSet<String> =
+            prev.nodes.keys().map(|k| k.to_string()).collect();
+        let new_node_ids: HashSet<String> =
+            graph.nodes.keys().map(|k| k.to_string()).collect();
+
+        let added_nodes: Vec<NodeDto> = graph
+            .nodes
+            .values()
+            .filter(|n| !prev_node_ids.contains(&n.id.to_string()))
+            .map(|n| NodeDto::from_node(n, graph.l1.get(&n.id)))
+            .collect();
+        let removed_node_ids: Vec<String> = prev_node_ids
+            .iter()
+            .filter(|id| !new_node_ids.contains(*id))
+            .cloned()
+            .collect();
+
+        let edge_key = |e: &crate::graph::Edge| {
+            format!("{}->{}:{:?}", e.source, e.target, e.relation)
+        };
+        let prev_edge_keys: HashSet<String> = prev.edges.iter().map(edge_key).collect();
+        let new_edge_keys: HashSet<String> = graph.edges.iter().map(edge_key).collect();
+
+        let added_edges: Vec<EdgeDto> = graph
+            .edges
+            .iter()
+            .filter(|e| !prev_edge_keys.contains(&edge_key(e)))
+            .map(EdgeDto::from_edge)
+            .collect();
+        let removed_edges: Vec<EdgeDto> = prev
+            .edges
+            .iter()
+            .filter(|e| !new_edge_keys.contains(&edge_key(e)))
+            .map(EdgeDto::from_edge)
+            .collect();
+
+        if added_nodes.is_empty()
+            && removed_node_ids.is_empty()
+            && added_edges.is_empty()
+            && removed_edges.is_empty()
+        {
+            return; // nothing changed; don't spam the UI
+        }
+
+        // Heuristic: removed + added nodes in the same step is a likely
+        // failure-replan replacement.
+        let replaced = !removed_node_ids.is_empty() && !added_nodes.is_empty();
+
+        self.emit(RunEvent::GraphPatch {
+            added_nodes,
+            removed_node_ids,
+            added_edges,
+            removed_edges,
+            replaced,
+        });
+    }
+
     /// Wait for the user to provide an answer (via `POST /api/runs/{id}/answer`).
     pub async fn await_answer(&self) -> String {
         self.pending_answer.notified().await;
