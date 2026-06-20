@@ -9,10 +9,11 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "vue": "^3.5.0",
-    "vue-router": "^4.4.0",
     "cytoscape": "^3.30.0",
-    "three": "^0.160.0"
+    "marked": "^18.0.5",
+    "three": "^0.160.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.4.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.1.0",
