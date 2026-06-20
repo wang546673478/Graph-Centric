@@ -653,6 +653,8 @@ pub struct GraphLoop {
     /// Whether the convergence hint has already been injected for the
     /// current stable streak (so we hint once, not every round).
     convergence_hint_sent: bool,
+    /// Whether the one-time Clarifying-phase instruction was injected.
+    clarifying_primed: bool,
     /// Gap (Seeding stall): consecutive rounds spent in the Seeding phase
     /// with an empty graph while the model chose a non-patch step (e.g.
     /// explore). The first action on any task must be the deterministic
@@ -825,6 +827,7 @@ impl GraphLoop {
             filling_rounds_without_nodes: 0,
             convergence_stable_count: 0,
             convergence_hint_sent: false,
+            clarifying_primed: false,
             seeding_rounds_without_patch: 0,
             last_verification: None,
             task_outcome: None,
@@ -1100,6 +1103,45 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
 
     async fn step_graph(&mut self) -> Result<LoopState> {
+        // ── Clarifying phase: confirm the goal with the user before building ──
+        // The user's "✅ 确认开始" button posts CONFIRM_START_SENTINEL via
+        // /answer, which resume() appended as the last user message. Seeing it
+        // means the goal is confirmed → advance to Seeding. Otherwise prime the
+        // Proposer (once) to emit an ask_user that confirms the goal; the
+        // normal AskUser→Paused path handles the back-and-forth.
+        if self.graph_phase == GraphPhase::Clarifying {
+            use crate::model::Role;
+            let confirmed = {
+                self.conversation
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.role, Role::User))
+                    .map(|m| m.content.trim() == CONFIRM_START_SENTINEL)
+                    .unwrap_or(false)
+            };
+            if confirmed {
+                info!("clarifying: user confirmed goal — advancing to Seeding");
+                self.graph_phase = GraphPhase::Seeding;
+                self.conversation.add_user(
+                    "✅ Goal confirmed. Now build the graph: emit a propose_patch \
+                     creating exactly two nodes — Start (A) and Goal (D) — joined by \
+                     one DependsOn edge.",
+                );
+            } else if !self.clarifying_primed {
+                self.clarifying_primed = true;
+                self.conversation.add_user(
+                    "GOAL CLARIFICATION PHASE. Before building anything, confirm the \
+                     user's goal. Emit an `ask_user` step: state your current \
+                     understanding of the goal, then either offer a few concrete \
+                     options (the user can also reply with their own answer), or ask \
+                     a focused question. Do NOT propose_patch or build the graph yet. \
+                     The user keeps answering until they click a confirm button. Keep \
+                     clarifying until then.",
+                );
+            }
+        }
+
         // ── Seeding guard: the first action must draw Start+Goal ──
         // The graph-centric design mandates that the first step on a task
         // is the deterministic 2-node Start→Goal seed, NOT exploration.
