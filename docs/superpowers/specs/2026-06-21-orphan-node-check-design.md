@@ -43,6 +43,8 @@ edges:    start -> deliverable : LeadsTo   ← 唯一一条边
 ### 3. 修过时提示词
 - `build_filling_hint()`:`A → T1 → D`、`DependsOn` → `start → 步骤 → deliverable`、`LeadsTo`;明确"加中间节点时必须同时用 LeadsTo 边把它接进主链"。
 - Seeding→Filling 转换提示(:1648):"between A and D" → "between start and deliverable";"insert intermediate Task nodes" 保留,补"并用 LeadsTo 连边接入主链"。
+- **中间节点命名引导**:在 build_filling_hint、Seeding→Filling 转换提示、以及 propose_patch 工具示例里,要求模型用**语义化短名**作中间节点 id(如 `outline`、`draft-intro`、`code-examples`、`proofread`),**不要用字母+序号**(B1、B2…、T1 等)——序号暗示固定数量/顺序槽位,语义名见名知意、数量任意,与 `start`/`deliverable` 风格一致。示例从 `T1` 改为如 `outline`。
+
 
 ## 数据流
 - 纯 agent 核心改动,无新增 web 端点。
