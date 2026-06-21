@@ -85,9 +85,11 @@ function connectToRun(id: string) {
         break
       case 'stream_chunk': {
         const comp = d.component || 'model'
-        const streamRole = 'stream:' + comp
         const thinkRole = 'thinking:' + comp
-        // Reasoning/thinking: per-component buffer.
+        // Keep thinking (reasoning) in the transcript (collapsible). Do NOT
+        // stream raw model content into the main chat — it includes the step
+        // JSON. The human-readable per-step summary (📝/🔍/✅) comes from the
+        // Transcript events instead; raw output stays in the Debug tab.
         if (d.reasoning_content) {
           const thinkLast = s.transcript[s.transcript.length - 1]
           if (thinkLast && thinkLast.role === thinkRole) {
@@ -96,27 +98,12 @@ function connectToRun(id: string) {
             s.transcript.push({ role: thinkRole, content: d.reasoning_content })
           }
         }
-        // Content: per-component buffer.
-        if (d.content) {
-          const last = s.transcript[s.transcript.length - 1]
-          if (last && last.role === streamRole) {
-            last.content += d.content
-          } else {
-            s.transcript.push({ role: streamRole, content: d.content })
-          }
-        }
         break
       }
       case 'stream_end': {
         const comp = d.component || 'model'
-        const streamRole = 'stream:' + comp
         const thinkRole = 'thinking:' + comp
-        // Lock streaming content to assistant.
-        const last = s.transcript[s.transcript.length - 1]
-        if (last && last.role === streamRole) {
-          last.role = 'assistant'
-        }
-        // Lock thinking content.
+        // Lock the streamed thinking block.
         const thinkLast = s.transcript[s.transcript.length - 1]
         if (thinkLast && thinkLast.role === thinkRole) {
           thinkLast.role = 'thinking'
@@ -132,6 +119,7 @@ function connectToRun(id: string) {
 
 // When activeRunId changes from sidebar, switch to that run.
 watch(activeRunId, (id) => {
+  clarifyOptions.value = []
   if (id && getRunStore(id)) {
     connectToRun(id)
   }

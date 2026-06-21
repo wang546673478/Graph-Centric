@@ -38,6 +38,11 @@ function useMd(r: string): boolean {
   // Render markdown for assistant/advisor/user prose; keep tool/detail/error monospace plain.
   return r === 'user' || r === 'assistant' || r === 'agent' || isAdvisor(r) || r.startsWith('stream:')
 }
+function looksLikeStepJson(c: string): boolean {
+  const t = (c || '').trim()
+  return t.startsWith('{') && t.includes('"step"')
+}
+
 function roleLabel(r: string): string {
   if (r.startsWith('stream:')) { const c = r.slice(7); return c === 'advisor' ? '顾问' : `流式:${c}` }
   if (r.startsWith('thinking:')) { const c = r.slice(9); return `思考:${c}` }
@@ -63,8 +68,8 @@ function roleLabel(r: string): string {
         </div>
         <pre v-if="expandedThinking.has(i)" class="thinking-body">{{ m.content }}</pre>
       </div>
-      <!-- Normal message -->
-      <div v-else class="msg" :class="roleClass(m.role)">
+      <!-- Normal message — skip bare step JSON that slipped through -->
+      <div v-else-if="!looksLikeStepJson(m.content)" class="msg" :class="roleClass(m.role)">
         <span v-if="showRoleTag(m.role)" class="role-tag">{{ roleLabel(m.role) }}</span>
         <div v-if="useMd(m.role)" class="md-body" v-html="renderMarkdown(m.content)"></div>
         <pre v-else class="body">{{ m.content }}</pre>
