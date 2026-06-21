@@ -171,22 +171,6 @@ async function branchRerun() {
   }
 }
 
-async function confirmStart() {
-  clarifyOptions.value = []
-  const id = activeRunId.value
-  if (!id) return
-  try {
-    await fetch(`/api/runs/${id}/answer`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ answer: '__CONFIRM_START__' }),
-    })
-    const s = getRunStore(id)
-    if (s) s.status = 'Running'
-  } catch (e: any) {
-    const s = getRunStore(id); if (s) s.error = String(e)
-  }
-}
-
 async function submitTask(task: string) {
   clarifyOptions.value = []
   if (sending.value) return
@@ -277,7 +261,7 @@ async function submitTask(task: string) {
           {{ opt }}
         </button>
       </div>
-      <Composer :disabled="sending" :paused="status === 'paused' || status === 'Paused'" @send="submitTask" @confirmStart="confirmStart" />
+      <Composer :disabled="sending" @send="submitTask" />
     </div>
   </div>
 </template>
