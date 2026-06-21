@@ -341,10 +341,6 @@ pub enum GraphPhase {
     Verifying,
 }
 
-/// When the user sends this exact answer during the Clarifying phase, the
-/// loop treats the goal as confirmed and advances to Seeding. The frontend's
-/// "✅ 确认开始" button posts this via /answer.
-pub const CONFIRM_START_SENTINEL: &str = "__CONFIRM_START__";
 
 /// Pending caller-facing operations that block `step()` until `resume*` is called.
 #[derive(Debug, Clone)]
@@ -1110,44 +1106,21 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
 
     async fn step_graph(&mut self) -> Result<LoopState> {
-        // ── Clarifying phase: confirm the goal with the user before building ──
-        // The user's "✅ 确认开始" button posts CONFIRM_START_SENTINEL via
-        // /answer, which resume() appended as the last user message. Seeing it
-        // means the goal is confirmed → advance to Seeding. Otherwise prime the
-        // Proposer (once) to emit an ask_user that confirms the goal; the
-        // normal AskUser→Paused path handles the back-and-forth.
-        if self.graph_phase == GraphPhase::Clarifying {
-            use crate::model::Role;
-            let confirmed = {
-                self.conversation
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| matches!(m.role, Role::User))
-                    .map(|m| m.content.trim() == CONFIRM_START_SENTINEL)
-                    .unwrap_or(false)
-            };
-            if confirmed {
-                info!("clarifying: user confirmed goal — advancing to Seeding");
-                self.graph_phase = GraphPhase::Seeding;
-                self.conversation.add_user(
-                    "✅ Goal confirmed. Now build the graph: emit a propose_patch \
-                     creating exactly two nodes — `start` (immutable anchor) and \
-                     `deliverable` (goal) — joined by one `LeadsTo` edge \
-                     start→deliverable.",
-                );
-            } else if !self.clarifying_primed {
-                self.clarifying_primed = true;
-                self.conversation.add_user(
-                    "GOAL CLARIFICATION PHASE. Before building anything, confirm the \
-                     user's goal. Emit an `ask_user` step: state your current \
-                     understanding of the goal, then either offer a few concrete \
-                     options (the user can also reply with their own answer), or ask \
-                     a focused question. Do NOT propose_patch or build the graph yet. \
-                     The user keeps answering until they click a confirm button. Keep \
-                     clarifying until then.",
-                );
-            }
+        // ── Clarifying phase: prime the Proposer (once) to confirm the goal ──
+        // The model keeps asking via ask_user until it is confident; when it
+        // decides the goal is clear it emits propose_patch — that IS the signal
+        // (handled in the ProposePatch arm below, Change 2).
+        if self.graph_phase == GraphPhase::Clarifying && !self.clarifying_primed {
+            self.clarifying_primed = true;
+            self.conversation.add_user(
+                "GOAL CLARIFICATION PHASE. Confirm the user's goal before building. \
+                 Emit `ask_user`: state your current understanding of the goal, and \
+                 provide 2-4 concrete `options` (the user can also type their own \
+                 answer). Keep asking until the goal is clear. When you are confident \
+                 about the deliverable, emit `propose_patch` to seed `start` and \
+                 `deliverable` — that begins building. Do not ask for confirmation; \
+                 starting to build IS the signal you're ready.",
+            );
         }
 
         // ── Seeding guard: the first action must draw Start+Goal ──
@@ -1483,6 +1456,13 @@ impl GraphLoop {
                 Ok(LoopState::Running)
             }
             ProposerStep::ProposePatch { mut patch, rationale: _ } => {
+                // If we're still Clarifying and the model starts building, that's
+                // the "goal confirmed" signal — advance to Seeding so the seed/guard
+                // logic treats this as the first build patch.
+                if self.graph_phase == GraphPhase::Clarifying {
+                    info!("clarifying: model started building — advancing to Seeding");
+                    self.graph_phase = GraphPhase::Seeding;
+                }
                 // ──────────────────────────────────────────────
                 // Orchestration layer: enforce the "Start→Goal first,
                 // then fill middle" workflow based on graph_phase.
@@ -4584,18 +4564,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirm_sentinel_advances_clarifying_to_seeding() {
-        let ask = r#"{"step":"ask_user","question":"目标是什么?","rationale":"r"}"#;
-        let mut gl = build_loop_with(vec![ask, ask]);
+    async fn propose_patch_advances_clarifying_to_seeding() {
+        // In Clarifying, when the model emits a propose_patch (starts building),
+        // the phase advances (no confirm button/sentinel). The seed patch then
+        // moves Seeding→Filling via the existing transition, so we end in Filling.
+        let patch = r#"{"step":"propose_patch","patch":{"add_nodes":[{"id":"start","kind":"Task","summary":"s","immutable":true},{"id":"deliverable","kind":"Task","summary":"d"}],"add_edges":[{"source":"start","target":"deliverable","relation":"LeadsTo","confidence":0.9}],"reason":"seed"},"rationale":"r"}"#;
+        let mut gl = build_loop_with(vec![patch]);
         assert_eq!(gl.graph_phase, GraphPhase::Clarifying);
-        // Round 1: model asks → Paused, still Clarifying.
-        let s1 = gl.step_graph().await.unwrap();
-        assert!(matches!(s1, LoopState::Paused { .. }));
-        assert_eq!(gl.graph_phase, GraphPhase::Clarifying);
-        // User confirms via sentinel → next step advances to Seeding.
-        gl.resume(CONFIRM_START_SENTINEL);
         let _ = gl.step_graph().await.unwrap();
-        assert_eq!(gl.graph_phase, GraphPhase::Seeding);
+        assert_ne!(gl.graph_phase, GraphPhase::Clarifying, "propose_patch should leave Clarifying");
     }
 
     #[test]
