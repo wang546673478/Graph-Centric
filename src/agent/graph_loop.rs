@@ -62,7 +62,8 @@ pub enum LoopState {
     Running,
 
     /// The agent has a question for the user. Caller must answer with `resume(answer)`.
-    Paused { question: String, rationale: String },
+    /// `options` are optional concrete choices (the user may also free-type).
+    Paused { question: String, options: Vec<String>, rationale: String },
 
     /// Graph errors were discovered DURING task execution or review (Phase 3+).
     /// The caller is expected to repair the graph and call
@@ -655,6 +656,10 @@ pub struct GraphLoop {
     convergence_hint_sent: bool,
     /// Whether the one-time Clarifying-phase instruction was injected.
     clarifying_primed: bool,
+    /// Signature (hash) of the last orphan-node set we hinted about, so we
+    /// don't re-inject the same "connect these nodes" hint every step. None
+    /// means no hint sent yet. Reset implicitly when the orphan set changes.
+    last_orphan_hint_sig: Option<u64>,
     /// Gap (Seeding stall): consecutive rounds spent in the Seeding phase
     /// with an empty graph while the model chose a non-patch step (e.g.
     /// explore). The first action on any task must be the deterministic
@@ -828,6 +833,7 @@ impl GraphLoop {
             convergence_stable_count: 0,
             convergence_hint_sent: false,
             clarifying_primed: false,
+            last_orphan_hint_sig: None,
             seeding_rounds_without_patch: 0,
             last_verification: None,
             task_outcome: None,
@@ -1036,6 +1042,7 @@ impl GraphLoop {
         if let Pending::AwaitingAnswer { question } = &self.pending {
             return LoopState::Paused {
                 question: question.clone(),
+                options: Vec::new(),
                 rationale: String::new(),
             };
         }
@@ -1237,12 +1244,12 @@ impl GraphLoop {
         }
 
         match step {
-            ProposerStep::AskUser { question, options: _, rationale } => {
+            ProposerStep::AskUser { question, options, rationale } => {
                 self.pending = Pending::AwaitingAnswer { question: question.clone() };
                 // Reset stuck detector — engaging the user is a way out.
                 self.stuck_repeat_count = 0;
                 self.last_stuck_signature = None;
-                Ok(LoopState::Paused { question, rationale })
+                Ok(LoopState::Paused { question, options, rationale })
             }
             ProposerStep::Block { reason, needed_from_user, rationale } => {
                 // Reset stuck detector — the model is explicitly
@@ -1259,7 +1266,7 @@ impl GraphLoop {
                 } else {
                     format!("[block] {reason} — {needed_from_user}")
                 };
-                Ok(LoopState::Paused { question, rationale })
+                Ok(LoopState::Paused { question, options: Vec::new(), rationale })
             }
             ProposerStep::Explore { items, rationale: _ } => {
                 // Claude Code's `EXPLORE_AGENT` pattern, with
