@@ -1650,10 +1650,12 @@ impl GraphLoop {
                                     info!("orchestration: Seeding → Filling ({}n/{}e)",
                                         self.graph.node_count(), self.graph.edge_count());
                                     self.conversation.add_user(
-                                        "✅ Start→Goal established. Now explore to understand \
-                                         what intermediate steps are needed between A and D. \
-                                         Use `explore` to read relevant files, then \
-                                         `propose_patch` to insert intermediate Task nodes."
+                                        "✅ start→deliverable established. Now work out the \
+                                         intermediate steps needed BETWEEN start and deliverable. \
+                                         Explore if needed, then `propose_patch` to insert step \
+                                         nodes — give them semantic ids (e.g. `outline`, \
+                                         `draft-intro`), NOT B1/B2/T1 — and connect each with \
+                                         `LeadsTo` edges so the path runs start → … → deliverable."
                                     );
                                 }
                                 GraphPhase::Filling => {
@@ -2392,14 +2394,16 @@ impl GraphLoop {
             format!("- {} (kind={:?}, summary=\"{}\")", n.id.as_str(), n.kind, n.summary)
         }).collect();
         format!(
-            "🔧 You have spent several rounds exploring but haven't added \
-             intermediate nodes between A and D. Based on your research, \
-             NOW add at least one intermediate Task node. Example:\n\
-             - Add node T1: \"read Transcript.vue and main.css to identify \
-             exact lines to change\"\n\
-             - Connect: A → T1 → D with DependsOn edges\n\n\
-             You MUST emit a `propose_patch` now with intermediate nodes. \
-             Do NOT explore again — you already have enough information.\n\n\
+            "🔧 You've spent several rounds without adding connected intermediate \
+             steps between start and deliverable. Based on what you know, NOW add \
+             step nodes AND wire them into the flow. Rules:\n\
+             - Use semantic ids (e.g. `outline`, `draft-intro`, `code-examples`, \
+             `proofread`), NOT letter+number ids like B1/B2/T1.\n\
+             - Every step node MUST sit on the path: connect with `LeadsTo` edges so \
+             it reads start → step → … → deliverable. Do not add a node without an \
+             edge wiring it in.\n\
+             - Emit a `propose_patch` now with the step node(s) AND their LeadsTo \
+             edges. Do NOT explore again — you have enough information.\n\n\
              Current graph:\n{node_info}",
             node_info = node_info.join("\n")
         )
