@@ -1804,6 +1804,25 @@ impl GraphLoop {
     }
 
     async fn run_verify_and_maybe_repair(&mut self) -> Result<LoopState> {
+        // Backstop: don't hand off to verification with orphan nodes (steps
+        // start can't reach). Bounce back to Filling and require the model to
+        // wire them into the start→…→deliverable chain first.
+        let orphans = self.replay_from_anchor();
+        if !orphans.is_empty() {
+            let ids = orphans
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            warn!(orphans = %ids, "ready_for_verify blocked: orphan nodes not on the chain");
+            self.graph_phase = GraphPhase::Filling;
+            self.conversation.add_user(format!(
+                "Cannot verify yet: these nodes are not connected into the main chain \
+                 (start cannot reach them): {ids}. Add `LeadsTo` edges to put each on the \
+                 path start → … → deliverable, then emit `ready_for_verify` again."
+            ));
+            return Ok(LoopState::Running);
+        }
         let result = self
             .verifier
             .verify(&self.graph, &self.task, Some(&self.conversation))
