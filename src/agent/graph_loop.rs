@@ -1132,8 +1132,9 @@ impl GraphLoop {
                 self.graph_phase = GraphPhase::Seeding;
                 self.conversation.add_user(
                     "✅ Goal confirmed. Now build the graph: emit a propose_patch \
-                     creating exactly two nodes — Start (A) and Goal (D) — joined by \
-                     one DependsOn edge.",
+                     creating exactly two nodes — `start` (immutable anchor) and \
+                     `deliverable` (goal) — joined by one `LeadsTo` edge \
+                     start→deliverable.",
                 );
             } else if !self.clarifying_primed {
                 self.clarifying_primed = true;
@@ -1169,10 +1170,12 @@ impl GraphLoop {
                 );
                 self.auto_seed_start_goal();
                 self.conversation.add_user(
-                    "I auto-created the Start (A) and Goal (D) nodes because the first \
-                     step on any task must be the 2-node Start→Goal seed, not endless \
-                     exploration. The graph is now in the Filling phase — explore if you \
-                     must, then `propose_patch` intermediate nodes between A and D.",
+                    "I auto-created the `start` (immutable anchor) and `deliverable` (goal) \
+                     nodes because the first step on any task must be the 2-node \
+                     start→deliverable seed, not endless exploration. The graph is now in \
+                     the Filling phase — explore if you must, then `propose_patch` step \
+                     nodes BETWEEN start and deliverable (semantic ids like `outline`, not \
+                     B1/B2), each wired in with `LeadsTo` edges.",
                 );
                 self.graph_phase = GraphPhase::Filling;
                 self.seeding_rounds_without_patch = 0;
