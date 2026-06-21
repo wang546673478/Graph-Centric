@@ -77,7 +77,7 @@ function connectToRun(id: string) {
       case 'done': s.status = 'Done'; break
       case 'error': s.error = d.message || 'Unknown error'; s.status = 'Error'; break
       case 'cascade_step': s.transcript.push({ role: 'cascade', content: `🔍 ${d.changed_node} ← ${d.predecessor}: ${d.verdict} — ${d.rationale}` }); break
-      case 'model_call': s.transcript.push({ role: 'model', content: `🤖 ${d.component} (${d.completion_tokens || 0}t, ${d.duration_ms || 0}ms): ${(d.response_content || '').slice(0, 200)}` }); break
+      case 'model_call': s.transcript.push({ role: 'model', content: `🤖 ${d.component} (${d.completion_tokens || 0}t, ${d.duration_ms || 0}ms): ${(d.response_content || '').slice(0, 2000)}` }); break
       case 'checkpoint':
         s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` })
         if (typeof d.round === 'number') s.round = d.round

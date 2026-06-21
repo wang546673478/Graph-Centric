@@ -76,7 +76,7 @@ const graph = computed(() => ({
               <span class="badge model-badge">LLM</span>
               <span class="entry-role">{{ item.data.role }}</span>
             </div>
-            <pre class="entry-body">{{ item.data.content?.slice(0, 500) }}</pre>
+            <pre class="entry-body">{{ item.data.content?.slice(0, 2000) }}</pre>
           </div>
 
           <!-- Tool Use -->
