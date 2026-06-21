@@ -8,7 +8,7 @@ export interface WSEvent {
   added_nodes?: any[]; removed_node_ids?: string[]
   added_edges?: any[]; removed_edges?: any[]; replaced?: boolean
   phase?: string; message?: string; tokens_used?: number
-  kind?: string; payload?: any
+  kind?: string; payload?: any; question?: string; options?: string[]
   verdict?: string; rationale?: string
   index?: number; round?: number; node_count?: number; edge_count?: number
   changed_node?: string; predecessor?: string; depth?: number

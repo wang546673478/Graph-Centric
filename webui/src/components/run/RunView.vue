@@ -20,6 +20,7 @@ const { size: chatWidth, startDrag } = useSplitter(
 const graphFx = reactive<{ added: string[]; removed: string[]; replaced: boolean; ts: number }>(
   { added: [], removed: [], replaced: false, ts: 0 },
 )
+const clarifyOptions = ref<string[]>([])
 const sending = ref(false)
 let socket: ReturnType<typeof useRunSocket> | null = null
 
@@ -69,7 +70,7 @@ function connectToRun(id: string) {
         break
       case 'status': if (d.phase) s.status = d.phase; s.tokensUsed = d.tokens_used || s.tokensUsed; break
       case 'loop_state':
-        if (d.kind === 'Paused') s.status = 'paused'
+        if (d.kind === 'Paused') { s.status = 'paused'; clarifyOptions.value = d.options || [] }
         else if (d.kind === 'GraphInvalid') s.status = 'graph_invalid'
         else if (d.kind === 'Done') s.status = 'Done'
         break
@@ -171,6 +172,7 @@ async function branchRerun() {
 }
 
 async function confirmStart() {
+  clarifyOptions.value = []
   const id = activeRunId.value
   if (!id) return
   try {
@@ -186,6 +188,7 @@ async function confirmStart() {
 }
 
 async function submitTask(task: string) {
+  clarifyOptions.value = []
   if (sending.value) return
   sending.value = true
 
@@ -269,6 +272,11 @@ async function submitTask(task: string) {
         <button v-if="activeRunId && (status === 'Done' || status === 'Error' || status === 'Cancelled' || status === 'paused')" class="secondary" @click="branchRerun">⑂ 分支重跑</button>
         <span class="run-label" v-if="activeRunId">{{ activeRunId.slice(0,8) }}… · {{ status }}</span>
       </div>
+      <div v-if="clarifyOptions.length" class="clarify-options">
+        <button v-for="(opt, i) in clarifyOptions" :key="i" class="clarify-opt" @click="submitTask(opt)">
+          {{ opt }}
+        </button>
+      </div>
       <Composer :disabled="sending" :paused="status === 'paused' || status === 'Paused'" @send="submitTask" @confirmStart="confirmStart" />
     </div>
   </div>
@@ -289,4 +297,10 @@ async function submitTask(task: string) {
 .toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-top: 1px solid var(--border); background: var(--bg); }
 .toolbar button { font-size: 0.75rem; padding: 4px 10px; }
 .run-label { font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono); }
+.clarify-options { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px 0; }
+.clarify-opt {
+  background: var(--bg-hover); border: 1px solid var(--border); color: var(--text);
+  padding: 6px 12px; border-radius: 14px; font-size: 0.8rem; cursor: pointer;
+}
+.clarify-opt:hover { border-color: var(--accent); color: var(--accent); }
 </style>
