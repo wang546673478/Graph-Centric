@@ -4492,6 +4492,43 @@ mod tests {
         assert!(gl.replay_from_anchor().is_empty());
     }
 
+    // ── orphan detection + ready_for_verify backstop ──
+
+    #[test]
+    fn orphan_nodes_detected_when_not_wired() {
+        use crate::graph::{Node, NodeId};
+        let mut gl = build_loop_with(vec!["{}"]);
+        build_chain_graph(&mut gl, &[], false); // start → deliverable, no middles
+        // Add two orphan nodes that start cannot reach.
+        gl.graph.add_node(Node::task("outline", "Outline"));
+        gl.graph.add_node(Node::task("draft", "Draft"));
+        let orphans = gl.replay_from_anchor();
+        assert!(orphans.contains(&NodeId::from("outline")));
+        assert!(orphans.contains(&NodeId::from("draft")));
+        assert!(!orphans.contains(&NodeId::from("deliverable")));
+    }
+
+    #[test]
+    fn no_orphans_when_steps_wired_into_chain() {
+        let mut gl = build_loop_with(vec!["{}"]);
+        // build_chain_graph wires start → outline → deliverable
+        build_chain_graph(&mut gl, &["outline"], false);
+        let orphans = gl.replay_from_anchor();
+        assert!(orphans.is_empty(), "wired chain should have no orphans, got {orphans:?}");
+    }
+
+    #[tokio::test]
+    async fn ready_for_verify_bounces_back_when_orphans() {
+        use crate::graph::Node;
+        let mut gl = build_loop_with(vec!["{}"]);
+        build_chain_graph(&mut gl, &[], false); // start → deliverable, no middles
+        // Add an orphan not connected to the chain.
+        gl.graph.add_node(Node::task("orphan", "Orphan step"));
+        let state = gl.run_verify_and_maybe_repair().await.unwrap();
+        assert!(matches!(state, LoopState::Running));
+        assert_eq!(gl.graph_phase, GraphPhase::Filling);
+    }
+
     #[test]
     fn convergence_hint_fires_once_after_stable_rounds() {
         let mut gl = build_loop_with(vec!["{}"]);
