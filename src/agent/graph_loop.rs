@@ -1675,6 +1675,41 @@ impl GraphLoop {
                         if !new_node_ids.is_empty() {
                             self.auto_enrich(&new_node_ids).await;
                         }
+
+                        // Orphan check: in build phases, after each patch,
+                        // detect nodes start can't reach (added but not wired
+                        // into the start→…→deliverable chain) and prompt the
+                        // model to connect them with LeadsTo. Dedup via the
+                        // orphan-set signature so we don't repeat the hint
+                        // every step. (Seeding only has start/deliverable.)
+                        if matches!(self.graph_phase, GraphPhase::Filling | GraphPhase::Expanding) {
+                            let orphans = self.replay_from_anchor();
+                            if orphans.is_empty() {
+                                self.last_orphan_hint_sig = None;
+                            } else {
+                                let mut joined = String::new();
+                                for id in &orphans {
+                                    joined.push_str(&id.to_string());
+                                    joined.push('|');
+                                }
+                                let sig = hash_string(&joined);
+                                if self.last_orphan_hint_sig != Some(sig) {
+                                    self.last_orphan_hint_sig = Some(sig);
+                                    let ids = orphans
+                                        .iter()
+                                        .map(|id| id.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    self.conversation.add_user(format!(
+                                        "⚠️ These nodes are NOT yet connected into the main chain \
+                                         (start cannot reach them): {ids}. They are floating \
+                                         orphans. Add `LeadsTo` edges to wire each one into the \
+                                         flow so the path runs start → … → deliverable. Every \
+                                         step node must sit on the path from start to deliverable."
+                                    ));
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         // Patch rejected at the graph level (e.g., dangling endpoint).
