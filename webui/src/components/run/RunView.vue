@@ -70,7 +70,7 @@ function connectToRun(id: string) {
         break
       case 'status': if (d.phase) s.status = d.phase; s.tokensUsed = d.tokens_used || s.tokensUsed; break
       case 'loop_state':
-        if (d.kind === 'Paused') { s.status = 'paused'; clarifyOptions.value = d.options || [] }
+        if (d.kind === 'Paused') { s.status = 'paused'; clarifyOptions.value = (d.payload && d.payload.options) || d.options || [] }
         else if (d.kind === 'GraphInvalid') s.status = 'graph_invalid'
         else if (d.kind === 'Done') s.status = 'Done'
         break
