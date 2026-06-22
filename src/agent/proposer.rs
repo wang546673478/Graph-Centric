@@ -895,7 +895,7 @@ fn proposer_tools(has_advisor: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "propose_patch",
-                "description": "Add/remove nodes and edges on the relationship graph. Use this for ALL graph modifications. Example of a minimal Start→Goal seed: {\"patch\":{\"add_nodes\":[{\"id\":\"A\",\"kind\":\"Task\",\"summary\":\"Start: current state\",\"immutable\":true},{\"id\":\"D\",\"kind\":\"Task\",\"summary\":\"Goal: desired outcome\"}],\"add_edges\":[{\"source\":\"D\",\"target\":\"A\",\"relation\":\"DependsOn\",\"confidence\":0.9}],\"reason\":\"seed Start and Goal\"},\"rationale\":\"establish the anchor and goal\"}",
+                "description": "Add/remove nodes and edges on the relationship graph. Use this for ALL graph modifications. The graph flows start → deliverable: `start` is the immutable anchor (current state), `deliverable` is the goal, and intermediate step nodes go BETWEEN them. Example minimal seed: {\"patch\":{\"add_nodes\":[{\"id\":\"start\",\"kind\":\"Task\",\"summary\":\"Start: current state\",\"immutable\":true},{\"id\":\"deliverable\",\"kind\":\"Task\",\"summary\":\"Deliverable: desired outcome\"}],\"add_edges\":[{\"source\":\"start\",\"target\":\"deliverable\",\"relation\":\"LeadsTo\",\"confidence\":0.9}],\"reason\":\"seed start and deliverable\"},\"rationale\":\"establish start and deliverable\"}",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -920,13 +920,13 @@ fn proposer_tools(has_advisor: bool) -> Vec<serde_json::Value> {
                                 },
                                 "add_edges": {
                                     "type": "array",
-                                    "description": "Edges to add. Each edge: source (node id, required), target (node id, required), relation (one of Contains/BelongsTo/Imports/Exports/DependsOn/Calls/Triggers/Reads/Writes/Other), confidence (0..1).",
+                                    "description": "Edges to add. Each edge: source (node id, required), target (node id, required), relation (LeadsTo for process flow / sequencing — the start→deliverable main chain and most step-to-step edges use this; DependsOn for true dependencies; Contains for hierarchy; or Imports/Exports/Calls/Triggers/Reads/Writes/Other), confidence (0..1). Edges flow source→target (source leads to / feeds target).",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "source": {"type": "string"},
                                             "target": {"type": "string"},
-                                            "relation": {"type": "string", "enum": ["Contains", "BelongsTo", "Imports", "Exports", "DependsOn", "Calls", "Triggers", "Reads", "Writes", "Other"]},
+                                            "relation": {"type": "string", "enum": ["LeadsTo", "DependsOn", "Contains", "BelongsTo", "Imports", "Exports", "Calls", "Triggers", "Reads", "Writes", "Other"]},
                                             "confidence": {"type": "number"},
                                             "evidence": {"type": "string"}
                                         },
@@ -975,11 +975,16 @@ fn proposer_tools(has_advisor: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "ask_user",
-                "description": "Ask the user a clarifying question BEFORE modifying the graph. Only use when the task is ambiguous.",
+                "description": "Ask the user a clarifying question. During the goal-clarification phase, state your current understanding of the goal, then provide `options` (a few concrete choices the user can pick — the user can always also reply with their own answer). Use this to confirm the goal before building the graph.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "question": {"type": "string"},
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "A few concrete choices for the user to pick from. The user may also type their own answer. Provide 2-4 options when clarifying a goal."
+                        },
                         "rationale": {"type": "string"}
                     },
                     "required": ["question", "rationale"]
@@ -1494,13 +1499,14 @@ cheaper to ask one clarification question than to build a graph toward \
 the wrong goal.\n\
 \n\
 **Building order:**\n\
-1. First patch: create A (anchor) + D (goal). Add a `DependsOn` edge D→A.\n\
-2. Second patch (after exploration if needed): add intermediate nodes \
-between A and D. Each intermediate node connects to the node it depends on.\n\
+1. First patch: create `start` (immutable anchor, current state) + `deliverable` (goal). Add a `LeadsTo` edge start→deliverable.\n\
+2. Second patch (after exploration if needed): add intermediate step nodes \
+BETWEEN start and deliverable. Connect them along the flow with `LeadsTo` \
+(process/sequence); use `DependsOn` only for true dependencies, `Contains` for hierarchy.\n\
 3. When all intermediate nodes are filled and verified, emit `ready_for_verify`.\n\
 \n\
-This A→D structure gives the verifier a concrete convergence criterion: \
-the graph is complete when the DependsOn chain from A to D is fully filled.";
+This start→deliverable flow gives the verifier a concrete convergence criterion: \
+the graph is complete when there is a filled path of structural edges from start to deliverable.";
 
 /// Intake rule — Mode A vs Mode B. The model's FIRST step in a fresh
 /// conversation is an intake decision: clear task → propose_patch,

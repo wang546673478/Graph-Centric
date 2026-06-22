@@ -246,7 +246,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     gl.graph.l1.len()
                 );
             }
-            LoopState::Paused { question, rationale } => {
+            LoopState::Paused { question, rationale, .. } => {
                 println!("\n┌─ AGENT ASKS ────────────────────────────────────────");
                 if !rationale.trim().is_empty() {
                     println!("│ (rationale: {})", truncate_for_display(&rationale, 100));

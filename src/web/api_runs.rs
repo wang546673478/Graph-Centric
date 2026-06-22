@@ -404,7 +404,7 @@ async fn self_decompose_answer(
         Ok(resp) => {
             let answer = resp.content.trim().to_string();
             if answer.is_empty() {
-                "立即建图执行。A=当前问题, D=目标效果, 中间加 Task 节点。不要犹豫，直接 propose_patch。".to_string()
+                "立即建图执行。start=当前问题, deliverable=目标效果, 中间加 Task 步骤节点(用 LeadsTo 连)。不要犹豫，直接 propose_patch。".to_string()
             } else {
                 answer
             }
@@ -1312,8 +1312,8 @@ mod step_transcripts_tests {
 fn loop_state_payload(s: &LoopState) -> serde_json::Value {
     match s {
         LoopState::Running => serde_json::json!({}),
-        LoopState::Paused { question, rationale } => {
-            serde_json::json!({"question": question, "rationale": rationale})
+        LoopState::Paused { question, options, rationale } => {
+            serde_json::json!({"question": question, "options": options, "rationale": rationale})
         }
         LoopState::GraphInvalid { source, errors, snapshot } => serde_json::json!({
             "source": format!("{source:?}"),
