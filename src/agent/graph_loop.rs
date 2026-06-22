@@ -3073,6 +3073,34 @@ impl GraphLoop {
         false
     }
 
+    /// If a direct `start → deliverable` edge exists AND there's also a
+    /// longer path from start to deliverable through ≥1 intermediate node,
+    /// the direct edge is redundant (it bypasses all the steps). Returns
+    /// that edge's index in `self.graph.edges`, else None.
+    fn redundant_direct_edge_index(&self) -> Option<usize> {
+        let anchor = self.graph.nodes.values().find(|n| n.immutable).map(|n| n.id.clone())?;
+        let goal = if self.graph.nodes.contains_key(&NodeId::from("deliverable")) {
+            NodeId::from("deliverable")
+        } else {
+            self.graph.nodes.values().find(|n| !n.immutable).map(|n| n.id.clone())?
+        };
+        if anchor == goal {
+            return None;
+        }
+        let direct_idx = self
+            .graph
+            .edges
+            .iter()
+            .position(|e| e.source == anchor && e.target == goal)?;
+        let has_longer_path = self.graph.nodes.keys().any(|mid| {
+            *mid != anchor
+                && *mid != goal
+                && self.path_exists(&anchor, mid)
+                && self.path_exists(mid, &goal)
+        });
+        if has_longer_path { Some(direct_idx) } else { None }
+    }
+
     /// Gap 2: re-walk the whole graph from the layer-1 Start (the
     /// immutable anchor) flowing *forward* along structural edges, and
     /// report any node that `start` cannot reach — i.e. a structural break
@@ -4585,5 +4613,46 @@ mod tests {
         cfg.is_heartbeat = true;
         let gl = GraphLoop::new("hb task", proposer, verifier, None, tools, cfg);
         assert_eq!(gl.graph_phase, GraphPhase::Seeding);
+    }
+
+    #[test]
+    fn redundant_direct_edge_detected_with_longer_path() {
+        use crate::graph::{Edge, Node, RelationType};
+        let mut gl = build_loop_with(vec!["{}"]);
+        let mut start = Node::task("start", "Start");
+        start.immutable = true;
+        gl.graph.add_node(start);
+        gl.graph.add_node(Node::task("deliverable", "Deliverable"));
+        gl.graph.add_node(Node::task("mid", "Mid"));
+        gl.graph.add_edge(Edge::new("start", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("start", "mid", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("mid", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        assert_eq!(gl.redundant_direct_edge_index(), Some(0));
+    }
+
+    #[test]
+    fn no_redundant_edge_when_direct_is_only_path() {
+        use crate::graph::{Edge, Node, RelationType};
+        let mut gl = build_loop_with(vec!["{}"]);
+        let mut start = Node::task("start", "Start");
+        start.immutable = true;
+        gl.graph.add_node(start);
+        gl.graph.add_node(Node::task("deliverable", "Deliverable"));
+        gl.graph.add_edge(Edge::new("start", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        assert_eq!(gl.redundant_direct_edge_index(), None);
+    }
+
+    #[test]
+    fn no_redundant_edge_when_direct_absent() {
+        use crate::graph::{Edge, Node, RelationType};
+        let mut gl = build_loop_with(vec!["{}"]);
+        let mut start = Node::task("start", "Start");
+        start.immutable = true;
+        gl.graph.add_node(start);
+        gl.graph.add_node(Node::task("deliverable", "Deliverable"));
+        gl.graph.add_node(Node::task("mid", "Mid"));
+        gl.graph.add_edge(Edge::new("start", "mid", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("mid", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        assert_eq!(gl.redundant_direct_edge_index(), None);
     }
 }
