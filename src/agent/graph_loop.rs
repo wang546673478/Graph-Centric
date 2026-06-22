@@ -1695,6 +1695,23 @@ impl GraphLoop {
                                 }
                             }
                         }
+
+                        // Redundant direct-edge monitor: once steps exist
+                        // between start and deliverable, the seed's direct
+                        // start→deliverable edge bypasses them. Remind the
+                        // model to delete it EVERY round (no dedup) until it's
+                        // gone — the main chain must be the single path.
+                        if matches!(self.graph_phase, GraphPhase::Filling | GraphPhase::Expanding) {
+                            if let Some(idx) = self.redundant_direct_edge_index() {
+                                self.conversation.add_user(format!(
+                                    "⚠️ A direct start→deliverable edge (index {idx}) still \
+                                     exists and bypasses all the intermediate steps. The main \
+                                     chain must be the single path start → step → … → \
+                                     deliverable. Emit a `propose_patch` with \
+                                     `remove_edge_indices: [{idx}]` to delete this direct edge."
+                                ));
+                            }
+                        }
                     }
                     Err(e) => {
                         // Patch rejected at the graph level (e.g., dangling endpoint).
@@ -2385,6 +2402,9 @@ impl GraphLoop {
              - Every step node MUST sit on the path: connect with `LeadsTo` edges so \
              it reads start → step → … → deliverable. Do not add a node without an \
              edge wiring it in.\n\
+             - When steps are wired between start and deliverable, delete the \
+             original direct start→deliverable edge via `remove_edge_indices` \
+             so the main chain is the single path.\n\
              - Emit a `propose_patch` now with the step node(s) AND their LeadsTo \
              edges. Do NOT explore again — you have enough information.\n\n\
              Current graph:\n{node_info}",
