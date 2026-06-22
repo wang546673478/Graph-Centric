@@ -23,3 +23,8 @@ src/cascade_demo_test.rs
 600
 _temp_report.ps1
 .superpowers/
+
+# agent run artifacts
+article.md
+rust_error_handling.rs
+docs/rust-error-handling.zh-CN.md
