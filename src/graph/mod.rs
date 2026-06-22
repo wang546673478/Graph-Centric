@@ -507,7 +507,7 @@ pub struct GraphPatch {
 // Graph
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Graph {
     pub nodes: HashMap<NodeId, Node>,
     pub edges: Vec<Edge>,
@@ -527,6 +527,41 @@ pub struct Graph {
     /// reconstructed on load by re-walking the parent's Contains edges.
     #[serde(skip)]
     pub parent: Option<(NodeId, Box<Graph>)>,
+}
+
+impl<'de> serde::Deserialize<'de> for Graph {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Shadow struct mirrors Graph's serialized (non-#[serde(skip)]) fields.
+        // After loading the plain fields we call rebuild_indices() so any
+        // deserialized Graph (checkpoint path, unit tests, etc.) has populated
+        // outgoing_idx/incoming_idx — otherwise outgoing() returns nothing and
+        // reachability checks falsely report nodes unreachable.
+        #[derive(serde::Deserialize)]
+        struct GraphData {
+            nodes: HashMap<NodeId, Node>,
+            edges: Vec<Edge>,
+            #[serde(default)]
+            l1: L1Store,
+            version: usize,
+            status: GraphStatus,
+        }
+        let d = GraphData::deserialize(deserializer)?;
+        let mut g = Graph {
+            nodes: d.nodes,
+            edges: d.edges,
+            l1: d.l1,
+            outgoing_idx: HashMap::new(),
+            incoming_idx: HashMap::new(),
+            version: d.version,
+            status: d.status,
+            parent: None,
+        };
+        g.rebuild_indices();
+        Ok(g)
+    }
 }
 
 impl Default for Graph {
@@ -1106,5 +1141,29 @@ mod tests {
         assert!(RelationType::Contains.is_structural());
         assert!(!RelationType::RevealedBy.is_structural());
         assert!(!RelationType::InvalidatedBy.is_structural());
+    }
+
+    #[test]
+    fn deserialized_graph_rebuilds_adjacency_index() {
+        // start --LeadsTo--> mid --LeadsTo--> deliverable
+        let mut g = Graph::new();
+        g.add_node(Node::task("start", "Start"));
+        g.add_node(Node::task("mid", "Mid"));
+        g.add_node(Node::task("deliverable", "Deliverable"));
+        g.add_edge(Edge::new("start", "mid", RelationType::LeadsTo, 0.99, "")).unwrap();
+        g.add_edge(Edge::new("mid", "deliverable", RelationType::LeadsTo, 0.99, "")).unwrap();
+
+        // Use raw serde_json (not from_json) to simulate checkpoint deserialization path.
+        let json = serde_json::to_string(&g).unwrap();
+        let restored: Graph = serde_json::from_str(&json).unwrap();
+
+        // The adjacency index must be rebuilt on deserialize.
+        assert_eq!(
+            restored.outgoing(&NodeId::from("start")).count(),
+            1,
+            "start should have 1 outgoing edge after deserialize"
+        );
+        assert_eq!(restored.outgoing(&NodeId::from("mid")).count(), 1);
+        assert_eq!(restored.edges.len(), 2);
     }
 }
