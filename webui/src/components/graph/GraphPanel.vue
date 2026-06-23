@@ -31,6 +31,13 @@ const parentMap = computed(() => {
 
 const hasChildren = (id: string) => childMap.value.has(id)
 
+// A node is drillable only if it has children AND is not already the current
+// breadcrumb tip. Without the second clause, clicking the parent node (which
+// is itself rendered at its own level, see visibleIds) re-drills into itself
+// forever: `deliverable › deliverable › deliverable › …`.
+const canDrill = (id: string) =>
+  hasChildren(id) && breadcrumb.value[breadcrumb.value.length - 1] !== id
+
 // Filter nodes/edges to current breadcrumb level.
 const visibleIds = computed(() => {
   if (breadcrumb.value.length === 0) {
@@ -58,7 +65,7 @@ const visibleEdges = computed(() =>
 const scopeSet = computed(() => new Set(props.scopeNodeIds || []))
 
 function drillDown(nodeId: string) {
-  if (hasChildren(nodeId)) {
+  if (canDrill(nodeId)) {
     breadcrumb.value.push(nodeId)
     cy?.center(cy.getElementById(nodeId))
   }
@@ -99,7 +106,7 @@ onMounted(() => {
     cy.on('tap', 'node', (evt: any) => {
       const node = evt.target
       const id = node.id()
-      if (hasChildren(id)) {
+      if (canDrill(id)) {
         drillDown(id)
       } else {
         selectedNode.value = props.nodes.find(n => n.id === id) || null

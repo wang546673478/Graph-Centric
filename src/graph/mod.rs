@@ -305,6 +305,7 @@ impl<'de> Deserialize<'de> for RelationType {
                     "Imports" => RelationType::Imports,
                     "Exports" => RelationType::Exports,
                     "DependsOn" => RelationType::DependsOn,
+                    "LeadsTo" => RelationType::LeadsTo,
                     "Calls" => RelationType::Calls,
                     "Triggers" => RelationType::Triggers,
                     "Reads" => RelationType::Reads,
@@ -605,6 +606,41 @@ impl Graph {
                 "target node missing: {}",
                 edge.target
             )));
+        }
+        // Idempotent on (source, target, relation): re-proposing an edge that
+        // already exists is a no-op, not a duplicate. The proposer re-emits
+        // the whole start→…→deliverable chain whenever the verify gate
+        // complains; without this guard the edge list inflates (7→14→…), the
+        // model then tries to delete "duplicates" by positional index, the
+        // positional removal hits the WRONG edges and breaks the real chain →
+        // genuine orphans → gate blocks again → infinite thrash → stagnation.
+        if self
+            .edges
+            .iter()
+            .any(|e| e.source == edge.source && e.target == edge.target && e.relation == edge.relation)
+        {
+            return Ok(());
+        }
+        // Containment is a tree: a node has at most one Contains parent. A
+        // second parent (e.g. `output-file` contained by both `step-integrate`
+        // and `deliverable`) makes the hierarchy ambiguous — the frontend's
+        // last-write-wins parentMap then nests the node under an arbitrary
+        // parent, so the deliverable's file rendered under a step. Reject by
+        // construction (the identical-edge check above already let an exact
+        // re-proposal through as a no-op).
+        if edge.relation == RelationType::Contains {
+            if let Some(existing) = self
+                .edges
+                .iter()
+                .find(|e| e.relation == RelationType::Contains && e.target == edge.target)
+            {
+                return Err(HarnessError::graph(format!(
+                    "node {} already has a Contains parent ({}); a node may have only one \
+                     containment parent — remove the existing edge first or use a non-Contains \
+                     relation (e.g. LeadsTo)",
+                    edge.target, existing.source
+                )));
+            }
         }
         let idx = self.edges.len();
         self.outgoing_idx
@@ -1051,6 +1087,17 @@ mod tests {
     }
 
     #[test]
+    fn relation_type_legacy_object_form_handles_leads_to() {
+        // Regression: the legacy single-key object arm was missing LeadsTo,
+        // so `{"LeadsTo":null}` fell through to Other("LeadsTo"), which is
+        // NOT structural → reachability silently breaks for any graph
+        // persisted in the legacy form. LeadsTo is the dominant flow edge.
+        let r: RelationType = serde_json::from_str(r#"{"LeadsTo":null}"#).unwrap();
+        assert!(matches!(r, RelationType::LeadsTo), "got {r:?}");
+        assert!(r.is_structural(), "LeadsTo must be structural");
+    }
+
+    #[test]
     fn full_graph_json_round_trip_with_kinds_and_relations() {
         // End-to-end check: a graph with mixed canonical and Other variants
         // serializes cleanly and deserializes back to the same logical state.
@@ -1165,5 +1212,105 @@ mod tests {
         );
         assert_eq!(restored.outgoing(&NodeId::from("mid")).count(), 1);
         assert_eq!(restored.edges.len(), 2);
+    }
+
+    #[test]
+    fn add_edge_rejects_second_contains_parent() {
+        // Containment is the fractal hierarchy: a node belongs to at most one
+        // parent. In run 4e2ebca7 the model gave `output-file` a Contains edge
+        // from BOTH `step-integrate` and `deliverable`; the frontend's
+        // parentMap is last-write-wins, so the deliverable's file rendered
+        // nested under a step (problem 3). Reject the second parent by
+        // construction so the model gets immediate feedback.
+        let mut g = Graph::new();
+        g.add_node(Node::task("step", "Step"));
+        g.add_node(Node::task("deliverable", "Deliverable"));
+        g.add_node(Node::file("output-file", "Output"));
+
+        g.add_edge(Edge::new("step", "output-file", RelationType::Contains, 0.9, ""))
+            .unwrap();
+        let err = g.add_edge(Edge::new(
+            "deliverable",
+            "output-file",
+            RelationType::Contains,
+            0.9,
+            "",
+        ));
+        assert!(err.is_err(), "second Contains parent must be rejected");
+        // Only the first containment survives.
+        assert_eq!(
+            g.incoming(&NodeId::from("output-file"))
+                .filter(|e| e.relation == RelationType::Contains)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn add_edge_reaccepts_same_contains_parent() {
+        // Re-proposing the SAME containment is idempotent (not a conflict).
+        let mut g = Graph::new();
+        g.add_node(Node::task("parent", "P"));
+        g.add_node(Node::file("child", "C"));
+        g.add_edge(Edge::new("parent", "child", RelationType::Contains, 0.9, ""))
+            .unwrap();
+        g.add_edge(Edge::new("parent", "child", RelationType::Contains, 0.9, ""))
+            .unwrap();
+        assert_eq!(g.edge_count(), 1);
+    }
+
+    #[test]
+    fn add_edge_deduplicates_identical_edges() {
+        // Regression: the proposer re-emits the whole start→…→deliverable
+        // chain every round when the verify gate complains. Without dedup
+        // the edge list inflates (7→14→…), the model then tries to delete
+        // "duplicates" by positional index, the positional removal deletes
+        // the WRONG edges and breaks the real chain → genuine orphans →
+        // gate blocks again → infinite thrash → stagnation failure.
+        // add_edge must be idempotent on (source, target, relation).
+        let mut g = Graph::new();
+        g.add_node(Node::task("start", "Start"));
+        g.add_node(Node::task("deliverable", "Deliverable"));
+
+        g.add_edge(Edge::new("start", "deliverable", RelationType::LeadsTo, 0.9, "first"))
+            .unwrap();
+        // Re-emit the identical edge (different confidence/evidence must not
+        // create a second parallel edge).
+        g.add_edge(Edge::new("start", "deliverable", RelationType::LeadsTo, 0.5, "again"))
+            .unwrap();
+
+        assert_eq!(g.edge_count(), 1, "identical edge must not be duplicated");
+        assert_eq!(
+            g.outgoing(&NodeId::from("start")).count(),
+            1,
+            "outgoing index must not contain a duplicate"
+        );
+    }
+
+    #[test]
+    fn apply_patch_chain_reproposal_is_idempotent() {
+        // End-to-end of the stagnation bug: apply the full chain, then apply
+        // it AGAIN (as the proposer does when re-prompted). Edge count must
+        // be stable, and start must still reach every node.
+        let mut g = Graph::new();
+        let mut anchor = Node::task("start", "Start");
+        anchor.immutable = true;
+        g.add_node(anchor);
+        for id in ["s1", "s2", "deliverable"] {
+            g.add_node(Node::task(id, id));
+        }
+        let chain = || GraphPatch {
+            add_edges: vec![
+                Edge::new("start", "s1", RelationType::LeadsTo, 0.9, ""),
+                Edge::new("s1", "s2", RelationType::LeadsTo, 0.9, ""),
+                Edge::new("s2", "deliverable", RelationType::LeadsTo, 0.9, ""),
+            ],
+            ..Default::default()
+        };
+        g.apply_patch(chain()).unwrap();
+        assert_eq!(g.edge_count(), 3);
+        // Re-propose the same chain — must NOT inflate to 6.
+        g.apply_patch(chain()).unwrap();
+        assert_eq!(g.edge_count(), 3, "re-proposing the chain must be idempotent");
     }
 }

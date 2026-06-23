@@ -224,13 +224,16 @@ mod tests {
 
     #[test]
     fn detects_duplicate_edge() {
+        // add_edge() is now idempotent, so duplicates can only arise from a
+        // graph loaded from external/legacy JSON (which bypasses add_edge).
+        // insert_edge_raw mirrors that deserialize path; the validator is the
+        // defense-in-depth backstop that still flags such dupes.
         let mut g = Graph::new();
         g.add_node(Node::file("a", "A"));
         g.add_node(Node::file("b", "B"));
-        g.add_edge(Edge::new("a", "b", RelationType::Imports, 1.0, ""))
-            .unwrap();
-        g.add_edge(Edge::new("a", "b", RelationType::Imports, 0.5, ""))
-            .unwrap();
+        g.insert_edge_raw(Edge::new("a", "b", RelationType::Imports, 1.0, ""));
+        g.insert_edge_raw(Edge::new("a", "b", RelationType::Imports, 0.5, ""));
+        g.rebuild_indices();
         let issues = g.find_inconsistencies();
         assert!(
             issues
