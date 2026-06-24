@@ -3093,32 +3093,55 @@ impl GraphLoop {
         false
     }
 
-    /// If a direct `start → deliverable` edge exists AND there's also a
-    /// longer path from start to deliverable through ≥1 intermediate node,
-    /// the direct edge is redundant (it bypasses all the steps). Returns
-    /// that edge's index in `self.graph.edges`, else None.
+    /// Like `path_exists`, but ignores the edge at `exclude_idx`. Used to ask
+    /// "if I delete this one edge, does a path still exist?" — i.e. is the edge
+    /// redundant? BFS scans the edge list by index so the excluded edge can be
+    /// skipped precisely.
+    fn path_exists_excluding(&self, from: &NodeId, to: &NodeId, exclude_idx: usize) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(from.clone());
+        seen.insert(from.clone());
+        while let Some(cur) = queue.pop_front() {
+            for (i, edge) in self.graph.edges.iter().enumerate() {
+                if i == exclude_idx { continue; }
+                if edge.source != cur { continue; }
+                if !edge.relation.is_structural() { continue; }
+                if &edge.target == to {
+                    return true;
+                }
+                if seen.insert(edge.target.clone()) {
+                    queue.push_back(edge.target.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Find a redundant inbound edge to the goal (deliverable). An edge
+    /// `X → goal` is redundant if, after removing it, X can STILL reach the
+    /// goal via a longer path through the step circle. The goal must have
+    /// exactly one inbound edge — the terminal of the step circle; any other
+    /// inbound edge is a bypass that skips part of the circle (e.g. the seed's
+    /// `start → deliverable`, or a step node wired straight to deliverable like
+    /// `outline → deliverable`). Returns the redundant edge's index, else None.
     fn redundant_direct_edge_index(&self) -> Option<usize> {
-        let anchor = self.graph.nodes.values().find(|n| n.immutable).map(|n| n.id.clone())?;
         let goal = if self.graph.nodes.contains_key(&NodeId::from("deliverable")) {
             NodeId::from("deliverable")
         } else {
             self.graph.nodes.values().find(|n| !n.immutable).map(|n| n.id.clone())?
         };
-        if anchor == goal {
-            return None;
+        // Scan every inbound edge to the goal. The redundant one is the edge
+        // whose source can still reach the goal without it.
+        for (idx, edge) in self.graph.edges.iter().enumerate() {
+            if edge.target != goal { continue; }
+            if !edge.relation.is_structural() { continue; }
+            if edge.source == goal { continue; }
+            if self.path_exists_excluding(&edge.source, &goal, idx) {
+                return Some(idx);
+            }
         }
-        let direct_idx = self
-            .graph
-            .edges
-            .iter()
-            .position(|e| e.source == anchor && e.target == goal)?;
-        let has_longer_path = self.graph.nodes.keys().any(|mid| {
-            *mid != anchor
-                && *mid != goal
-                && self.path_exists(&anchor, mid)
-                && self.path_exists(mid, &goal)
-        });
-        if has_longer_path { Some(direct_idx) } else { None }
+        None
     }
 
     /// Gap 2: re-walk the whole graph from the layer-1 Start (the
@@ -4673,6 +4696,54 @@ mod tests {
         gl.graph.add_node(Node::task("mid", "Mid"));
         gl.graph.add_edge(Edge::new("start", "mid", RelationType::LeadsTo, 0.9, "")).unwrap();
         gl.graph.add_edge(Edge::new("mid", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        assert_eq!(gl.redundant_direct_edge_index(), None);
+    }
+
+    #[test]
+    fn redundant_bypass_edge_from_step_node_detected() {
+        // Regression (run 28ee249d): the model wired a step node directly to
+        // deliverable (outline→deliverable) AND through the full step circle
+        // (outline→stages→…→cheatsheet→deliverable). deliverable then had two
+        // inbound edges; the bypass edge skips the rest of the circle. The
+        // deliverable must have exactly ONE inbound edge — the terminal of the
+        // step circle. The bypass (outline→deliverable) is the redundant one.
+        use crate::graph::{Edge, Node, RelationType};
+        let mut gl = build_loop_with(vec!["{}"]);
+        let mut start = Node::task("start", "Start");
+        start.immutable = true;
+        gl.graph.add_node(start);
+        gl.graph.add_node(Node::task("deliverable", "Deliverable"));
+        for s in ["outline", "stages", "resources", "cheatsheet"] {
+            gl.graph.add_node(Node::task(s, s));
+        }
+        gl.graph.add_edge(Edge::new("start", "outline", RelationType::LeadsTo, 0.9, "")).unwrap();
+        // The bypass edge — index 1.
+        gl.graph.add_edge(Edge::new("outline", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("outline", "stages", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("stages", "resources", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("resources", "cheatsheet", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("cheatsheet", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
+        // outline→deliverable (idx 1) is redundant: outline still reaches
+        // deliverable via outline→stages→resources→cheatsheet→deliverable.
+        assert_eq!(gl.redundant_direct_edge_index(), Some(1));
+    }
+
+    #[test]
+    fn no_redundant_when_deliverable_has_single_terminal() {
+        // The legitimate shape: deliverable has exactly one inbound edge from
+        // the end of the step circle. Nothing to flag.
+        use crate::graph::{Edge, Node, RelationType};
+        let mut gl = build_loop_with(vec!["{}"]);
+        let mut start = Node::task("start", "Start");
+        start.immutable = true;
+        gl.graph.add_node(start);
+        gl.graph.add_node(Node::task("deliverable", "Deliverable"));
+        for s in ["outline", "stages"] {
+            gl.graph.add_node(Node::task(s, s));
+        }
+        gl.graph.add_edge(Edge::new("start", "outline", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("outline", "stages", RelationType::LeadsTo, 0.9, "")).unwrap();
+        gl.graph.add_edge(Edge::new("stages", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
         assert_eq!(gl.redundant_direct_edge_index(), None);
     }
 }
