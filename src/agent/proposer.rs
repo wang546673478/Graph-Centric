@@ -1433,6 +1433,7 @@ fn parse_relation_type(s: &str) -> RelationType {
         "Imports" => RelationType::Imports,
         "Exports" => RelationType::Exports,
         "DependsOn" => RelationType::DependsOn,
+        "LeadsTo" => RelationType::LeadsTo,
         "Calls" => RelationType::Calls,
         "Triggers" => RelationType::Triggers,
         "Reads" => RelationType::Reads,
@@ -2162,6 +2163,38 @@ mod tests {
                     RelationType::Other(s) => assert_eq!(s, "SoftCoupling"),
                     other => panic!("expected RelationType::Other, got {other:?}"),
                 }
+            }
+            _ => panic!("expected ProposePatch"),
+        }
+    }
+
+    #[test]
+    fn parse_step_leads_to_relation_is_structural() {
+        // Regression (run 1a55f6a1, GATE-DIAG 2026-06-24): parse_relation_type
+        // was missing the "LeadsTo" arm, so every model-proposed chain edge
+        // became Other("LeadsTo"), whose is_structural() is false. path_exists
+        // then ignored the entire chain → start could not reach any middle
+        // node → verify gate falsely reported all-orphans → infinite thrash.
+        // LeadsTo is THE flow edge; it must parse to the canonical variant.
+        let s = r#"{
+          "step":"propose_patch",
+          "patch":{
+            "add_nodes":[{"id":"start","kind":"Task","path":"start","summary":""},
+                          {"id":"mid","kind":"Task","path":"mid","summary":""}],
+            "add_edges":[{"source":"start","target":"mid","relation":"LeadsTo","confidence":0.9,"evidence":""}]
+          }
+        }"#;
+        match parse_step(s).unwrap() {
+            ProposerStep::ProposePatch { patch, .. } => {
+                assert_eq!(
+                    patch.add_edges[0].relation,
+                    RelationType::LeadsTo,
+                    "LeadsTo must parse to the canonical variant, not Other"
+                );
+                assert!(
+                    patch.add_edges[0].relation.is_structural(),
+                    "LeadsTo must be structural so path_exists walks it"
+                );
             }
             _ => panic!("expected ProposePatch"),
         }
