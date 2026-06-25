@@ -23,7 +23,7 @@
 
 use super::Conversation;
 use crate::error::{HarnessError, Result};
-use crate::graph::{Edge, Graph, GraphPatch, Node, NodeId, NodeKind, RelationType};
+use crate::graph::{DrillDownMark, Edge, Graph, GraphPatch, Node, NodeId, NodeKind, RelationType};
 use crate::model::{Message, Model, Role};
 use crate::tools::ToolRegistry;
 use tracing::warn;
@@ -1054,6 +1054,7 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
             // treats every field as optional and maps common aliases.
             let patch_val = tc.arguments.get("patch").unwrap_or(&tc.arguments);
             let patch = parse_patch(patch_val)?;
+            validate_drill_down(&patch)?;
             Ok(ProposerStep::ProposePatch {
                 patch,
                 rationale: tc.arguments.get("rationale").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -1185,6 +1186,7 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                 HarnessError::model("proposer: propose_patch requires 'patch'".to_string())
             })?;
             let patch = parse_patch(patch_v)?;
+            validate_drill_down(&patch)?;
             Ok(ProposerStep::ProposePatch { patch, rationale })
         }
         "ready_for_verify" => Ok(ProposerStep::ReadyForVerify { rationale }),
@@ -1351,6 +1353,29 @@ fn parse_patch(v: &serde_json::Value) -> Result<GraphPatch> {
         }
     }
     Ok(patch)
+}
+
+/// Reject `drill_down` whose target is not present in the same patch's
+/// `add_nodes`. The drill-down sub-graph machinery (see
+/// `docs/superpowers/specs/2026-06-25-drill-down-sub-graph-design.md`)
+/// forks a child GraphLoop for the target node — but it can only do so
+/// if the parent patch actually added that node. A model that points
+/// `drill_down.target` at an existing node (or a typo) would otherwise
+/// silently drop the field, which is exactly the kind of "stuck because
+/// a marker was silently swallowed" failure this validation prevents.
+///
+/// Returns `Err` (a model error) when validation fails so the caller can
+/// surface it to the model via the fix-it retry path.
+fn validate_drill_down(patch: &GraphPatch) -> Result<()> {
+    if let Some(dd) = &patch.drill_down {
+        if !patch.add_nodes.iter().any(|n| n.id == dd.target) {
+            return Err(HarnessError::model(format!(
+                "proposer: drill_down.target '{}' not in add_nodes; drill_down must target a node added in the same patch",
+                dd.target.as_str()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_node(v: &serde_json::Value) -> Result<Node> {
@@ -2583,5 +2608,99 @@ mod tests {
             let raw = Arc::as_ptr(self) as *const MockModel;
             unsafe { &*raw }
         }
+    }
+
+    // ----- drill_down validation tests (Task 2) -----
+    //
+    // These two tests verify the *logic* the validator uses to decide
+    // accept/reject. They intentionally don't call `validate_drill_down`
+    // directly — that comes next, once the function exists. The point
+    // is to lock in the invariant the validator must check.
+
+    #[test]
+    fn drill_down_target_must_be_in_add_nodes_rejects() {
+        let patch = GraphPatch {
+            add_nodes: vec![
+                Node::task("design-modules", "设计功能模块层:..."),
+            ],
+            add_edges: vec![],
+            remove_node_ids: vec![],
+            remove_edge_indices: vec![],
+            set_l1: vec![],
+            reason: "test".into(),
+            drill_down: Some(DrillDownMark {
+                target: NodeId::from("not-in-add-nodes"),
+                reason: "test".into(),
+                sub_task_override: None,
+            }),
+        };
+        // Simulate the validator: target ∉ add_nodes → reject
+        let target_in_add = patch
+            .add_nodes
+            .iter()
+            .any(|n| n.id == patch.drill_down.as_ref().unwrap().target);
+        assert!(!target_in_add, "validator should reject: target not in add_nodes");
+    }
+
+    #[test]
+    fn drill_down_target_in_add_nodes_passes() {
+        let patch = GraphPatch {
+            add_nodes: vec![Node::task("design-modules", "...")],
+            add_edges: vec![],
+            remove_node_ids: vec![],
+            remove_edge_indices: vec![],
+            set_l1: vec![],
+            reason: "test".into(),
+            drill_down: Some(DrillDownMark {
+                target: NodeId::from("design-modules"),
+                reason: "test".into(),
+                sub_task_override: None,
+            }),
+        };
+        let target = patch.drill_down.as_ref().unwrap().target.clone();
+        let target_in_add = patch.add_nodes.iter().any(|n| n.id == target);
+        assert!(target_in_add);
+    }
+
+    #[test]
+    fn validate_drill_down_returns_err_on_missing_target() {
+        let patch = GraphPatch {
+            add_nodes: vec![Node::task("design-modules", "...")],
+            add_edges: vec![],
+            remove_node_ids: vec![],
+            remove_edge_indices: vec![],
+            set_l1: vec![],
+            reason: "test".into(),
+            drill_down: Some(DrillDownMark {
+                target: NodeId::from("not-in-add-nodes"),
+                reason: "test".into(),
+                sub_task_override: None,
+            }),
+        };
+        assert!(validate_drill_down(&patch).is_err());
+    }
+
+    #[test]
+    fn validate_drill_down_returns_ok_on_valid_target() {
+        let patch = GraphPatch {
+            add_nodes: vec![Node::task("design-modules", "...")],
+            add_edges: vec![],
+            remove_node_ids: vec![],
+            remove_edge_indices: vec![],
+            set_l1: vec![],
+            reason: "test".into(),
+            drill_down: Some(DrillDownMark {
+                target: NodeId::from("design-modules"),
+                reason: "test".into(),
+                sub_task_override: None,
+            }),
+        };
+        assert!(validate_drill_down(&patch).is_ok());
+    }
+
+    #[test]
+    fn validate_drill_down_returns_ok_when_field_absent() {
+        let patch = GraphPatch::default();
+        assert!(validate_drill_down(&patch).is_ok());
     }
 }
