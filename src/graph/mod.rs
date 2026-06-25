@@ -502,6 +502,33 @@ pub struct GraphPatch {
     #[serde(default)]
     pub set_l1: Vec<(NodeId, L1Description)>,
     pub reason: String,
+    /// Optional: mark one of `add_nodes` for drill-down. The system will
+    /// pause the parent graph at this node and fork a sub-GraphLoop to
+    /// expand it. See `DrillDownMark` and `docs/superpowers/specs/2026-06-25-drill-down-sub-graph-design.md`.
+    #[serde(default)]
+    pub drill_down: Option<DrillDownMark>,
+}
+
+/// Sub-graph drill-down marker attached to a `GraphPatch`. The model
+/// sets this in `propose_patch` to flag a newly-added node that needs
+/// to be expanded into a sub-GraphLoop.
+///
+/// Lifecycle:
+///   1. Model emits `GraphPatch { add_nodes: [C], drill_down: Some(...) }`
+///   2. `step_graph` applies the patch (adds C + edges)
+///   3. `fork_sub_graph_for(C)` is called: if `current_depth + 1 <= max_drilldown_depth`,
+///      a child `GraphLoop` is spawned; otherwise the field is dropped with a warn log.
+///   4. Parent graph polls the child run's `data/runs/<parent>/sub_runs/<child>/run.json`
+///      until status = Done, then marks C done and proceeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrillDownMark {
+    /// Target node id, must be present in the same patch's `add_nodes`.
+    pub target: NodeId,
+    /// Human-readable reason (used in transcript + sub-task description).
+    pub reason: String,
+    /// Optional: refined sub-task description (defaults to node.summary).
+    #[serde(default)]
+    pub sub_task_override: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +968,7 @@ mod tests {
             remove_edge_indices: vec![],
             set_l1: vec![],
             reason: "test patch".into(),
+            drill_down: None,
         };
         g.apply_patch(patch).unwrap();
         assert_eq!(g.node_count(), 3);
@@ -961,6 +989,7 @@ mod tests {
                 L1Description::new("does C", "wraps lib", "intent", "constraint"),
             )],
             reason: "add C with L1".into(),
+            drill_down: None,
         };
         g.apply_patch(patch).unwrap();
         let l1 = g.l1.get(&NodeId::from("c.rs")).unwrap();
@@ -1312,5 +1341,36 @@ mod tests {
         // Re-propose the same chain — must NOT inflate to 6.
         g.apply_patch(chain()).unwrap();
         assert_eq!(g.edge_count(), 3, "re-proposing the chain must be idempotent");
+    }
+
+    #[test]
+    fn graph_patch_drill_down_field_round_trips() {
+        let patch = GraphPatch {
+            add_nodes: vec![],
+            add_edges: vec![],
+            remove_node_ids: vec![],
+            remove_edge_indices: vec![],
+            set_l1: vec![],
+            reason: "drill down design-modules".into(),
+            drill_down: Some(DrillDownMark {
+                target: NodeId::from("design-modules"),
+                reason: "10+ sub-modules, each is a sub-design".into(),
+                sub_task_override: None,
+            }),
+        };
+        let json = serde_json::to_string(&patch).unwrap();
+        let back: GraphPatch = serde_json::from_str(&json).unwrap();
+        let dd = back.drill_down.expect("drill_down preserved");
+        assert_eq!(dd.target.as_str(), "design-modules");
+        assert_eq!(dd.reason, "10+ sub-modules, each is a sub-design");
+        assert!(dd.sub_task_override.is_none());
+    }
+
+    #[test]
+    fn graph_patch_drill_down_omitted_serializes_as_null() {
+        let patch = GraphPatch::default();
+        let json = serde_json::to_string(&patch).unwrap();
+        let back: GraphPatch = serde_json::from_str(&json).unwrap();
+        assert!(back.drill_down.is_none());
     }
 }
