@@ -1062,13 +1062,65 @@ impl GraphLoop {
             "tokens_used": self.tokens_used,
         });
         let dir = persistence.data_dir.clone();
+        // Ensure the sub-run dir exists. If this fails, fall back to
+        // writing a minimal Error-status run.json so the parent's poll
+        // loop can detect the failure instead of hanging forever.
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            tracing::warn!(error = %e, dir = %dir.display(), "run_with_persistence: failed to create dir");
+            tracing::error!(error = %e, dir = %dir.display(), "run_with_persistence: create_dir_all failed");
+            let fallback = serde_json::json!({
+                "id": self.run_id,
+                "task": self.task,
+                "status": "Error",
+                "error": format!("create_dir_all failed: {e}"),
+                "parent_run_id": self.parent_run_id,
+                "current_depth": self.current_depth,
+                "duration_ms": duration_ms,
+            });
+            // Try a best-effort write in the current working directory
+            // so the failure is at least visible.
+            let _ = std::fs::write(
+                "run.json.fallback",
+                serde_json::to_string_pretty(&fallback).unwrap_or_default(),
+            );
+            return Err(crate::error::HarnessError::model(format!(
+                "run_with_persistence: create_dir_all({}) failed: {e}",
+                dir.display()
+            )));
         }
-        if let Err(e) = std::fs::write(dir.join("run.json"), serde_json::to_string_pretty(&payload).unwrap_or_default()) {
-            tracing::warn!(error = %e, "run_with_persistence: failed to write run.json");
+        let run_json_path = dir.join("run.json");
+        match std::fs::write(
+            &run_json_path,
+            serde_json::to_string_pretty(&payload).unwrap_or_default(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Final-write failure: do NOT silently swallow. Fall back
+                // to writing an Error-status payload so the parent's poll
+                // loop can detect the failure, then return Err.
+                tracing::error!(
+                    error = %e,
+                    path = %run_json_path.display(),
+                    "run_with_persistence: final run.json write failed"
+                );
+                let fallback = serde_json::json!({
+                    "id": self.run_id,
+                    "task": self.task,
+                    "status": "Error",
+                    "error": format!("run.json write failed: {e}"),
+                    "parent_run_id": self.parent_run_id,
+                    "current_depth": self.current_depth,
+                    "duration_ms": duration_ms,
+                });
+                let _ = std::fs::write(
+                    &run_json_path,
+                    serde_json::to_string_pretty(&fallback).unwrap_or_default(),
+                );
+                Err(crate::error::HarnessError::model(format!(
+                    "run_with_persistence: write {} failed: {e}",
+                    run_json_path.display()
+                )))
+            }
         }
-        Ok(())
     }
 
     /// Build the drill-down task prompt that the sub-GraphLoop will be
@@ -1154,10 +1206,28 @@ impl GraphLoop {
             Some(sub_task.clone()),
         );
 
-        // Create the sub-run directory under <data_dir>/<parent>/sub_runs/<sub>/.
-        // Best-effort: log on failure but still return a handle so the
-        // parent loop can keep running (the sub-loop's run.json write
-        // will be the source of truth for status).
+        // Atomicity note (Task 6 review): the steps below have a small
+        // window where, if a panic occurs between metadata mutation and
+        // the final tokio::spawn, the parent could observe `expanded = true`
+        // and `sub_run_status = "running"` without a corresponding child
+        // task. The simplest fix that ships in Task 6 is to make
+        // `tokio::spawn` the absolute last side-effect (after all metadata
+        // writes + conversation appends). If the spawn is reached, the
+        // sub-loop is guaranteed to run. If a panic happens earlier, the
+        // parent's worst case is "expanded but no child" — Task 7's
+        // poll_sub_run_status can detect "no run.json after N ms" and
+        // surface an Error to the user. Task 10 will tighten this to a
+        // true two-phase commit (build all state in memory, then commit
+        // atomically) when step_graph integration lands.
+        //
+        // Order is therefore:
+        //   1. Build sub-loop in memory (no side effects).
+        //   2. Persist sub-run dir + link.
+        //   3. Stamp complex node metadata.
+        //   4. Append transcript line.
+        //   5. tokio::spawn — THE COMMIT POINT.
+
+        // Step 2: persist sub-run dir.
         if let Err(e) = self
             .persistence
             .create_sub_run_dir(&self.run_id, &sub_run_id_for_loop)
@@ -1169,7 +1239,6 @@ impl GraphLoop {
                 "fork_sub_graph_for: create_sub_run_dir failed; sub-loop will still spawn"
             );
         }
-
         let link = crate::web::persistence::SubRunLink {
             node_id: complex_node.clone(),
             sub_run_id: sub_run_id_for_loop.clone(),
@@ -1179,7 +1248,7 @@ impl GraphLoop {
         self.persistence
             .append_sub_run_link(&self.run_id, &link);
 
-        // Stamp the complex node's metadata.
+        // Step 3: stamp the complex node's metadata.
         if let Some(node) = self.graph.nodes.get_mut(&complex_node) {
             node.metadata.insert(
                 "sub_run_id".into(),
@@ -1191,7 +1260,10 @@ impl GraphLoop {
             );
             node.metadata.insert(
                 "drill_down_depth".into(),
-                serde_json::Value::String(new_depth.to_string()),
+                // Wire format decision (Task 6 review): Number, not String.
+                // Consumers (frontend, poll_sub_run_status, e2e tests)
+                // expect an integer they can compare without parsing.
+                serde_json::Value::Number(serde_json::Number::from(new_depth as u64)),
             );
             node.expanded = true;
         } else {
@@ -1201,6 +1273,7 @@ impl GraphLoop {
             );
         }
 
+        // Step 4: append transcript line.
         self.conversation.add_user(format!(
             "⤵ drill_down started: {}\n(sub_run_id={}, depth={})",
             complex_node.as_str(),
@@ -1208,7 +1281,8 @@ impl GraphLoop {
             new_depth
         ));
 
-        // Spawn the sub-loop with its own persistence rooted at the sub-run dir.
+        // Step 5: COMMIT POINT — spawn the sub-loop. After this line
+        // returns, the sub-loop is running and will write run.json.
         let sub_persistence = self
             .persistence
             .clone_for_sub_run(&self.run_id, &sub_run_id_for_loop);
@@ -5322,9 +5396,11 @@ mod tests {
             node.metadata.get("sub_run_status").and_then(|v| v.as_str()),
             Some("running")
         );
+        // drill_down_depth is stored as a JSON Number (per Task 6 wire-format
+        // review). Compare via as_u64 instead of as_str.
         assert_eq!(
-            node.metadata.get("drill_down_depth").and_then(|v| v.as_str()),
-            Some("1")
+            node.metadata.get("drill_down_depth").and_then(|v| v.as_u64()),
+            Some(1)
         );
         assert!(node.expanded, "Node.expanded should be set true after fork");
     }
@@ -5364,7 +5440,19 @@ mod tests {
         let run_json = std::fs::read_to_string(sub_run_dir.join("run.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&run_json).unwrap();
         assert!(v.get("task").is_some(), "sub-run should have a task field");
-        assert_eq!(v.get("current_depth").and_then(|x| x.as_u64()), Some(1));
+        // Sanity check: the field must exist. Then assert the exact value.
+        // This guards against silent off-by-one refactors — if the field
+        // disappears or renames, the assert above catches it before the
+        // tight equality check below gives a confusing error.
+        assert!(
+            v.get("current_depth").is_some(),
+            "sub-run should have a current_depth field; payload: {v}"
+        );
+        assert_eq!(
+            v.get("current_depth").and_then(|x| x.as_u64()),
+            Some(1),
+            "sub-run forked from depth 0 should be at depth 1; payload: {v}"
+        );
         assert_eq!(
             v.get("parent_run_id").and_then(|x| x.as_str()),
             Some("test-run-001")
