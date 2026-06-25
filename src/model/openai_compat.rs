@@ -69,7 +69,7 @@ impl OpenAICompatModel {
             capabilities,
             thinking_enabled: true,
             reasoning_effort: None,
-            retry_max_attempts: 1,
+            retry_max_attempts: 3,
             retry_base_delay: Duration::from_secs(1),
             retry_max_delay: Duration::from_secs(30),
         }
@@ -1055,6 +1055,22 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(90),
             "elapsed {elapsed:?} should reflect the capped backoff schedule"
+        );
+    }
+
+    #[test]
+    fn default_retry_policy_allows_retries_on_transient_errors() {
+        // Regression (run bf7d76b3 and earlier): a single MiniMax HTTP timeout
+        // killed the whole run. The retry machinery (send_with_retry +
+        // is_transient_http_error) was correct, but retry_max_attempts
+        // defaulted to 1 — i.e. "initial attempt + 0 retries" — so a transient
+        // timeout was never retried. The constructed model must allow at least
+        // one retry by default so a transient failure isn't fatal.
+        let m = OpenAICompatModel::new("http://localhost", "test-model");
+        assert!(
+            m.retry_max_attempts >= 2,
+            "default retry_max_attempts must be >= 2 (initial + >=1 retry), got {}",
+            m.retry_max_attempts
         );
     }
 }
