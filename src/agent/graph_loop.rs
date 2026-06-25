@@ -1301,6 +1301,121 @@ impl GraphLoop {
         })
     }
 
+    /// Poll a forked sub-run's persisted `run.json` and update `handle.status`
+    /// based on the child's reported status. This is the inverse of
+    /// [`Self::fork_sub_graph_for`]: the parent loop calls it (typically
+    /// from `step_graph` / `Task 10`) each round to see whether the child
+    /// has finished.
+    ///
+    /// Behavior:
+    /// - If `run.json` does not exist yet (child still running) or is
+    ///   unreadable / unparseable, the function returns silently and
+    ///   leaves `handle.status` as `Running` (idempotent). This is
+    ///   intentional — the parent will try again next round.
+    /// - If `status == "Done"`, the complex node is marked done and a
+    ///   transcript line is appended so the model sees the drill-down
+    ///   completed.
+    /// - If `status == "Error"`, the complex node is marked with
+    ///   `status="error"` + `error=<message>` and a transcript line is
+    ///   appended so the model can react (e.g., backtrack, escalate).
+    /// - Any other status string (including `"Running"`) keeps the
+    ///   handle in `Running`.
+    ///
+    /// The function never panics on malformed input; it logs a `warn!`
+    /// and returns.
+    pub async fn poll_sub_run_status(&mut self, handle: &mut SubRunHandle) {
+        let path = self
+            .persistence
+            .sub_run_run_json(&self.run_id, &handle.sub_run_id);
+        let status_str = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return, // sub-run file not yet written; try again next round
+        };
+        let v: serde_json::Value = match serde_json::from_str(&status_str) {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    sub_run_id = %handle.sub_run_id,
+                    "poll_sub_run_status: run.json present but not valid JSON; treating as Running"
+                );
+                return;
+            }
+        };
+        let status_field = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+
+        handle.status = match status_field {
+            "Done" | "done" => {
+                self.mark_complex_node_done(&handle.complex_node);
+                self.conversation.add_user(format!(
+                    "✓ drill_down complete: {}\n(sub_run_id={})",
+                    handle.complex_node.as_str(),
+                    handle.sub_run_id
+                ));
+                SubRunStatus::Done
+            }
+            "Error" | "error" => {
+                let err = v
+                    .get("error")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.mark_complex_node_error(&handle.complex_node, &err);
+                self.conversation.add_user(format!(
+                    "✗ drill_down failed: {}\n(sub_run_id={}, error: {})",
+                    handle.complex_node.as_str(),
+                    handle.sub_run_id,
+                    err
+                ));
+                SubRunStatus::Error(err)
+            }
+            _ => SubRunStatus::Running,
+        };
+
+        if let Some(node) = self.graph.nodes.get_mut(&handle.complex_node) {
+            let status_str = match &handle.status {
+                SubRunStatus::Running => "running",
+                SubRunStatus::Done => "done",
+                SubRunStatus::Error(_) => "error",
+                SubRunStatus::Timeout => "timeout",
+            };
+            node.metadata.insert(
+                "sub_run_status".into(),
+                serde_json::Value::String(status_str.into()),
+            );
+        }
+    }
+
+    /// Stamp a complex node with `status="done"`. Called by
+    /// [`Self::poll_sub_run_status`] when the sub-run finishes successfully.
+    /// Idempotent and safe to call on a missing node (logs nothing on miss
+    /// to avoid noise — the parent already knows which complex node is in
+    /// play).
+    pub fn mark_complex_node_done(&mut self, node_id: &NodeId) {
+        if let Some(node) = self.graph.nodes.get_mut(node_id) {
+            node.metadata.insert(
+                "status".into(),
+                serde_json::Value::String("done".into()),
+            );
+        }
+    }
+
+    /// Stamp a complex node with `status="error"` plus the error message.
+    /// Called by [`Self::poll_sub_run_status`] when the sub-run reports an
+    /// error. Idempotent.
+    pub fn mark_complex_node_error(&mut self, node_id: &NodeId, err: &str) {
+        if let Some(node) = self.graph.nodes.get_mut(node_id) {
+            node.metadata.insert(
+                "status".into(),
+                serde_json::Value::String("error".into()),
+            );
+            node.metadata.insert(
+                "error".into(),
+                serde_json::Value::String(err.to_string()),
+            );
+        }
+    }
+
     /// Attach an [`L1Enricher`]. The loop will auto-enrich new nodes added
     /// by `ProposePatch` and (on `resume_with_repaired_graph`) any nodes
     /// still missing L1 in the replaced graph.
@@ -5487,5 +5602,99 @@ mod tests {
 
         let result = gl.fork_sub_graph_for(complex).await;
         assert!(result.is_ok(), "depth 0 with max 2 should allow fork to depth 1");
+    }
+
+    // --------------------------------------------------------------
+    // Drill-down poll tests (Task 7)
+    // --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn poll_sub_run_status_marks_done_when_sub_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sub_dir = tmp.path().join("test-run-001").join("sub_runs").join(&handle.sub_run_id);
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Done"}"#).unwrap();
+
+        let mut h = handle;
+        gl.poll_sub_run_status(&mut h).await;
+        assert!(matches!(h.status, SubRunStatus::Done));
+
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(node.metadata.get("sub_run_status").and_then(|v| v.as_str()), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn poll_sub_run_status_marks_error_when_sub_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sub_dir = tmp.path().join("test-run-001").join("sub_runs").join(&handle.sub_run_id);
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Error","error":"reviewer failed"}"#).unwrap();
+
+        let mut h = handle;
+        gl.poll_sub_run_status(&mut h).await;
+        assert!(matches!(h.status, SubRunStatus::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn poll_sub_run_status_idempotent_when_still_running() {
+        // Construct a handle whose sub_run_id points to a directory the
+        // sub-loop will NEVER write a `run.json` to. This isolates the
+        // "file missing → keep Running" branch of `poll_sub_run_status`
+        // from the real sub-loop's behavior (which terminates very
+        // quickly in test mode and would otherwise leave a `run.json`
+        // with `status: "Error"`).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let h = SubRunHandle {
+            sub_run_id: "nonexistent-sub-run-id".into(),
+            complex_node: complex.clone(),
+            started_at: 0,
+            status: SubRunStatus::Running,
+        };
+        let mut handle = h;
+        // Polling must NOT panic and must leave the handle in `Running`.
+        gl.poll_sub_run_status(&mut handle).await;
+        assert!(matches!(handle.status, SubRunStatus::Running));
+
+        // Polling a second time must be equally safe (idempotent).
+        gl.poll_sub_run_status(&mut handle).await;
+        assert!(matches!(handle.status, SubRunStatus::Running));
+    }
+
+    #[test]
+    fn mark_complex_node_done_sets_done_metadata() {
+        let mut gl = test_graph_loop_with_seed();
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+        gl.mark_complex_node_done(&complex);
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(node.metadata.get("status").and_then(|v| v.as_str()), Some("done"));
+    }
+
+    #[test]
+    fn mark_complex_node_error_sets_error_metadata() {
+        let mut gl = test_graph_loop_with_seed();
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+        gl.mark_complex_node_error(&complex, "reviewer failed");
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(node.metadata.get("status").and_then(|v| v.as_str()), Some("error"));
+        assert_eq!(node.metadata.get("error").and_then(|v| v.as_str()), Some("reviewer failed"));
     }
 }

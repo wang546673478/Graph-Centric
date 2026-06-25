@@ -194,6 +194,18 @@ impl RunPersistence {
             "TODO(task-8): persist SubRunLink to disk (in-memory only for now)"
         );
     }
+
+    /// Return the path to a sub-run's `run.json` (the child's persisted
+    /// status). The path matches the directory produced by
+    /// [`Self::create_sub_run_dir`] / [`Self::clone_for_sub_run`]:
+    /// `data_dir/<parent>/sub_runs/<sub>/run.json`. Used by
+    /// `GraphLoop::poll_sub_run_status` (Task 7) to read the child loop's
+    /// status. Note: this only constructs the path; callers should treat a
+    /// `NotFound` from `read_to_string` as "sub-run still running" rather
+    /// than an error.
+    pub fn sub_run_run_json(&self, parent: &str, sub: &str) -> PathBuf {
+        self.data_dir.join(parent).join("sub_runs").join(sub).join("run.json")
+    }
 }
 
 /// Link from a complex node in the parent graph to its forked sub-run.
