@@ -1239,7 +1239,7 @@ impl GraphLoop {
                 "fork_sub_graph_for: create_sub_run_dir failed; sub-loop will still spawn"
             );
         }
-        let link = crate::web::persistence::SubRunLink {
+        let link = crate::web::checkpoint::SubRunLink {
             node_id: complex_node.clone(),
             sub_run_id: sub_run_id_for_loop.clone(),
             sub_status: "running".to_string(),

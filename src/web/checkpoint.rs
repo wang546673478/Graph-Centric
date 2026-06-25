@@ -13,6 +13,25 @@ pub struct Checkpoint {
     pub phase: CheckpointPhase,
     pub graph_snapshot: Graph,
     pub transcript: Vec<Message>,
+    /// Links from this run's complex nodes to forked sub-runs.
+    /// Populated by `RunPersistence::append_sub_run_link`; consumed by the
+    /// API and frontend to render the drill-down graph.
+    /// `#[serde(default)]` keeps backward compatibility with older
+    /// checkpoint files written before Task 8.
+    #[serde(default)]
+    pub sub_run_links: Vec<SubRunLink>,
+}
+
+/// Link from a complex node in a parent graph to its forked sub-run.
+/// Persisted inside the latest parent checkpoint so the parent loop
+/// can poll the child loop's status and update the node's
+/// `expanded`/`sub_run_status` metadata when the child finishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubRunLink {
+    pub node_id: crate::graph::NodeId,
+    pub sub_run_id: String,
+    pub sub_status: String, // "running" | "done" | "error"
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -80,6 +99,7 @@ impl CheckpointStore {
             phase,
             graph_snapshot: graph.clone(),
             transcript: transcript.to_vec(),
+            sub_run_links: Vec::new(),
         };
         if let Some(ref p) = self.persistence {
             let _ = p.save_checkpoint(&self.run_id, &cp);
