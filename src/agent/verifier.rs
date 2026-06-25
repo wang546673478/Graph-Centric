@@ -394,13 +394,37 @@ impl Verifier {
             "verifier model self-check returned"
         );
 
-        let cleaned = extract_json_block(&resp.content)?;
-        let value: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
-            HarnessError::model(format!(
-                "verifier: invalid JSON: {e}\n--- raw ---\n{}\n--- cleaned ---\n{cleaned}",
-                resp.content
-            ))
-        })?;
+        // The model self-check is an ADVISORY layer on top of the
+        // deterministic structural checks. A malformed response (e.g. the
+        // model replied in prose with no JSON — run bf7d76b3) must NOT abort
+        // verification and kill the whole run; it degrades to "no model
+        // opinion this round" (no issues, neutral confidence). The raw
+        // response is logged so the failure is diagnosable — extract_json_block
+        // alone drops it. This mirrors the L1 self-check above, which already
+        // tolerates unparseable responses with `continue`.
+        let cleaned = match extract_json_block(&resp.content) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    raw = %resp.content,
+                    "verifier self-check returned no parseable JSON; skipping model opinion this round"
+                );
+                return Ok((Vec::new(), 0.5));
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&cleaned) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    raw = %resp.content,
+                    cleaned = %cleaned,
+                    "verifier self-check produced invalid JSON; skipping model opinion this round"
+                );
+                return Ok((Vec::new(), 0.5));
+            }
+        };
         parse_verifier_json(&value)
     }
 }
@@ -731,6 +755,39 @@ mod tests {
         let r = v.verify(&clean_graph(), "", None).await.unwrap();
         assert!(r.passed);
         assert!((r.model_confidence - 0.7).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn self_check_non_json_response_does_not_kill_run() {
+        // Regression (run bf7d76b3): the model returned brace-less prose to the
+        // verifier self-check; extract_json_block errored and was bare-`?`
+        // propagated, turning a single malformed self-check response into a
+        // fatal "graph phase error: proposer: no '{' in response" that killed
+        // the whole run. The self-check is an ADVISORY layer — a malformed
+        // response must degrade gracefully (skip the model's opinion this
+        // round), not abort verification. Structural checks must still run.
+        let resp = "I think the graph looks good overall, but let me explain my reasoning in prose instead of JSON.";
+        let model: Arc<dyn Model> = Arc::new(MockModel::new(resp));
+        let v = Verifier::with_model(model);
+        // Must return Ok (not Err) — the run survives.
+        let r = v
+            .verify(&clean_graph(), "design a system", None)
+            .await
+            .expect("malformed self-check must not abort verification");
+        // No model issues could be parsed, so a clean graph still passes on
+        // structural grounds.
+        assert!(r.passed, "clean graph should pass when self-check is unusable");
+    }
+
+    #[tokio::test]
+    async fn self_check_non_json_still_catches_structural_issues() {
+        // Even when the model self-check is unusable, deterministic structural
+        // checks must still fire — a cycle is High severity and fails.
+        let resp = "no json here, just talking";
+        let model: Arc<dyn Model> = Arc::new(MockModel::new(resp));
+        let v = Verifier::with_model(model);
+        let r = v.verify(&graph_with_cycle(), "", None).await.unwrap();
+        assert!(!r.passed, "structural cycle must still fail despite unusable self-check");
     }
 
     /// Two-shot mock: first response handles the model_self_check; remaining
