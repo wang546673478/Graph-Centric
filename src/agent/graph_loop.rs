@@ -2194,10 +2194,28 @@ impl GraphLoop {
             Some(RootCause::GraphIssue) | Some(RootCause::ScopeIssue) => {
                 let errors = reviewer.to_graph_errors(&result);
                 self.pending = Pending::AwaitingRepair;
+                // Record WHY the review rejected the graph so it's observable
+                // (run 7f7b60c0: only issue_count was logged, the judge's
+                // actual complaint went nowhere). Surface the judge detail +
+                // rationale into both the log and the conversation/transcript,
+                // mirroring how the verify gate records its orphan list.
+                let detail = result
+                    .judge_verdict
+                    .as_ref()
+                    .map(|j| j.detail.as_str())
+                    .unwrap_or("");
                 warn!(
                     issue_count = errors.len(),
+                    detail = %detail,
+                    rationale = %result.rationale,
                     "graph_loop: review failed with graph-rooted cause; surfacing GraphInvalid"
                 );
+                self.conversation.add_user(format!(
+                    "🔁 Review rejected the graph (root cause: graph/scope). \
+                     Reviewer's finding: {detail}\nRationale: {}\n\
+                     The graph needs repair before this task can complete.",
+                    result.rationale
+                ));
                 LoopState::GraphInvalid {
                     source: ErrorSource::Review,
                     errors,
@@ -4203,6 +4221,41 @@ mod tests {
         // review_result should also be stored on the loop for inspection
         let r = gl.review_result.expect("review_result populated");
         assert!(!r.passed);
+    }
+
+    #[tokio::test]
+    async fn phase4_review_fail_records_judge_detail_in_conversation() {
+        // Observability gap (run 7f7b60c0): when Review surfaced GraphInvalid,
+        // only `issue_count` was logged — the judge's actual complaint
+        // ("missing critical edges") went nowhere, so neither the user nor a
+        // later debugging session could see WHY the graph was rejected. The
+        // judge detail must be written into the conversation/transcript so the
+        // reason is inspectable, mirroring how the verify gate records orphans.
+        let proposer_resp = r#"{"step":"ready_for_verify","rationale":"go"}"#;
+        let decomp_resp = r#"{"tasks":[],"rationale":"trivial"}"#;
+        let judge_resp = r#"{"verdict":"fail","root_cause":"graph","detail":"missing critical edges between asset and contract","confidence":0.85}"#;
+        let mut gl = build_phase4_loop(vec![proposer_resp, decomp_resp, judge_resp]);
+
+        let mut state = LoopState::Running;
+        for _ in 0..20 {
+            state = gl.step().await;
+            if !matches!(state, LoopState::Running) {
+                break;
+            }
+        }
+        assert!(matches!(state, LoopState::GraphInvalid { .. }));
+        // The judge's detail must appear somewhere in the conversation so the
+        // GraphInvalid reason is observable.
+        let found = gl
+            .conversation
+            .messages
+            .iter()
+            .any(|m| m.content.contains("missing critical edges between asset and contract"));
+        assert!(
+            found,
+            "judge detail must be recorded in the conversation/transcript; messages: {:?}",
+            gl.conversation.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
