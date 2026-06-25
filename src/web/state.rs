@@ -145,6 +145,11 @@ pub struct LoopTuningConfig {
     /// the "emit ready_for_verify" convergence hint. 0 disables.
     #[serde(default = "default_convergence_stable_rounds")]
     pub convergence_stable_rounds: u32,
+
+    /// Task 6: stub for the drill-down sub-graph depth cap. Task 9 will
+    /// wire it into the full config (UI + persistence + heartbeat).
+    #[serde(default)]
+    pub max_drilldown_depth: u32,
 }
 
 fn default_true() -> bool {
@@ -271,6 +276,7 @@ impl Default for EngineConfig {
                 event_channel_capacity: 256,
                 force_search_after_filling_stall: 5,
                 convergence_stable_rounds: 3,
+                max_drilldown_depth: 0,
             },
         }
     }

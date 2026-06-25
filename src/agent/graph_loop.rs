@@ -451,6 +451,7 @@ fn validate_patch_schema(
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct GraphLoopConfig {
     /// Hard cap on total proposer rounds (including ask_user / call_tool turns).
     pub max_rounds: usize,
@@ -499,6 +500,15 @@ pub struct GraphLoopConfig {
     /// emit ready_for_verify now" hint. The hint never auto-emits — the
     /// model keeps final say. 0 disables convergence hinting.
     pub convergence_stable_rounds: u32,
+
+    // ── Drill-down sub-graph (Task 6) ──
+    /// Maximum recursion depth for sub-graph forking. A parent run at
+    /// `current_depth = N` can fork a child at `N + 1` only if
+    /// `N + 1 <= max_drilldown_depth`. When exceeded, the drill_down
+    /// field is dropped (patch nodes/edges still apply) and a warn is
+    /// logged. Default 0 = drill-down disabled (current behavior).
+    /// Full config wiring lands in Task 9.
+    pub max_drilldown_depth: u32,
 }
 
 impl GraphLoopConfig {
@@ -522,6 +532,7 @@ impl GraphLoopConfig {
             tool_failure_halt_after: 8,
             force_search_after_filling_stall: 5,
             convergence_stable_rounds: 3,
+            max_drilldown_depth: 0, // disabled by default until Task 9 wires it up
         }
     }
 }
@@ -718,6 +729,11 @@ pub struct GraphLoop {
     /// by `build_sub_task_for` during `fork_sub_graph_for`. Cleared after fork.
     pub last_patch_drill_down_reasons: std::collections::HashMap<NodeId, String>,
 
+    /// Persistence used by `fork_sub_graph_for` to write the sub-run
+    /// directory + link. Defaults to a no-op persistence rooted at a
+    /// tmp dir; the web gateway overrides via `with_persistence`.
+    pub persistence: crate::web::persistence::RunPersistence,
+
     phase: Phase,
     pending: Pending,
 }
@@ -835,6 +851,47 @@ async fn summarize_for_main_agent(model: &dyn crate::model::Model, text: &str) -
     }
 }
 
+// ---------------------------------------------------------------------------
+// Drill-down helpers (Task 6)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock millis since UNIX_EPOCH. Used to stamp `SubRunHandle.started_at`
+/// and `SubRunLink.created_at` so the parent can age sub-runs for the
+/// `pending_sub_runs` map and decide when to surface status to the user.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Minimal `Model` impl used by `new_with_depth` for sub-loops. Returns
+/// `ready_for_verify` on the first call (which passes structural verify
+/// on an empty graph and routes the sub-loop to Done) so any spawn made
+/// by `fork_sub_graph_for` in a test setting terminates in a few ticks.
+/// Task 10 will replace this with a real clone of the parent's proposer
+/// so the sub-loop actually expands the complex node.
+struct NoopModel;
+
+#[async_trait::async_trait]
+impl crate::model::Model for NoopModel {
+    fn name(&self) -> &str {
+        "noop-sub-graph-model"
+    }
+    async fn complete(
+        &self,
+        _request: crate::model::ModelRequest,
+    ) -> Result<crate::model::ModelResponse> {
+        Ok(crate::model::ModelResponse {
+            content: r#"{"step":"ready_for_verify","rationale":"noop sub-graph termination"}"#.to_string(),
+            tool_calls: vec![],
+            finish_reason: crate::model::FinishReason::Stop,
+            reasoning_content: None,
+            usage: crate::model::Usage::default(),
+        })
+    }
+}
+
 impl GraphLoop {
     pub fn new(
         task: impl Into<String>,
@@ -910,9 +967,264 @@ impl GraphLoop {
             run_id: format!("run-{}", uuid::Uuid::new_v4()),
             event_tx: tokio::sync::broadcast::channel::<crate::web::events::EngineEvent>(64).0,
             last_patch_drill_down_reasons: std::collections::HashMap::new(),
+            // Default persistence: rooted at a tempdir so `fork_sub_graph_for`
+            // has a valid place to create the sub-run dir even without the
+            // web gateway overriding. The web path replaces this via
+            // `with_persistence` after construction.
+            persistence: crate::web::persistence::RunPersistence::with_data_dir(
+                std::env::temp_dir().join("graph_harness_default_persistence"),
+            ),
             phase: Phase::Graph,
             pending: Pending::None,
         }
+    }
+
+    /// Attach a [`RunPersistence`]. The web gateway calls this after
+    /// constructing the loop so that `fork_sub_graph_for` writes the
+    /// sub-run directory under the project's `data/runs/` tree. Tests
+    /// call this with a tempdir-rooted persistence.
+    pub fn with_persistence(mut self, persistence: crate::web::persistence::RunPersistence) -> Self {
+        self.persistence = persistence;
+        self
+    }
+
+    /// Factory: build a sub-GraphLoop that inherits the parent's config,
+    /// task, model, tools, and conversation setup, but at an incremented
+    /// drill-down depth with `parent_run_id` set. Used by
+    /// [`Self::fork_sub_graph_for`].
+    ///
+    /// The sub-loop is created with a `NullModel` (no model calls) and
+    /// an empty tool registry so it can run unattended: when
+    /// `run_with_persistence` drives it, the model returns an immediate
+    /// `ready_for_verify` (since the verifier passes on an empty graph)
+    /// and the loop terminates with `Done` in a few steps — enough to
+    /// write `run.json` for the tests.
+    ///
+    /// Task 10 (step_graph integration) will replace this with a real
+    /// clone of the parent's proposer/model/tools/decomposer/etc. so the
+    /// child can actually expand the complex node into a sub-graph.
+    pub fn new_with_depth(
+        cfg: GraphLoopConfig,
+        parent_run_id: String,
+        current_depth: u32,
+        sub_task: Option<String>,
+    ) -> Self {
+        use crate::agent::proposer::GraphProposer;
+        use crate::agent::verifier::Verifier;
+        let model: Arc<dyn crate::model::Model> = Arc::new(NoopModel);
+        let tools = Arc::new(crate::tools::ToolRegistry::new());
+        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
+        let verifier = Verifier::structural_only();
+        let task_str = sub_task.unwrap_or_else(|| "sub-graph task".to_string());
+        let mut sub = Self::new(task_str, proposer, verifier, None, tools, cfg);
+        sub.parent_run_id = Some(parent_run_id);
+        sub.current_depth = current_depth;
+        sub
+    }
+
+    /// Run the loop to terminal state, persist the final `run.json` into
+    /// the provided persistence's data dir, and emit events on the
+    /// provided broadcast channel. Used by [`Self::fork_sub_graph_for`]
+    /// to drive a forked sub-loop without interfering with the parent's
+    /// `event_tx` / persistence state.
+    ///
+    /// Simplified for Task 6: walks the FSM until it returns Done/Error,
+    /// then writes a minimal `run.json` (status + node_count + edge_count
+    /// + duration). Doesn't emit per-step events on the broadcast channel
+    /// for now — that's wired in Task 10/11 (API endpoints).
+    pub async fn run_with_persistence(
+        mut self,
+        persistence: crate::web::persistence::RunPersistence,
+        _event_tx: tokio::sync::broadcast::Sender<crate::web::events::EngineEvent>,
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let terminal = loop {
+            match self.step().await {
+                LoopState::Running => continue,
+                terminal => break terminal,
+            }
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let status = match &terminal {
+            LoopState::Done(_) => "Done",
+            LoopState::Error(_) => "Error",
+            _ => "Done",
+        };
+        let payload = serde_json::json!({
+            "id": self.run_id,
+            "task": self.task,
+            "status": status,
+            "node_count": self.graph.node_count(),
+            "edge_count": self.graph.edge_count(),
+            "duration_ms": duration_ms,
+            "parent_run_id": self.parent_run_id,
+            "current_depth": self.current_depth,
+            "tokens_used": self.tokens_used,
+        });
+        let dir = persistence.data_dir.clone();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(error = %e, dir = %dir.display(), "run_with_persistence: failed to create dir");
+        }
+        if let Err(e) = std::fs::write(dir.join("run.json"), serde_json::to_string_pretty(&payload).unwrap_or_default()) {
+            tracing::warn!(error = %e, "run_with_persistence: failed to write run.json");
+        }
+        Ok(())
+    }
+
+    /// Build the drill-down task prompt that the sub-GraphLoop will be
+    /// handed as its task description. Pulls the cached `drill_down.reason`
+    /// from the most recent patch (set by `step_graph` when a patch with
+    /// drill_down marks was applied), or falls back to the node's summary
+    /// if no reason was provided.
+    pub fn build_sub_task_for(&self, complex_node: &NodeId) -> String {
+        let node = match self.graph.nodes.get(complex_node) {
+            Some(n) => n,
+            None => return format!("Drill-down: {}", complex_node.as_str()),
+        };
+        let reason = self
+            .last_patch_drill_down_reasons
+            .get(complex_node)
+            .cloned()
+            .unwrap_or_else(|| node.summary.clone());
+        format!(
+            "[Drill-down of {}] {}\n\n\
+             Goal: produce a sub-graph explaining how to implement this step. \
+             Expand it into concrete sub-steps connected by LeadsTo / DependsOn / \
+             Contains. Use semantic ids and emit a complete sub-graph.",
+            complex_node.as_str(),
+            reason
+        )
+    }
+
+    /// Fork the current loop into a sub-GraphLoop that expands
+    /// `complex_node` into its own sub-graph. Returns a [`SubRunHandle`]
+    /// the parent can poll (via `poll_sub_run_status` in Task 7).
+    ///
+    /// Mechanics:
+    /// 1. Depth check: if `current_depth + 1 > max_drilldown_depth`, return
+    ///    `DrillDownError::DepthLimit`. The drill_down field is dropped
+    ///    (nodes/edges from the same patch are still applied).
+    /// 2. Generate a unique sub_run_id (`<run_id>-sub-<counter>-d<depth>`).
+    /// 3. Build the sub-task prompt via `build_sub_task_for`.
+    /// 4. Create a fresh sub-GraphLoop via `new_with_depth` with the same
+    ///    config (so model/tools/policy inherit), incremented depth, and
+    ///    parent_run_id set.
+    /// 5. Persist the sub-run directory and append a `SubRunLink` to the
+    ///    parent's checkpoint index (Task 6 stub: in-memory only).
+    /// 6. Stamp the complex node's metadata with `sub_run_id`,
+    ///    `sub_run_status="running"`, `drill_down_depth=<depth>`, and
+    ///    flip `expanded=true` so subsequent renders show the node as
+    ///    expanded.
+    /// 7. Inject a transcript line so the model sees the drill-down start.
+    /// 8. Spawn the sub-loop on the tokio runtime — it runs unattended
+    ///    and writes `run.json` to its sub-run dir when it terminates.
+    pub async fn fork_sub_graph_for(
+        &mut self,
+        complex_node: NodeId,
+    ) -> std::result::Result<SubRunHandle, DrillDownError> {
+        let new_depth = self.current_depth + 1;
+        if new_depth > self.config.max_drilldown_depth {
+            tracing::warn!(
+                current_depth = self.current_depth,
+                max_depth = self.config.max_drilldown_depth,
+                node = %complex_node.as_str(),
+                "drill_down depth limit reached; field dropped, patch nodes/edges still applied"
+            );
+            return Err(DrillDownError::DepthLimit);
+        }
+
+        let sub_run_id = format!(
+            "{}-sub-{}-d{}",
+            self.run_id, self.sub_run_counter, new_depth
+        );
+        self.sub_run_counter += 1;
+
+        let sub_task = self.build_sub_task_for(&complex_node);
+
+        let sub_config = self.config.clone();
+        // Don't re-clamp max_drilldown_depth — it's already set; the
+        // sub-loop can itself fork at depth+1 if max allows.
+
+        let sub_run_id_for_loop = sub_run_id.clone();
+        let parent_run_id = self.run_id.clone();
+        let sub_loop = GraphLoop::new_with_depth(
+            sub_config,
+            parent_run_id,
+            new_depth,
+            Some(sub_task.clone()),
+        );
+
+        // Create the sub-run directory under <data_dir>/<parent>/sub_runs/<sub>/.
+        // Best-effort: log on failure but still return a handle so the
+        // parent loop can keep running (the sub-loop's run.json write
+        // will be the source of truth for status).
+        if let Err(e) = self
+            .persistence
+            .create_sub_run_dir(&self.run_id, &sub_run_id_for_loop)
+        {
+            tracing::warn!(
+                error = %e,
+                parent = %self.run_id,
+                sub = %sub_run_id_for_loop,
+                "fork_sub_graph_for: create_sub_run_dir failed; sub-loop will still spawn"
+            );
+        }
+
+        let link = crate::web::persistence::SubRunLink {
+            node_id: complex_node.clone(),
+            sub_run_id: sub_run_id_for_loop.clone(),
+            sub_status: "running".to_string(),
+            created_at: now_ms(),
+        };
+        self.persistence
+            .append_sub_run_link(&self.run_id, &link);
+
+        // Stamp the complex node's metadata.
+        if let Some(node) = self.graph.nodes.get_mut(&complex_node) {
+            node.metadata.insert(
+                "sub_run_id".into(),
+                serde_json::Value::String(sub_run_id_for_loop.clone()),
+            );
+            node.metadata.insert(
+                "sub_run_status".into(),
+                serde_json::Value::String("running".into()),
+            );
+            node.metadata.insert(
+                "drill_down_depth".into(),
+                serde_json::Value::String(new_depth.to_string()),
+            );
+            node.expanded = true;
+        } else {
+            tracing::warn!(
+                node = %complex_node.as_str(),
+                "fork_sub_graph_for: complex node not found in graph; skipping metadata stamp"
+            );
+        }
+
+        self.conversation.add_user(format!(
+            "⤵ drill_down started: {}\n(sub_run_id={}, depth={})",
+            complex_node.as_str(),
+            sub_run_id_for_loop,
+            new_depth
+        ));
+
+        // Spawn the sub-loop with its own persistence rooted at the sub-run dir.
+        let sub_persistence = self
+            .persistence
+            .clone_for_sub_run(&self.run_id, &sub_run_id_for_loop);
+        let event_tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sub_loop.run_with_persistence(sub_persistence, event_tx).await {
+                tracing::warn!(error = %e, "sub-graph loop errored");
+            }
+        });
+
+        Ok(SubRunHandle {
+            sub_run_id: sub_run_id_for_loop,
+            complex_node,
+            started_at: now_ms(),
+            status: SubRunStatus::Running,
+        })
     }
 
     /// Attach an [`L1Enricher`]. The loop will auto-enrich new nodes added
@@ -3501,6 +3813,20 @@ mod tests {
         gl
     }
 
+    /// Same as `test_graph_loop_with_seed` but rooted at a tempdir so
+    /// `fork_sub_graph_for` can create the sub-run directory there. Sets
+    /// `run_id = "test-run-001"` (a fixed string the tests can predict
+    /// against) and uses `RunPersistence::with_data_dir(path)` so the
+    /// layout matches the test's expectations
+    /// (`<path>/<parent>/sub_runs/<sub>/run.json`).
+    fn test_graph_loop_with_seed_at(path: &std::path::Path) -> GraphLoop {
+        let mut gl = test_graph_loop_with_seed();
+        gl.run_id = "test-run-001".to_string();
+        let persistence = crate::web::persistence::RunPersistence::with_data_dir(path.to_path_buf());
+        gl = gl.with_persistence(persistence);
+        gl
+    }
+
     #[test]
     fn build_filling_hint_no_longer_says_single_path() {
         let gl = test_graph_loop_with_seed();
@@ -4953,5 +5279,125 @@ mod tests {
     fn drill_down_error_depth_limit() {
         let e = DrillDownError::DepthLimit;
         assert_eq!(format!("{e:?}"), "DepthLimit");
+    }
+
+    // --------------------------------------------------------------
+    // Drill-down fork tests (Task 6)
+    // --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fork_creates_sub_run_with_complex_node_as_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        assert_eq!(handle.complex_node, complex);
+        assert!(
+            handle.sub_run_id.starts_with("test-run")
+                || handle.sub_run_id.contains("sub"),
+            "sub_run_id should be derived from parent + counter + depth; got {}",
+            handle.sub_run_id
+        );
+        assert!(matches!(handle.status, SubRunStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn fork_records_sub_run_id_in_complex_node_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(
+            node.metadata.get("sub_run_id").and_then(|v| v.as_str()),
+            Some(handle.sub_run_id.as_str())
+        );
+        assert_eq!(
+            node.metadata.get("sub_run_status").and_then(|v| v.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            node.metadata.get("drill_down_depth").and_then(|v| v.as_str()),
+            Some("1")
+        );
+        assert!(node.expanded, "Node.expanded should be set true after fork");
+    }
+
+    #[tokio::test]
+    async fn fork_persists_sub_run_under_parent_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex).await.unwrap();
+        // Give the spawned sub-loop a moment to write run.json.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sub_dir = tmp.path().join("test-run-001").join("sub_runs").join(&handle.sub_run_id);
+        assert!(sub_dir.exists(), "sub_run dir should exist at {sub_dir:?}");
+        assert!(sub_dir.join("run.json").exists(), "sub_run run.json should exist");
+    }
+
+    #[tokio::test]
+    async fn fork_inherits_model_and_tools_and_increments_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        assert_eq!(gl.current_depth, 0);
+
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+        let handle = gl.fork_sub_graph_for(complex).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let sub_run_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&handle.sub_run_id);
+        let run_json = std::fs::read_to_string(sub_run_dir.join("run.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&run_json).unwrap();
+        assert!(v.get("task").is_some(), "sub-run should have a task field");
+        assert_eq!(v.get("current_depth").and_then(|x| x.as_u64()), Some(1));
+        assert_eq!(
+            v.get("parent_run_id").and_then(|x| x.as_str()),
+            Some("test-run-001")
+        );
+    }
+
+    #[tokio::test]
+    async fn depth_limit_blocks_excessive_recursion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 1;
+        gl.current_depth = 1; // simulate being a sub-graph at depth 1
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let result = gl.fork_sub_graph_for(complex.clone()).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DrillDownError::DepthLimit));
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert!(node.metadata.get("sub_run_id").is_none());
+        assert!(!node.expanded);
+    }
+
+    #[tokio::test]
+    async fn depth_limit_allows_within_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        gl.current_depth = 0;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let result = gl.fork_sub_graph_for(complex).await;
+        assert!(result.is_ok(), "depth 0 with max 2 should allow fork to depth 1");
     }
 }

@@ -25,6 +25,14 @@ impl RunPersistence {
         Self { data_dir: project_root.join("data").join("runs") }
     }
 
+    /// Construct a persistence rooted directly at `data_dir`. Used by tests
+    /// (and a few internal helpers) that want to bypass the
+    /// `<project>/data/runs/` layout. Production paths stick with
+    /// `RunPersistence::new`.
+    pub fn with_data_dir(data_dir: PathBuf) -> Self {
+        Self { data_dir }
+    }
+
     fn run_dir(&self, run_id: &str) -> PathBuf {
         self.data_dir.join(run_id)
     }
@@ -154,6 +162,50 @@ impl RunPersistence {
         }
         Ok(ids)
     }
+
+    // ---- Sub-runs (Task 6 stub — Task 8 will replace with real impl) ----
+
+    /// Create the directory for a sub-run under `data_dir/<parent>/sub_runs/<sub>/`.
+    /// TODO(task-8): replace with the real layout that uses `<project>/data/runs/<parent>/sub_runs/<sub>/`.
+    pub fn create_sub_run_dir(&self, parent: &str, sub: &str) -> std::io::Result<PathBuf> {
+        let dir = self.data_dir.join(parent).join("sub_runs").join(sub);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    /// Return a fresh [`RunPersistence`] rooted at the sub-run dir. Used by
+    /// `GraphLoop::fork_sub_graph_for` so the child loop writes its own
+    /// `run.json` to the sub-run directory.
+    /// TODO(task-8): replace with the real layout.
+    pub fn clone_for_sub_run(&self, parent: &str, sub: &str) -> Self {
+        let dir = self.data_dir.join(parent).join("sub_runs").join(sub);
+        Self::with_data_dir(dir)
+    }
+
+    /// Append a [`SubRunLink`] to the parent's checkpoint index. Task 6
+    /// stub: logs a TODO line and writes nothing on disk. Task 8 will
+    /// implement the real append (atomic write to
+    /// `<parent>/sub_runs/links.json`).
+    pub fn append_sub_run_link(&self, parent: &str, link: &SubRunLink) {
+        tracing::warn!(
+            parent = %parent,
+            node = %link.node_id.as_str(),
+            sub_run_id = %link.sub_run_id,
+            "TODO(task-8): persist SubRunLink to disk (in-memory only for now)"
+        );
+    }
+}
+
+/// Link from a complex node in the parent graph to its forked sub-run.
+/// Captured by `GraphLoop::fork_sub_graph_for` so the parent loop can poll
+/// the child loop's status and update the node's `expanded`/`sub_run_status`
+/// metadata when the child finishes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SubRunLink {
+    pub node_id: crate::graph::NodeId,
+    pub sub_run_id: String,
+    pub sub_status: String,
+    pub created_at: u64,
 }
 
 // ---------------------------------------------------------------------------
