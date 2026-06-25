@@ -40,3 +40,34 @@ Ask the independent advisor model for a second opinion on a design or knowledge 
 - `DependsOn`:真正的依赖(B 必须先存在/完成,A 才能工作)。无环。
 - `Contains`:层级包含(节点展开成子节点)。无环。
 先判断任务类型:线性任务(如写文档)→ 纯 LeadsTo;系统构建 → 依赖用 DependsOn、流程用 LeadsTo。
+
+## drill_down (optional, in propose_patch)
+
+Use this to mark a complex step node that needs sub-graph expansion. The system will pause the parent graph at this node, spawn a child graph whose `start` is this node, and the child's Filling/Expanding/Review will produce the detail.
+
+Schema:
+  drill_down: {
+    target: "<node_id from add_nodes in the same patch>",
+    reason: "<one sentence: why this needs expansion>",
+    sub_task_override: "<optional: refined task description for the sub-graph>"
+  }
+
+When to use:
+- Node summary is broad / lists 5+ sub-items
+- The node would be 1+ hour of real work
+- The node has natural sub-process the user expects broken out
+
+When NOT to use:
+- Simple steps ("define the goal", "set up project")
+- Atoms ("read file X", "add a label")
+- Every node (max 1 drill_down per patch; sub-graph is heavy)
+
+Example:
+  propose_patch: {
+    add_nodes: [{id: "design-modules", summary: "...", ...}],
+    add_edges: [
+      {from: "define-roles", to: "design-modules", relation: "LeadsTo"},
+      {from: "design-modules", to: "define-entities", relation: "LeadsTo"}
+    ],
+    drill_down: {target: "design-modules", reason: "10+ sub-modules, each is a sub-design"}
+  }

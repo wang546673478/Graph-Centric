@@ -1775,7 +1775,41 @@ RelationType: Contains | BelongsTo | Imports | Exports | DependsOn |
 - L1 is not your concern in `propose_patch` — focus on L0 correctness.
   The L1 column in the graph snapshot you see each turn reflects what the
   L1Enricher has produced so far; if it looks wrong for a node, flag it as
-  rationale in your next patch and the verifier/repairer will pick it up."#;
+  rationale in your next patch and the verifier/repairer will pick it up.
+
+## drill_down (optional, in propose_patch)
+
+Use this to mark a complex step node that needs sub-graph expansion. The
+system will pause the parent graph at this node, spawn a child graph
+whose `start` is this node, and the child's Filling/Expanding/Review
+will produce the detail.
+
+Schema:
+  drill_down: {
+    target: "<node_id from add_nodes in the same patch>",
+    reason: "<one sentence: why this needs expansion>",
+    sub_task_override: "<optional: refined task description for the sub-graph>"
+  }
+
+When to use:
+- Node summary is broad / lists 5+ sub-items
+- The node would be 1+ hour of real work
+- The node has natural sub-process the user expects broken out
+
+When NOT to use:
+- Simple steps ("define the goal", "set up project")
+- Atoms ("read file X", "add a label")
+- Every node (max 1 drill_down per patch; sub-graph is heavy)
+
+Example:
+  propose_patch: {
+    add_nodes: [{id: "design-modules", summary: "...", ...}],
+    add_edges: [
+      {from: "define-roles", to: "design-modules", relation: "LeadsTo"},
+      {from: "design-modules", to: "define-entities", relation: "LeadsTo"}
+    ],
+    drill_down: {target: "design-modules", reason: "10+ sub-modules, each is a sub-design"}
+  }"#;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2586,6 +2620,21 @@ mod tests {
         );
         let prompt = proposer.build_system_prompt("any task");
         assert!(!prompt.contains("## Available skills"));
+    }
+
+    #[test]
+    fn proposer_system_prompt_contains_drill_down_schema() {
+        // The system prompt must document the `drill_down` field on
+        // `propose_patch` so the model knows it can mark a complex step
+        // node for sub-graph expansion. Without this schema, the model
+        // never emits `drill_down` and Task 6 (fork_sub_graph_for) is
+        // never exercised.
+        let p = proposer_with(vec![r#"{"step":"ready_for_verify"}"#]);
+        let prompt = p.build_system_prompt("any task");
+        assert!(prompt.contains("drill_down"), "prompt missing 'drill_down' keyword");
+        assert!(prompt.contains("target"), "prompt missing 'target' field doc");
+        assert!(prompt.contains("sub_task_override"), "prompt missing 'sub_task_override' field doc");
+        assert!(prompt.contains("design-modules"), "prompt missing example node id");
     }
 
     #[tokio::test]
