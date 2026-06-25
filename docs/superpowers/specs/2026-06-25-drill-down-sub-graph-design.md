@@ -37,7 +37,7 @@ start → identify-layers → define-roles → design-modules → define-entitie
 3. **独立子 GraphLoop 跑下钻**:父图 fork 一个全新 GraphLoop,把 C 作为子图的 `start`,走完整 Filling/Expanding/Review,**复用现有代码不变**。子图没有强制的 deliverable 节点,子图本身 ready_for_verify = done。
 4. **父图挂起/恢复**:有 pending 子图 → 父图 step_graph 不发新 propose_patch,只 polling 子图状态;子图 done → C 标 done → 父图继续 C 下游。
 5. **子图可以递归下钻**:子图与父图享有**同一套 `drill_down` 机制**,可继续 fork 子子图、孙图。深度受 `EngineConfig::max_drilldown_depth` 限制(默认 2,即允许 main → sub → sub-sub 三层)。
-6. **节点 metadata 复用**:Node 不加新 struct 字段,用现有 `metadata: HashMap<String, String>` 存 `sub_run_id` / `sub_run_status` / `drill_down_reason` / `requires_drilldown`。
+6. **节点 metadata 复用**:Node 不加新 struct 字段,用现有 `metadata: HashMap<String, String>` 存 `sub_run_id` / `sub_run_status` / `drill_down_depth`(均由系统在 fork 时回填;模型标记下钻走 `ProposePatch.drill_down` 字段而非 metadata key)。
 7. **嵌套持久化**:子 run 存 `data/runs/<parent>/sub_runs/<child>/`(递归嵌套,3 层时是 `data/runs/<main>/sub_runs/<sub1>/sub_runs/<sub2>/`),父图 Checkpoint 新增 `sub_run_links: Vec<SubRunLink>`,删父 run 自动级联清子。
 8. **错误复用**:`sub_run_status=error` → 父图 C 失败 → 走现有 GraphInvalid 路径(reviewer judge 评 C 失败),不引入新机制。
 9. **资源保护**:以**层**为单位,不是以**个数**为单位:`EngineConfig::max_drilldown_depth: usize`(默认 2,即最多 main + sub + sub-sub = 3 层);单 patch 最多 1 个 drill_down(超出 → 该字段被丢弃 + warn log)。
@@ -298,14 +298,15 @@ Example:
 ### 4. 数据模型 / 持久化(`src/graph/mod.rs` + `src/web/persistence.rs`)
 
 #### 4.1 Node metadata keys
-| Key | Value | 含义 |
-|---|---|---|
-| `requires_drilldown` | `"true"` | 模型在 patch 时标记,系统识别后 fork 子图 |
-| `sub_run_id` | `"uuid-v4"` | 子图创建后回填 |
-| `sub_run_status` | `"running"` / `"done"` / `"error"` | 子图状态 |
-| `drill_down_reason` | `"..."` | 模型当时为什么下钻(可读 / 日志) |
+| Key | Value | 含义 | 谁写 |
+|---|---|---|---|
+| `sub_run_id` | `"uuid-v4"` | 子图创建后回填 | 系统(fork 时) |
+| `sub_run_status` | `"running"` / `"done"` / `"error"` | 子图当前状态 | 系统(polling 时更新) |
+| `drill_down_depth` | `"1"` / `"2"` | 节点被下钻到的层数 | 系统(fork 时) |
 
 **Node 结构体本身不增字段**,复用 `metadata: HashMap<String, String>`。序列化反序列化向后兼容。
+
+**注**:模型标记下钻的载体是 `ProposePatch.drill_down: { target, reason, sub_task_override }` 字段(在 `add_nodes` 同 patch 里),不是 metadata key。`requires_drilldown` / `drill_down_reason` 之类 metadata key 跟 patch 字段重复,本设计**不引入**。
 
 #### 4.2 目录布局(嵌套)
 ```
@@ -447,7 +448,8 @@ pub struct EngineConfig {
 **Schema 校验**(`src/agent/proposer.rs`):
 - `drill_down_target_must_be_in_add_nodes`:target 不在 → patch 拒绝
 - `drill_down_only_one_per_patch`:2 个 drill_down → 保留第一个,其余 drop+warn
-- `drill_down_max_per_run`:第 6 个 → 第 6 个 patch 的 drill_down 字段 drop+warn
+- `drill_down_depth_limit_blocks_excessive`:depth 2 的 run 发 drill_down(patch 仍可 apply 节点/边)→ drill_down 字段 drop + warn log
+- `drill_down_depth_allows_within_limit`:depth 0/1 的 run 发 drill_down → 子图正常 fork
 
 **Prompt 改动**(`build_filling_hint`):
 - `hint_no_longer_says_single_path`:新文本**不包含** "main chain is the single path"
