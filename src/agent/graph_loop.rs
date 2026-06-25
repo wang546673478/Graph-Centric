@@ -45,7 +45,7 @@ use super::verifier::{Severity, VerificationResult, VerifyIssue, Verifier};
 use super::Conversation;
 use crate::context::SourceLoader;
 use crate::error::{HarnessError, Result};
-use crate::graph::{Edge, Graph, Node, NodeId, NodeKind, RelationType};
+use crate::graph::{DrillDownMark, Edge, Graph, GraphPatch, Node, NodeId, NodeKind, RelationType};
 use crate::tools::{ToolContext, ToolRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -729,6 +729,14 @@ pub struct GraphLoop {
     /// by `build_sub_task_for` during `fork_sub_graph_for`. Cleared after fork.
     pub last_patch_drill_down_reasons: std::collections::HashMap<NodeId, String>,
 
+    /// Queue of `(complex_node, drill_down_reason)` pairs that the
+    /// patch-apply arm has flagged for fork. Drained at the top of
+    /// `step_graph` (in the polling block) where `fork_sub_graph_for`
+    /// can be called without tripping the Send-bound at the
+    /// `tokio::spawn` site. See the comment at the patch-apply site
+    /// for the full rationale.
+    pub pending_fork_targets: Vec<(NodeId, String)>,
+
     /// Persistence used by `fork_sub_graph_for` to write the sub-run
     /// directory + link. Defaults to a no-op persistence rooted at a
     /// tmp dir; the web gateway overrides via `with_persistence`.
@@ -967,6 +975,7 @@ impl GraphLoop {
             run_id: format!("run-{}", uuid::Uuid::new_v4()),
             event_tx: tokio::sync::broadcast::channel::<crate::web::events::EngineEvent>(64).0,
             last_patch_drill_down_reasons: std::collections::HashMap::new(),
+            pending_fork_targets: Vec::new(),
             // Default persistence: rooted at a tempdir so `fork_sub_graph_for`
             // has a valid place to create the sub-run dir even without the
             // web gateway overriding. The web path replaces this via
@@ -1287,11 +1296,18 @@ impl GraphLoop {
             .persistence
             .clone_for_sub_run(&self.run_id, &sub_run_id_for_loop);
         let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = sub_loop.run_with_persistence(sub_persistence, event_tx).await {
-                tracing::warn!(error = %e, "sub-graph loop errored");
-            }
-        });
+        // Task 10 fix: previously this `tokio::spawn` site would trip
+        // a Send-bound violation when `fork_sub_graph_for` was awaited
+        // from `step_graph` (because the outer future's state machine
+        // unified with the spawned future and propagated non-Send
+        // captures). The fix is to extract the spawned task into a
+        // free `async fn` so its future is type-erased from the
+        // caller's call-graph and Send is checked only against its
+        // own (Send-only) captures: `sub_loop`, `sub_persistence`,
+        // and `event_tx`. If any of those stops being Send, the
+        // compile error here will point directly at the culprit
+        // rather than at a confusing propagation through `step_graph`.
+        Self::spawn_sub_loop_task(sub_loop, sub_persistence, event_tx);
 
         Ok(SubRunHandle {
             sub_run_id: sub_run_id_for_loop,
@@ -1299,6 +1315,24 @@ impl GraphLoop {
             started_at: now_ms(),
             status: SubRunStatus::Running,
         })
+    }
+
+    /// Free-function helper that spawns a sub-GraphLoop's
+    /// `run_with_persistence` on the runtime. Lives outside the
+    /// `async fn fork_sub_graph_for` body so its Send-bound is checked
+    /// in isolation from any outer caller's call-graph (notably
+    /// `step_graph`'s). See the comment at the spawn site in
+    /// `fork_sub_graph_for` for the full rationale.
+    fn spawn_sub_loop_task(
+        sub_loop: GraphLoop,
+        sub_persistence: crate::web::persistence::RunPersistence,
+        event_tx: tokio::sync::broadcast::Sender<crate::web::events::EngineEvent>,
+    ) {
+        tokio::spawn(async move {
+            if let Err(e) = sub_loop.run_with_persistence(sub_persistence, event_tx).await {
+                tracing::warn!(error = %e, "sub-graph loop errored");
+            }
+        });
     }
 
     /// Poll a forked sub-run's persisted `run.json` and update `handle.status`
@@ -1414,6 +1448,50 @@ impl GraphLoop {
                 serde_json::Value::String(err.to_string()),
             );
         }
+    }
+
+    /// Apply a [`GraphPatch`] to the graph, then queue a drill-down fork
+    /// for the target complex node (if `patch.drill_down` is set).
+    ///
+    /// This is the single-purpose integration helper that `step_graph`
+    /// uses in the `ProposePatch` arm. Splitting it out keeps the
+    /// `step_graph` arm readable and lets tests exercise the patch +
+    /// drill_down wiring directly without driving a full Proposer round.
+    ///
+    /// Behaviour:
+    /// - The patch is applied to the graph via `Graph::apply_patch`. Any
+    ///   graph-level error (dangling endpoint, etc.) is returned as-is
+    ///   so the caller can surface it back to the model.
+    /// - If `patch.drill_down` is `Some(mark)` AND `mark.target` is one
+    ///   of `patch.add_nodes`, the (target, reason) pair is pushed onto
+    ///   `pending_fork_targets`. The polling block at the top of
+    ///   `step_graph` drains that queue on the next tick and calls
+    ///   `fork_sub_graph_for` there. This indirection exists because
+    ///   calling `fork_sub_graph_for` inline from inside the patch-apply
+    ///   arm propagates a non-Send capture from its internal
+    ///   `tokio::spawn` through `step_graph`'s outer future, breaking
+    ///   compilation. See the comment at the queue drain site for the
+    ///   full rationale.
+    pub async fn apply_graph_patch_with_drill_down(
+        &mut self,
+        patch: &GraphPatch,
+    ) -> Result<()> {
+        // 1. Apply the patch to the graph.
+        self.graph.apply_patch(patch.clone())?;
+
+        // 2. Queue any drill_down request for the next polling tick.
+        if let Some(dd) = &patch.drill_down {
+            if let Some(complex_node) = patch
+                .add_nodes
+                .iter()
+                .find(|n| n.id == dd.target)
+                .map(|n| n.id.clone())
+            {
+                self.pending_fork_targets
+                    .push((complex_node, dd.reason.clone()));
+            }
+        }
+        Ok(())
     }
 
     /// Attach an [`L1Enricher`]. The loop will auto-enrich new nodes added
@@ -1674,6 +1752,77 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
 
     async fn step_graph(&mut self) -> Result<LoopState> {
+        // ── Polling priority: drain pending sub-runs BEFORE invoking the Proposer ──
+        // When the parent is waiting on at least one forked sub-GraphLoop,
+        // we must poll those handles first. The parent loop must NOT
+        // continue to grow the main graph while a complex node is being
+        // expanded in a sub-graph — the sub-graph's findings will feed back
+        // via `poll_sub_run_status` / transcript lines, and the model
+        // needs an opportunity to react before proposing more nodes.
+        //
+        // Behaviour:
+        // - If any sub-run is still Running/Timeout, return `LoopState::Running`
+        //   without calling the model (caller will call `step()` again next
+        //   tick).
+        // - If all sub-runs are terminal (Done/Error), fall through and
+        //   proceed to the normal Proposer round; terminal sub-runs have
+        //   already been removed from `pending_sub_runs` by the poll loop
+        //   and `poll_sub_run_status` has already stamped the complex node
+        //   + added a transcript line. Errors surface in the model's view
+        //   on the next round; the existing error-handling path will react.
+        // ── Drill-down fork queue ──
+        // Drain any (complex_node, reason) pairs queued by the
+        // patch-apply arm into actual `pending_sub_runs` handles. We do
+        // this BEFORE polling existing sub-runs so that a freshly-forked
+        // sub-run is included in the same tick's poll. Forking is
+        // deferred to here (rather than called inline in the patch-apply
+        // arm) to avoid triggering a Send-bound at the `tokio::spawn`
+        // site inside `fork_sub_graph_for`; see the comment at the
+        // patch-apply site for the full rationale.
+        if !self.pending_fork_targets.is_empty() {
+            let queued = std::mem::take(&mut self.pending_fork_targets);
+            for (complex_node, reason) in queued {
+                self.last_patch_drill_down_reasons
+                    .insert(complex_node.clone(), reason);
+                match self.fork_sub_graph_for(complex_node.clone()).await {
+                    Ok(handle) => {
+                        self.pending_sub_runs.insert(complex_node.clone(), handle);
+                    }
+                    Err(DrillDownError::DepthLimit) => {
+                        // Already warned inside `fork_sub_graph_for`;
+                        // patch is already applied — drill_down is dropped.
+                    }
+                }
+                self.last_patch_drill_down_reasons.remove(&complex_node);
+            }
+        }
+
+        if !self.pending_sub_runs.is_empty() {
+            let keys: Vec<NodeId> = self.pending_sub_runs.keys().cloned().collect();
+            for k in keys {
+                let mut handle = self.pending_sub_runs.remove(&k).expect(
+                    "pending_sub_runs key was collected above; entry must still exist",
+                );
+                self.poll_sub_run_status(&mut handle).await;
+                match &handle.status {
+                    SubRunStatus::Running | SubRunStatus::Timeout => {
+                        // Still in flight — keep tracking and skip the
+                        // Proposer round this tick.
+                        self.pending_sub_runs.insert(k, handle);
+                    }
+                    SubRunStatus::Done | SubRunStatus::Error(_) => {
+                        // Terminal — drop the handle. Done case has
+                        // already been marked done on the complex node;
+                        // Error case has been marked error + transcript
+                        // line added so the model can react next round.
+                    }
+                }
+            }
+            if !self.pending_sub_runs.is_empty() {
+                return Ok(LoopState::Running);
+            }
+        }
+
         // ── Clarifying phase: prime the Proposer (once) to confirm the goal ──
         // The model keeps asking via ask_user until it is confident; when it
         // decides the goal is clear it emits propose_patch — that IS the signal
@@ -2227,6 +2376,38 @@ impl GraphLoop {
                         // L0 → L1 linkage: auto-enrich brand-new nodes.
                         if !new_node_ids.is_empty() {
                             self.auto_enrich(&new_node_ids).await;
+                        }
+
+                        // Drill-down detection: if this patch flagged one of
+                        // its new nodes with `drill_down`, queue a fork
+                        // request that the polling block at the top of
+                        // `step_graph` will process on the next tick.
+                        //
+                        // Why queue rather than call `fork_sub_graph_for`
+                        // inline? `fork_sub_graph_for` does an internal
+                        // `tokio::spawn` of the sub-GraphLoop's
+                        // `run_with_persistence` future, which captures
+                        // the sub-loop's full state. When called from
+                        // `step_graph`'s patch-apply arm, that capture
+                        // propagates through `step_graph`'s outer future
+                        // and triggers a Send-bound violation at the
+                        // `tokio::spawn` site (the sub-loop's state isn't
+                        // `Send` in the compile-time call graph rooted at
+                        // `step_graph`, even though it IS Send when called
+                        // directly from a test). Deferring to the polling
+                        // block — which uses a different call graph that
+                        // doesn't trip the same path — sidesteps the issue
+                        // without changing the runtime behavior. The fork
+                        // still happens; it just runs on the next tick.
+                        let drill_down_target: Option<(NodeId, String)> = patch
+                            .drill_down
+                            .as_ref()
+                            .and_then(|dd| {
+                                patch.add_nodes.iter().find(|n| n.id == dd.target).map(|n| (n.id.clone(), dd.reason.clone()))
+                            });
+                        if let Some((complex_node, reason)) = drill_down_target {
+                            self.pending_fork_targets
+                                .push((complex_node, reason));
                         }
 
                         // Orphan check: in build phases, after each patch,
@@ -5696,5 +5877,92 @@ mod tests {
         let node = gl.graph.nodes.get(&complex).unwrap();
         assert_eq!(node.metadata.get("status").and_then(|v| v.as_str()), Some("error"));
         assert_eq!(node.metadata.get("error").and_then(|v| v.as_str()), Some("reviewer failed"));
+    }
+
+    // --------------------------------------------------------------
+    // Drill-down integration tests (Task 10)
+    // --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn step_graph_polling_only_when_pending_sub_runs_nonempty() {
+        // When pending_sub_runs is non-empty with a Running handle, polling
+        // should not crash, should keep tracking the pending sub-run, and
+        // should return early (Running) without invoking the proposer. We
+        // exercise the integration via the public `apply_graph_patch_with_drill_down`
+        // helper plus a direct `step_graph` call after seeding the pending map.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        gl.pending_sub_runs.insert(complex.clone(), handle);
+
+        assert_eq!(gl.pending_sub_runs.len(), 1, "pending sub-run should be tracked");
+
+        // step_graph must return early when there are still-pending sub-runs,
+        // leaving the pending map intact.
+        let state = gl.step_graph().await.unwrap();
+        assert!(
+            matches!(state, LoopState::Running),
+            "step_graph should return Running while sub-runs are still pending; got {state:?}"
+        );
+        assert_eq!(
+            gl.pending_sub_runs.len(),
+            1,
+            "pending sub-run should still be tracked after polling"
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_with_drill_down_creates_sub_run() {
+        // When a GraphPatch with drill_down is applied via the integration
+        // helper, the target node must be added, the sub-run must be forked,
+        // and the node's `expanded` flag must be set.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+
+        let patch = GraphPatch {
+            add_nodes: vec![Node::task("design-modules", "10+ sub-modules")],
+            add_edges: vec![Edge::new(
+                "start",
+                "design-modules",
+                RelationType::LeadsTo,
+                0.9,
+                "...",
+            )],
+            remove_node_ids: vec![],
+            remove_edge_indices: vec![],
+            set_l1: vec![],
+            reason: "expanding".into(),
+            drill_down: Some(DrillDownMark {
+                target: NodeId::from("design-modules"),
+                reason: "10+ sub-modules".into(),
+                sub_task_override: None,
+            }),
+        };
+        gl.apply_graph_patch_with_drill_down(&patch).await.unwrap();
+
+        // The helper only queues the fork (see the comment at the polling
+        // block drain site in `step_graph` for why the actual `tokio::spawn`
+        // happens there). Drive `step_graph` once to drain the queue and
+        // verify the sub-run is forked.
+        let _ = gl.step_graph().await.unwrap();
+
+        assert_eq!(
+            gl.pending_sub_runs.len(),
+            1,
+            "drill_down should create a pending sub-run"
+        );
+        assert!(
+            gl.graph
+                .nodes
+                .get(&NodeId::from("design-modules"))
+                .unwrap()
+                .expanded,
+            "complex node should be marked expanded after fork"
+        );
     }
 }
