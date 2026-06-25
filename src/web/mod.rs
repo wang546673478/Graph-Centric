@@ -118,6 +118,8 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/runs/:id/events", get(api_runs::run_events))
         .route("/runs/:id/checkpoints", get(api_runs::list_checkpoints))
         .route("/runs/:id/checkpoints/:idx", get(api_runs::get_checkpoint))
+        .route("/runs/:id/sub-runs", get(api_runs::get_sub_runs))
+        .route("/runs/:id/parent", get(api_runs::get_parent))
         .route("/runs/:id/branch", post(api_runs::create_branch))
         .route("/runs/:id/answer", post(api_runs::post_answer))
         .route("/runs/:id/repair", post(api_runs::post_repair))

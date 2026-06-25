@@ -6,7 +6,7 @@
 //! channel. Cancellation, answers, and repairs are all coordinated
 //! through `tokio::sync::Notify` + the session's storage.
 
-use super::checkpoint::CheckpointMeta;
+use super::checkpoint::{Checkpoint, CheckpointMeta, SubRunLink};
 use super::errors::ApiError;
 use super::events::{InitialGraphDto, RunEvent};
 use super::run_session::{RunMetadata, RunSession, RunStatus};
@@ -26,6 +26,7 @@ use crate::model::{ModelConfig, ModelWithEvents};
 use crate::tools::{BashTool, DangerousCommandDeny, EditFileTool, ReadFileTool, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool};
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -1187,6 +1188,62 @@ pub async fn get_usage(
     }))
 }
 
+// --- Task 11: drill-down sub-graph API endpoints ---
+
+/// GET /api/runs/:id/sub-runs — list every [`SubRunLink`] accumulated
+/// across this run's checkpoints (links from complex nodes to forked
+/// sub-runs). The frontend uses this to render the drill-down graph.
+///
+/// Reads every `checkpoints/*.json` file under the run dir and
+/// concatenates their `sub_run_links` lists. 404 if the checkpoints
+/// directory does not exist (i.e. the run has never persisted a
+/// checkpoint — typical for unknown run ids).
+pub async fn get_sub_runs(
+    State(state): AppState,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<SubRunLink>>, StatusCode> {
+    let ckpt_dir = state.persistence.data_dir.join(&id).join("checkpoints");
+    let entries = match std::fs::read_dir(&ckpt_dir) {
+        Ok(e) => e,
+        Err(_) => return Err(StatusCode::NOT_FOUND),
+    };
+    let mut all_links: Vec<SubRunLink> = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let s = match std::fs::read_to_string(entry.path()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if let Ok(ckpt) = serde_json::from_str::<Checkpoint>(&s) {
+            all_links.extend(ckpt.sub_run_links);
+        }
+    }
+    Ok(Json(all_links))
+}
+
+/// GET /api/runs/:id/parent — return this run's parent run id, if any.
+/// For top-level runs the field is missing/null. 404 if `run.json` does
+/// not exist (i.e. the run was never persisted — typical for unknown ids).
+pub async fn get_parent(
+    State(state): AppState,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let run_json = state.persistence.data_dir.join(&id).join("run.json");
+    let s = match std::fs::read_to_string(&run_json) {
+        Ok(s) => s,
+        Err(_) => return Err(StatusCode::NOT_FOUND),
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&s).map_err(|_| StatusCode::NOT_FOUND)?;
+    let parent = v
+        .get("parent_run_id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(Json(serde_json::json!({ "parent_run_id": parent })))
+}
+
 #[cfg(test)]
 mod step_transcripts_tests {
     use super::step_transcripts;
@@ -1407,5 +1464,131 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status(), StatusCode::CONFLICT);
+    }
+
+    // ---- Task 11: drill-down API endpoints ----
+    //
+    // Builds an axum Router rooted at the supplied tempdir, so the
+    // /api/runs/:id/sub-runs and /api/runs/:id/parent handlers can
+    // read directly from `<data_dir>/<id>/...`.
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatus};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn test_app_with_data_root(data_dir: &std::path::Path) -> Router {
+        let local = Arc::new(LocalSkillStorage::new(data_dir.to_path_buf()));
+        let cfg = super::super::state::WebConfig {
+            bind_addr: "0.0.0.0:0".to_string(),
+            static_dir: String::new(),
+            project_root: data_dir.to_path_buf(),
+            engine: super::super::state::EngineConfig::default(),
+        };
+        // Build a real WebState then override its persistence to root at
+        // the exact tempdir (bypassing the `<root>/data/runs` layout).
+        let state = super::super::WebState {
+            persistence: super::super::persistence::RunPersistence::with_data_dir(
+                data_dir.to_path_buf(),
+            ),
+            ..super::super::WebState::new(local, cfg)
+        };
+        super::super::router(state, "")
+    }
+
+    #[tokio::test]
+    async fn get_sub_runs_returns_200_with_links() {
+        use crate::graph::NodeId;
+        use crate::web::checkpoint::{Checkpoint, CheckpointPhase, SubRunLink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let run_id = "parent-test-1";
+        let sub_id = "sub-test-1";
+        let ckpt_dir = tmp.path().join(run_id).join("checkpoints");
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = Checkpoint {
+            index: 1,
+            round: 1,
+            phase: CheckpointPhase::Task,
+            graph_snapshot: Graph::new(),
+            transcript: vec![],
+            sub_run_links: vec![SubRunLink {
+                node_id: NodeId::from("design-modules"),
+                sub_run_id: sub_id.into(),
+                sub_status: "running".into(),
+                created_at: 1000,
+            }],
+        };
+        std::fs::write(
+            ckpt_dir.join("0001.json"),
+            serde_json::to_string(&ckpt).unwrap(),
+        )
+        .unwrap();
+
+        let app = test_app_with_data_root(tmp.path());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runs/{run_id}/sub-runs"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let arr = body.as_array().expect("expected array");
+        assert!(arr.len() >= 1);
+        assert_eq!(arr[0]["sub_run_id"], sub_id);
+        assert_eq!(arr[0]["sub_status"], "running");
+        assert_eq!(arr[0]["node_id"], "design-modules");
+    }
+
+    #[tokio::test]
+    async fn get_parent_returns_200_with_parent_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub_id = "sub-test-1";
+        let run_dir = tmp.path().join(sub_id);
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(
+            run_dir.join("run.json"),
+            r#"{"status":"Done","parent_run_id":"parent-1"}"#,
+        )
+        .unwrap();
+
+        let app = test_app_with_data_root(tmp.path());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/runs/{sub_id}/parent"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body["parent_run_id"], "parent-1");
+    }
+
+    #[tokio::test]
+    async fn get_sub_runs_returns_404_for_unknown_run() {
+        let app = test_app_with_data_root(tempfile::tempdir().unwrap().path());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runs/nonexistent/sub-runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), HttpStatus::NOT_FOUND);
     }
 }
