@@ -394,3 +394,8 @@ mod tests {
         assert_eq!(v["data"]["replaced"], true);
     }
 }
+
+/// Alias for [`RunEvent`] used by the agent layer (so it doesn't depend on
+/// the "web" naming of the gateway). Resolves to the same type; downstream
+/// code should prefer this name when importing from `crate::agent::*`.
+pub type EngineEvent = RunEvent;

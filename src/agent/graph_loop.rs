@@ -526,6 +526,37 @@ impl GraphLoopConfig {
     }
 }
 
+/// Handle for a forked sub-GraphLoop. Held by parent graph's
+/// `pending_sub_runs` map; `poll_sub_run_status` updates `status` based
+/// on the child run's persisted `data/runs/<parent>/sub_runs/<child>/run.json`.
+#[derive(Debug, Clone)]
+pub struct SubRunHandle {
+    pub sub_run_id: String,
+    pub complex_node: NodeId,
+    pub started_at: u64,
+    pub status: SubRunStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubRunStatus {
+    Running,
+    Done,
+    Error(String),
+    Timeout,
+}
+
+impl Default for SubRunStatus {
+    fn default() -> Self { SubRunStatus::Running }
+}
+
+/// Errors that can occur during `fork_sub_graph_for`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrillDownError {
+    /// `current_depth + 1 > max_drilldown_depth`; the drill_down field
+    /// has been dropped (patch nodes/edges still applied).
+    DepthLimit,
+}
+
 pub struct GraphLoop {
     pub proposer: GraphProposer,
     pub verifier: Verifier,
@@ -662,6 +693,30 @@ pub struct GraphLoop {
     /// "draw Start+Goal" patch; if the model keeps exploring instead, we
     /// hint, then auto-seed so the loop can never stall at 0 nodes.
     seeding_rounds_without_patch: u32,
+
+    /// Sub-graph handles keyed by complex_node_id. Non-empty when
+    /// the parent is waiting on at least one child run.
+    pub pending_sub_runs: std::collections::HashMap<NodeId, SubRunHandle>,
+
+    /// Parent run id (None for the outermost run).
+    pub parent_run_id: Option<String>,
+
+    /// Depth in the drill-down chain: 0 = outermost, 1 = sub, 2 = sub-sub, ...
+    pub current_depth: u32,
+
+    /// Counter for generating unique sub-run ids.
+    pub sub_run_counter: u32,
+
+    /// This run's id (used as the parent id when forking sub-runs).
+    pub run_id: String,
+
+    /// Event channel for streaming sub-graph events back to the parent.
+    pub event_tx: tokio::sync::broadcast::Sender<crate::web::events::EngineEvent>,
+
+    /// Cache of `drill_down.reason` for nodes added in the most recent patch.
+    /// Set by step_graph after a patch with drill_down is applied; consumed
+    /// by `build_sub_task_for` during `fork_sub_graph_for`. Cleared after fork.
+    pub last_patch_drill_down_reasons: std::collections::HashMap<NodeId, String>,
 
     phase: Phase,
     pending: Pending,
@@ -843,6 +898,18 @@ impl GraphLoop {
             graph_stagnation_count: 0,
             tool_failure_counts: std::collections::HashMap::new(),
             tokens_used: 0,
+            // Drill-down sub-graph machinery (Task 5). `event_tx` defaults to
+            // a no-op broadcast channel; production callers (web gateway) replace
+            // it via `with_event_tx` so sub-runs can stream events back to the
+            // parent. `current_depth = 0` marks the outermost run; sub-runs fork
+            // at depth+1.
+            pending_sub_runs: std::collections::HashMap::new(),
+            parent_run_id: None,
+            current_depth: 0,
+            sub_run_counter: 0,
+            run_id: format!("run-{}", uuid::Uuid::new_v4()),
+            event_tx: tokio::sync::broadcast::channel::<crate::web::events::EngineEvent>(64).0,
+            last_patch_drill_down_reasons: std::collections::HashMap::new(),
             phase: Phase::Graph,
             pending: Pending::None,
         }
@@ -4858,5 +4925,33 @@ mod tests {
         gl.graph.add_edge(Edge::new("outline", "stages", RelationType::LeadsTo, 0.9, "")).unwrap();
         gl.graph.add_edge(Edge::new("stages", "deliverable", RelationType::LeadsTo, 0.9, "")).unwrap();
         assert_eq!(gl.redundant_direct_edge_index(), None);
+    }
+
+    // --------------------------------------------------------------
+    // Drill-down sub-graph machinery (Task 5)
+    // --------------------------------------------------------------
+
+    #[test]
+    fn sub_run_status_default_is_running() {
+        let s = SubRunStatus::default();
+        assert!(matches!(s, SubRunStatus::Running));
+    }
+
+    #[test]
+    fn sub_run_handle_carries_complex_node() {
+        let h = SubRunHandle {
+            sub_run_id: "sub-123".into(),
+            complex_node: NodeId::from("design-modules"),
+            started_at: 1000,
+            status: SubRunStatus::Running,
+        };
+        assert_eq!(h.complex_node.as_str(), "design-modules");
+        assert_eq!(h.sub_run_id, "sub-123");
+    }
+
+    #[test]
+    fn drill_down_error_depth_limit() {
+        let e = DrillDownError::DepthLimit;
+        assert_eq!(format!("{e:?}"), "DepthLimit");
     }
 }
