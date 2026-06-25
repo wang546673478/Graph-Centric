@@ -209,7 +209,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tool_failure_halt_after: 8,
         force_search_after_filling_stall: 5,
         convergence_stable_rounds: 3,
-        max_drilldown_depth: 0, // CLI demo: drill-down disabled until Task 9 wires it up
+        max_drilldown_depth: 2, // Task 9: drill-down enabled (main + sub + sub-sub)
         is_heartbeat: false,
         graph_schema: None,
     };

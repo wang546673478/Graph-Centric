@@ -57,6 +57,10 @@ pub struct EngineConfig {
     /// Currently active profile name (empty = use `model` directly).
     #[serde(default)]
     pub active_profile: String,
+    /// Maximum drill-down depth. 0 = main run only; 2 = main + sub + sub-sub.
+    /// Default: 2 (3 levels total).
+    #[serde(default = "default_max_drilldown_depth")]
+    pub max_drilldown_depth: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,9 +150,10 @@ pub struct LoopTuningConfig {
     #[serde(default = "default_convergence_stable_rounds")]
     pub convergence_stable_rounds: u32,
 
-    /// Task 6: stub for the drill-down sub-graph depth cap. Task 9 will
-    /// wire it into the full config (UI + persistence + heartbeat).
-    #[serde(default)]
+    /// Mirror of `EngineConfig::max_drilldown_depth` kept for backward
+    /// compatibility with serialized configs from Task 6. The canonical
+    /// source is now `EngineConfig::max_drilldown_depth`.
+    #[serde(default = "default_loop_tuning_max_drilldown_depth")]
     pub max_drilldown_depth: u32,
 }
 
@@ -167,38 +172,53 @@ fn default_tool_failure_halt() -> u32 { 8 }
 fn default_event_channel_capacity() -> usize { 256 }
 fn default_force_search_after_filling_stall() -> u32 { 5 }
 fn default_convergence_stable_rounds() -> u32 { 3 }
+fn default_max_drilldown_depth() -> usize { 2 }
+fn default_loop_tuning_max_drilldown_depth() -> u32 { 2 }
 
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
     pub fn load() -> Self {
         let path = std::path::PathBuf::from(".graph_harness_config.json");
-        if path.exists() {
+        let mut cfg = if path.exists() {
             if let Ok(json) = std::fs::read_to_string(&path) {
                 if let Ok(cfg) = serde_json::from_str(&json) {
-                    return cfg;
+                    cfg
+                } else {
+                    Self::default()
                 }
+            } else {
+                Self::default()
+            }
+        } else {
+            // Fallback: read from env vars like ModelConfig does.
+            let base_url = std::env::var("MODEL_BASE_URL").unwrap_or_default();
+            let api_key = std::env::var("MODEL_API_KEY").unwrap_or_default();
+            let fast_model = std::env::var("MODEL_NAME_FAST").unwrap_or_else(|_| "deepseek-v4-flash".into());
+            let deep_model = std::env::var("MODEL_NAME_DEEP").unwrap_or_else(|_| "deepseek-v4-pro".into());
+            EngineConfig {
+                model: ModelTierConfig {
+                    base_url,
+                    api_key,
+                    api_key_masked: String::new(),
+                    fast_model,
+                    deep_model,
+                    default_model: None,
+                    advisor_base_url: std::env::var("ADVISOR_BASE_URL").unwrap_or_default(),
+                    advisor_api_key: std::env::var("ADVISOR_API_KEY").unwrap_or_default(),
+                    advisor_api_key_masked: String::new(),
+                    advisor_model: std::env::var("ADVISOR_MODEL").unwrap_or_default(),
+                },
+                ..Default::default()
+            }
+        };
+        // Env-var overrides take precedence over the disk config so operators
+        // can tweak a single knob without editing the JSON file.
+        if let Ok(s) = std::env::var("GRAPH_HARNESS_MAX_DRILLDOWN_DEPTH") {
+            if let Ok(v) = s.parse::<usize>() {
+                cfg.max_drilldown_depth = v;
             }
         }
-        // Fallback: read from env vars like ModelConfig does.
-        let base_url = std::env::var("MODEL_BASE_URL").unwrap_or_default();
-        let api_key = std::env::var("MODEL_API_KEY").unwrap_or_default();
-        let fast_model = std::env::var("MODEL_NAME_FAST").unwrap_or_else(|_| "deepseek-v4-flash".into());
-        let deep_model = std::env::var("MODEL_NAME_DEEP").unwrap_or_else(|_| "deepseek-v4-pro".into());
-        EngineConfig {
-            model: ModelTierConfig {
-                base_url,
-                api_key,
-                api_key_masked: String::new(),
-                fast_model,
-                deep_model,
-                default_model: None,
-                advisor_base_url: std::env::var("ADVISOR_BASE_URL").unwrap_or_default(),
-                advisor_api_key: std::env::var("ADVISOR_API_KEY").unwrap_or_default(),
-                advisor_api_key_masked: String::new(),
-                advisor_model: std::env::var("ADVISOR_MODEL").unwrap_or_default(),
-            },
-            ..Default::default()
-        }
+        cfg
     }
 
     /// Sync model config to env vars so ModelConfig::load() picks them up.
@@ -237,6 +257,7 @@ impl Default for EngineConfig {
         Self {
             profiles: std::collections::HashMap::new(),
             active_profile: String::new(),
+            max_drilldown_depth: default_max_drilldown_depth(),
             model: ModelTierConfig {
                 base_url: String::new(),
                 api_key: String::new(),
@@ -276,7 +297,7 @@ impl Default for EngineConfig {
                 event_channel_capacity: 256,
                 force_search_after_filling_stall: 5,
                 convergence_stable_rounds: 3,
-                max_drilldown_depth: 0,
+                max_drilldown_depth: 2,
             },
         }
     }
@@ -305,5 +326,23 @@ mod tests {
         let port: u16 = "9999".parse().unwrap();
         let addr = format!("0.0.0.0:{port}");
         assert_eq!(addr, "0.0.0.0:9999");
+    }
+
+    #[test]
+    fn engine_config_default_max_drilldown_depth_is_2() {
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.max_drilldown_depth, 2, "default should be 2 (= 3 levels: main+sub+sub-sub)");
+    }
+
+    #[test]
+    fn engine_config_from_env_overrides_max_drilldown_depth() {
+        unsafe {
+            std::env::set_var("GRAPH_HARNESS_MAX_DRILLDOWN_DEPTH", "5");
+        }
+        let cfg = EngineConfig::load();
+        unsafe {
+            std::env::remove_var("GRAPH_HARNESS_MAX_DRILLDOWN_DEPTH");
+        }
+        assert_eq!(cfg.max_drilldown_depth, 5);
     }
 }
