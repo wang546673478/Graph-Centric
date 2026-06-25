@@ -2415,16 +2415,27 @@ impl GraphLoop {
             "🔧 You've spent several rounds without adding connected intermediate \
              steps between start and deliverable. Based on what you know, NOW add \
              step nodes AND wire them into the flow. Rules:\n\
-             - Use semantic ids (e.g. `outline`, `draft-intro`, `code-examples`, \
-             `proofread`), NOT letter+number ids like B1/B2/T1.\n\
-             - Every step node MUST sit on the path: connect with `LeadsTo` edges so \
-             it reads start → step → … → deliverable. Do not add a node without an \
-             edge wiring it in.\n\
-             - When steps are wired between start and deliverable, delete the \
-             original direct start→deliverable edge via `remove_edge_indices` \
-             so the main chain is the single path.\n\
-             - Emit a `propose_patch` now with the step node(s) AND their LeadsTo \
-             edges. Do NOT explore again — you have enough information.\n\n\
+             - Use semantic ids (e.g. `outline`, `design-modules`, `define-entities`), \
+             NOT letter+number ids like B1/B2/T1.\n\
+             - Step nodes are NOT required to form a single chain. They can:\n\
+             \t• branch: one node feeds many (e.g. `define-roles` → both \
+             `design-modules` and `define-entities`)\n\
+             \t• converge: many nodes feed one (e.g. `define-roles` + \
+             `define-entities` → `design-modules`)\n\
+             \t• cross-depend: a node `B` may `DependsOn` an earlier node `A` \
+             even if A is not its direct predecessor\n\
+             \t• be a hub: a single complex node (e.g. \"design functional modules\") \
+             may contain 5+ sub-concerns — see drill_down below\n\
+             - For most step nodes: connect with `LeadsTo` edges in the main flow.\n\
+             - For TRUE dependencies (B cannot be designed before A exists): use `DependsOn`.\n\
+             - If a step node is itself a complex task (its summary is broad / lists \
+             5+ sub-items / would be 1+ hour of work):\n\
+             \t→ mark it for drill_down in the propose_patch (see schema). The system \
+             will pause the parent graph at this node and spawn a sub-graph to expand it.\n\
+             - The original start→deliverable edge can stay; it represents the goal \
+             arc, not a forbidden shortcut.\n\
+             - Emit a `propose_patch` now with the step node(s), their edges, and any \
+             drill_down marks.\n\n\
              Current graph:\n{node_info}",
             node_info = node_info.join("\n")
         )
@@ -3391,6 +3402,55 @@ mod tests {
         let verifier = Verifier::structural_only();
         let cfg = GraphLoopConfig::defaults_at(std::env::current_dir().unwrap());
         GraphLoop::new("test task", proposer, verifier, None, tools, cfg)
+    }
+
+    /// Build a GraphLoop with a minimal seed graph (immutable `start` and
+    /// a `deliverable` node wired with a single LeadsTo edge). Used by
+    /// tests that exercise hint text generation against a non-empty
+    /// graph state.
+    fn test_graph_loop_with_seed() -> GraphLoop {
+        let mut gl = build_loop_with(vec![]);
+        let mut start = Node::new(
+            "start",
+            NodeKind::Task,
+            "start",
+            "Start: current state / the task to accomplish",
+        );
+        start.immutable = true;
+        gl.graph.add_node(start);
+        gl.graph.add_node(Node::new(
+            "deliverable",
+            NodeKind::Task,
+            "deliverable",
+            "Deliverable: the desired outcome",
+        ));
+        let _ = gl.graph.add_edge(Edge::new(
+            "start",
+            "deliverable",
+            RelationType::LeadsTo,
+            0.9,
+            "seed",
+        ));
+        gl
+    }
+
+    #[test]
+    fn build_filling_hint_no_longer_says_single_path() {
+        let gl = test_graph_loop_with_seed();
+        let hint = gl.build_filling_hint();
+        assert!(
+            !hint.contains("main chain is the single path"),
+            "hint must not force single chain; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn build_filling_hint_allows_branching_and_drill_down() {
+        let gl = test_graph_loop_with_seed();
+        let hint = gl.build_filling_hint();
+        assert!(hint.contains("branch"), "hint should mention 'branch'");
+        assert!(hint.contains("converge"), "hint should mention 'converge'");
+        assert!(hint.contains("drill_down"), "hint should mention 'drill_down'");
     }
 
     /// Drive `step()` until the loop returns a non-Running state. Cap at
