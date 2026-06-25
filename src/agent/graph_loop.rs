@@ -737,6 +737,14 @@ pub struct GraphLoop {
     /// for the full rationale.
     pub pending_fork_targets: Vec<(NodeId, String)>,
 
+    /// Set by `poll_sub_run_status` when a sub-run reports an error.
+    /// The polling block at the top of `step_graph` checks this on the
+    /// next tick and returns `LoopState::GraphInvalid { source: Review }`
+    /// so the existing reviewer-judge / GraphInvalid repair path runs
+    /// — no new error-handling machinery. Per the drill-down spec:
+    /// "sub_run_status=error → 父图 C 标 error → 走现有 GraphInvalid 路径".
+    pub drill_down_error: Option<(NodeId, String)>,
+
     /// Persistence used by `fork_sub_graph_for` to write the sub-run
     /// directory + link. Defaults to a no-op persistence rooted at a
     /// tmp dir; the web gateway overrides via `with_persistence`.
@@ -976,6 +984,7 @@ impl GraphLoop {
             event_tx: tokio::sync::broadcast::channel::<crate::web::events::EngineEvent>(64).0,
             last_patch_drill_down_reasons: std::collections::HashMap::new(),
             pending_fork_targets: Vec::new(),
+            drill_down_error: None,
             // Default persistence: rooted at a tempdir so `fork_sub_graph_for`
             // has a valid place to create the sub-run dir even without the
             // web gateway overriding. The web path replaces this via
@@ -1170,8 +1179,11 @@ impl GraphLoop {
     /// 4. Create a fresh sub-GraphLoop via `new_with_depth` with the same
     ///    config (so model/tools/policy inherit), incremented depth, and
     ///    parent_run_id set.
-    /// 5. Persist the sub-run directory and append a `SubRunLink` to the
-    ///    parent's checkpoint index (Task 6 stub: in-memory only).
+    /// 5. Create the sub-run directory under the parent's run dir (on
+    ///    disk; on IO failure we warn and proceed — the sub-loop can
+    ///    still run in-memory), then append a `SubRunLink` to the
+    ///    parent's checkpoint index via `append_sub_run_link` so future
+    ///    runs can locate and resume the child.
     /// 6. Stamp the complex node's metadata with `sub_run_id`,
     ///    `sub_run_status="running"`, `drill_down_depth=<depth>`, and
     ///    flip `expanded=true` so subsequent renders show the node as
@@ -1236,7 +1248,9 @@ impl GraphLoop {
         //   4. Append transcript line.
         //   5. tokio::spawn — THE COMMIT POINT.
 
-        // Step 2: persist sub-run dir.
+        // Persist the sub-run directory under the parent's run dir so
+        // the child has a place to write `run.json` later. On IO failure
+        // we warn and proceed — the sub-loop can still run in-memory.
         if let Err(e) = self
             .persistence
             .create_sub_run_dir(&self.run_id, &sub_run_id_for_loop)
@@ -1257,7 +1271,11 @@ impl GraphLoop {
         self.persistence
             .append_sub_run_link(&self.run_id, &link);
 
-        // Step 3: stamp the complex node's metadata.
+        // Stamp the complex node's metadata so subsequent renders know
+        // it's been expanded and can show drill-down state. The
+        // `drill_down_depth` is stored as a JSON Number rather than
+        // String because consumers (frontend, poll_sub_run_status, e2e
+        // tests) compare against it as an integer.
         if let Some(node) = self.graph.nodes.get_mut(&complex_node) {
             node.metadata.insert(
                 "sub_run_id".into(),
@@ -1269,9 +1287,6 @@ impl GraphLoop {
             );
             node.metadata.insert(
                 "drill_down_depth".into(),
-                // Wire format decision (Task 6 review): Number, not String.
-                // Consumers (frontend, poll_sub_run_status, e2e tests)
-                // expect an integer they can compare without parsing.
                 serde_json::Value::Number(serde_json::Number::from(new_depth as u64)),
             );
             node.expanded = true;
@@ -1282,7 +1297,8 @@ impl GraphLoop {
             );
         }
 
-        // Step 4: append transcript line.
+        // Add a transcript line so the model sees the drill-down start
+        // when it next reads the conversation.
         self.conversation.add_user(format!(
             "⤵ drill_down started: {}\n(sub_run_id={}, depth={})",
             complex_node.as_str(),
@@ -1290,8 +1306,9 @@ impl GraphLoop {
             new_depth
         ));
 
-        // Step 5: COMMIT POINT — spawn the sub-loop. After this line
-        // returns, the sub-loop is running and will write run.json.
+        // COMMIT POINT: spawn the sub-loop. Once this returns, the
+        // sub-loop is running and will write run.json when it
+        // terminates.
         let sub_persistence = self
             .persistence
             .clone_for_sub_run(&self.run_id, &sub_run_id_for_loop);
@@ -1436,7 +1453,11 @@ impl GraphLoop {
 
     /// Stamp a complex node with `status="error"` plus the error message.
     /// Called by [`Self::poll_sub_run_status`] when the sub-run reports an
-    /// error. Idempotent.
+    /// error. Idempotent. Also raises the `drill_down_error` flag on the
+    /// parent loop so the polling block at the top of `step_graph` can
+    /// surface a `LoopState::GraphInvalid` on the next tick — that lets
+    /// the existing GraphInvalid/reviewer/repair machinery react to a
+    /// sub-run failure rather than silently swallowing it.
     pub fn mark_complex_node_error(&mut self, node_id: &NodeId, err: &str) {
         if let Some(node) = self.graph.nodes.get_mut(node_id) {
             node.metadata.insert(
@@ -1448,6 +1469,7 @@ impl GraphLoop {
                 serde_json::Value::String(err.to_string()),
             );
         }
+        self.drill_down_error = Some((node_id.clone(), err.to_string()));
     }
 
     /// Apply a [`GraphPatch`] to the graph, then queue a drill-down fork
@@ -1480,6 +1502,20 @@ impl GraphLoop {
         self.graph.apply_patch(patch.clone())?;
 
         // 2. Queue any drill_down request for the next polling tick.
+        self.queue_drill_down(patch);
+        Ok(())
+    }
+
+    /// Push a `(complex_node, reason)` pair onto `pending_fork_targets`
+    /// when `patch.drill_down` is set and its target is one of the
+    /// newly-added nodes. This is the single source of truth for the
+    /// "queue a drill_down for fork" step — both the live `step_graph`
+    /// patch-apply arm and the `apply_graph_patch_with_drill_down` test
+    /// helper call into here so the wiring stays in sync. The actual
+    /// `fork_sub_graph_for` call is deferred to the polling block at the
+    /// top of `step_graph`; see that block's comment for the Send-bound
+    /// rationale.
+    fn queue_drill_down(&mut self, patch: &GraphPatch) {
         if let Some(dd) = &patch.drill_down {
             if let Some(complex_node) = patch
                 .add_nodes
@@ -1491,7 +1527,6 @@ impl GraphLoop {
                     .push((complex_node, dd.reason.clone()));
             }
         }
-        Ok(())
     }
 
     /// Attach an [`L1Enricher`]. The loop will auto-enrich new nodes added
@@ -1821,6 +1856,33 @@ impl GraphLoop {
             if !self.pending_sub_runs.is_empty() {
                 return Ok(LoopState::Running);
             }
+        }
+
+        // ── Drill-down error propagation ──
+        // If a sub-run finished with an error, surface it to the caller
+        // as `LoopState::GraphInvalid` so the existing GraphInvalid /
+        // reviewer / repair path handles it. Per the drill-down spec:
+        // "sub_run_status=error → 父图 C 标 error → 走现有 GraphInvalid
+        // 路径(reviewer judge 评 C 失败),不引入新机制". We use `Review`
+        // as the error source because the parent model effectively
+        // "reviewed" the sub-graph outcome and concluded it failed —
+        // same conceptual step as a Reviewer judge.
+        if let Some((node_id, err)) = self.drill_down_error.take() {
+            self.pending = Pending::AwaitingRepair;
+            return Ok(LoopState::GraphInvalid {
+                source: ErrorSource::Review,
+                errors: vec![GraphError::L0Structural {
+                    error_type: L0ErrorType::WrongRelation,
+                    detail: format!(
+                        "drill_down sub-run failed for node `{}`: {}",
+                        node_id.as_str(),
+                        err
+                    ),
+                    related_nodes: vec![node_id],
+                    discovered_by: Some("drill_down_sub_run".into()),
+                }],
+                snapshot: self.graph.clone(),
+            });
         }
 
         // ── Clarifying phase: prime the Proposer (once) to confirm the goal ──
@@ -2399,16 +2461,12 @@ impl GraphLoop {
                         // doesn't trip the same path — sidesteps the issue
                         // without changing the runtime behavior. The fork
                         // still happens; it just runs on the next tick.
-                        let drill_down_target: Option<(NodeId, String)> = patch
-                            .drill_down
-                            .as_ref()
-                            .and_then(|dd| {
-                                patch.add_nodes.iter().find(|n| n.id == dd.target).map(|n| (n.id.clone(), dd.reason.clone()))
-                            });
-                        if let Some((complex_node, reason)) = drill_down_target {
-                            self.pending_fork_targets
-                                .push((complex_node, reason));
-                        }
+                        //
+                        // The actual queue logic lives in
+                        // `queue_drill_down` so the test-only helper
+                        // `apply_graph_patch_with_drill_down` and this
+                        // live arm share one implementation.
+                        self.queue_drill_down(&patch);
 
                         // Orphan check: in build phases, after each patch,
                         // detect nodes start can't reach (added but not wired
@@ -5785,6 +5843,39 @@ mod tests {
         assert!(result.is_ok(), "depth 0 with max 2 should allow fork to depth 1");
     }
 
+    /// The drill_down spec requires that "子图与父图享有同一套 drill_down
+    /// 机制,可继续 fork 子子图、孙图" — a sub-graph must be able to
+    /// itself fork a grandchild. This test simulates being a depth-1
+    /// sub-graph (parent of which has current_depth = 0) and confirms a
+    /// second fork to depth 2 still succeeds when max_drilldown_depth = 2.
+    #[tokio::test]
+    async fn sub_graph_can_drill_down_to_grandchild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        gl.current_depth = 1; // simulate being a sub-graph already
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl
+            .fork_sub_graph_for(complex.clone())
+            .await
+            .expect("depth 1 with max 2 should fork to depth 2 (grandchild)");
+        assert!(
+            handle.sub_run_id.contains("d2"),
+            "sub_run_id should encode depth=2 (grandchild); got {}",
+            handle.sub_run_id
+        );
+        assert_eq!(
+            gl.graph
+                .nodes
+                .get(&complex)
+                .and_then(|n| n.metadata.get("drill_down_depth"))
+                .and_then(|v| v.as_u64()),
+            Some(2)
+        );
+    }
+
     // --------------------------------------------------------------
     // Drill-down poll tests (Task 7)
     // --------------------------------------------------------------
@@ -5877,6 +5968,14 @@ mod tests {
         let node = gl.graph.nodes.get(&complex).unwrap();
         assert_eq!(node.metadata.get("status").and_then(|v| v.as_str()), Some("error"));
         assert_eq!(node.metadata.get("error").and_then(|v| v.as_str()), Some("reviewer failed"));
+        // The parent loop should also have its drill_down_error flag set
+        // so the polling block at the top of step_graph can surface a
+        // GraphInvalid on the next tick (Fix #2: sub-run error must
+        // propagate, not silently get swallowed).
+        assert!(
+            matches!(&gl.drill_down_error, Some((n, e)) if n == &complex && e == "reviewer failed"),
+            "expected drill_down_error to be set after mark_complex_node_error"
+        );
     }
 
     // --------------------------------------------------------------

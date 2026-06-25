@@ -149,12 +149,6 @@ pub struct LoopTuningConfig {
     /// the "emit ready_for_verify" convergence hint. 0 disables.
     #[serde(default = "default_convergence_stable_rounds")]
     pub convergence_stable_rounds: u32,
-
-    /// Mirror of `EngineConfig::max_drilldown_depth` kept for backward
-    /// compatibility with serialized configs from Task 6. The canonical
-    /// source is now `EngineConfig::max_drilldown_depth`.
-    #[serde(default = "default_loop_tuning_max_drilldown_depth")]
-    pub max_drilldown_depth: u32,
 }
 
 fn default_true() -> bool {
@@ -173,7 +167,6 @@ fn default_event_channel_capacity() -> usize { 256 }
 fn default_force_search_after_filling_stall() -> u32 { 5 }
 fn default_convergence_stable_rounds() -> u32 { 3 }
 fn default_max_drilldown_depth() -> usize { 2 }
-fn default_loop_tuning_max_drilldown_depth() -> u32 { 2 }
 
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
@@ -297,7 +290,6 @@ impl Default for EngineConfig {
                 event_channel_capacity: 256,
                 force_search_after_filling_stall: 5,
                 convergence_stable_rounds: 3,
-                max_drilldown_depth: 2,
             },
         }
     }
