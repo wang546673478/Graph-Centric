@@ -1352,6 +1352,30 @@ fn parse_patch(v: &serde_json::Value) -> Result<GraphPatch> {
             }
         }
     }
+    // drill_down (Task 2 follow-up): previously dead code — `parse_patch`
+    // ignored the field, so the validator from the prior commit never saw
+    // a model-emitted `drill_down` and the field was always `None` on the
+    // produced GraphPatch. Now we read it; missing/null → None (most
+    // patches), present and well-formed → Some(mark), present but
+    // malformed → None with a warn log so a single bad field doesn't
+    // drop the rest of the patch.
+    match obj.get("drill_down") {
+        None | Some(serde_json::Value::Null) => {
+            // No drill_down marker — the default.
+        }
+        Some(v) => {
+            match serde_json::from_value::<DrillDownMark>(v.clone()) {
+                Ok(mark) => patch.drill_down = Some(mark),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        raw = %v,
+                        "proposer: patch.drill_down malformed; leaving field as None"
+                    );
+                }
+            }
+        }
+    }
     Ok(patch)
 }
 
@@ -2612,55 +2636,11 @@ mod tests {
 
     // ----- drill_down validation tests (Task 2) -----
     //
-    // These two tests verify the *logic* the validator uses to decide
-    // accept/reject. They intentionally don't call `validate_drill_down`
-    // directly — that comes next, once the function exists. The point
-    // is to lock in the invariant the validator must check.
-
-    #[test]
-    fn drill_down_target_must_be_in_add_nodes_rejects() {
-        let patch = GraphPatch {
-            add_nodes: vec![
-                Node::task("design-modules", "设计功能模块层:..."),
-            ],
-            add_edges: vec![],
-            remove_node_ids: vec![],
-            remove_edge_indices: vec![],
-            set_l1: vec![],
-            reason: "test".into(),
-            drill_down: Some(DrillDownMark {
-                target: NodeId::from("not-in-add-nodes"),
-                reason: "test".into(),
-                sub_task_override: None,
-            }),
-        };
-        // Simulate the validator: target ∉ add_nodes → reject
-        let target_in_add = patch
-            .add_nodes
-            .iter()
-            .any(|n| n.id == patch.drill_down.as_ref().unwrap().target);
-        assert!(!target_in_add, "validator should reject: target not in add_nodes");
-    }
-
-    #[test]
-    fn drill_down_target_in_add_nodes_passes() {
-        let patch = GraphPatch {
-            add_nodes: vec![Node::task("design-modules", "...")],
-            add_edges: vec![],
-            remove_node_ids: vec![],
-            remove_edge_indices: vec![],
-            set_l1: vec![],
-            reason: "test".into(),
-            drill_down: Some(DrillDownMark {
-                target: NodeId::from("design-modules"),
-                reason: "test".into(),
-                sub_task_override: None,
-            }),
-        };
-        let target = patch.drill_down.as_ref().unwrap().target.clone();
-        let target_in_add = patch.add_nodes.iter().any(|n| n.id == target);
-        assert!(target_in_add);
-    }
+    // `validate_drill_down` is the unit-level gate. The e2e tests below
+    // exercise the full pipeline: raw JSON → parse_patch → drill_down
+    // populated → validate_drill_down result. Without these, a regression
+    // in `parse_patch` (e.g. dropping the new drill_down extraction code)
+    // would silently make the validator dead code again.
 
     #[test]
     fn validate_drill_down_returns_err_on_missing_target() {
@@ -2702,5 +2682,73 @@ mod tests {
     fn validate_drill_down_returns_ok_when_field_absent() {
         let patch = GraphPatch::default();
         assert!(validate_drill_down(&patch).is_ok());
+    }
+
+    // ----- e2e: raw JSON → parse_patch → drill_down populated -----
+    //
+    // These exercise the same path `parse_step` / `parse_step_from_tool_calls`
+    // walk in production: raw JSON string parsed into a serde_json::Value,
+    // then handed to `parse_patch`. They catch regressions where
+    // `parse_patch` stops reading the `drill_down` field (which would
+    // silently regress the validator from commit 145e8f7 to dead code).
+
+    #[test]
+    fn parse_patch_extracts_drill_down_from_json() {
+        let raw = r#"{
+            "reason": "x",
+            "add_nodes": [
+                {"id": "design-modules", "kind": "Task", "path": "design-modules", "summary": "design"}
+            ],
+            "drill_down": {
+                "target": "design-modules",
+                "reason": "expand the module design"
+            }
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(raw).expect("raw parses");
+        let patch = parse_patch(&v).expect("parse_patch succeeds");
+        assert!(
+            patch.drill_down.is_some(),
+            "parse_patch must extract drill_down from JSON; got None"
+        );
+        let dd = patch.drill_down.as_ref().unwrap();
+        assert_eq!(dd.target.as_str(), "design-modules");
+        assert_eq!(dd.reason, "expand the module design");
+        assert!(dd.sub_task_override.is_none());
+    }
+
+    #[test]
+    fn parse_patch_omits_drill_down_when_field_absent() {
+        let raw = r#"{
+            "reason": "x",
+            "add_nodes": [
+                {"id": "design-modules", "kind": "Task", "path": "design-modules", "summary": "design"}
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(raw).expect("raw parses");
+        let patch = parse_patch(&v).expect("parse_patch succeeds");
+        assert!(
+            patch.drill_down.is_none(),
+            "drill_down must default to None when absent"
+        );
+    }
+
+    #[test]
+    fn parse_patch_tolerates_malformed_drill_down() {
+        // target is missing → deserialize fails → patch.drill_down = None,
+        // but the rest of the patch still parses (no Err returned).
+        let raw = r#"{
+            "reason": "x",
+            "add_nodes": [
+                {"id": "design-modules", "kind": "Task", "path": "design-modules", "summary": "design"}
+            ],
+            "drill_down": {"reason": "missing target field"}
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(raw).expect("raw parses");
+        let patch = parse_patch(&v).expect("parse_patch should tolerate malformed drill_down");
+        assert!(
+            patch.drill_down.is_none(),
+            "malformed drill_down must not populate the field"
+        );
+        assert_eq!(patch.add_nodes.len(), 1, "rest of patch must survive");
     }
 }
