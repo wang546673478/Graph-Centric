@@ -588,6 +588,7 @@ pub async fn drive_run(
         force_search_after_filling_stall: state.config.engine.loop_tuning.force_search_after_filling_stall,
         convergence_stable_rounds: state.config.engine.loop_tuning.convergence_stable_rounds,
         max_drilldown_depth: state.config.engine.max_drilldown_depth as u32,
+        sub_run_timeout_ms: Some(state.config.engine.sub_run_timeout_ms),
         is_heartbeat: is_heartbeat_active,
         graph_schema: if is_heartbeat_active {
             Some(crate::agent::graph_loop::GraphSchema {
@@ -672,6 +673,12 @@ pub async fn drive_run(
     // Main loop.
     loop {
         if session.cancel.is_cancelled() {
+            // Propagate the cancel signal to the GraphLoop so its
+            // polling block can mark any pending sub-runs as Cancelled
+            // and return LoopState::Error("parent cancelled") on the
+            // next step. Without this, drill-down sub-runs would keep
+            // running after the parent session was already torn down.
+            gl.check_and_set_cancelled(true);
             *session.status.write().await = RunStatus::Cancelled;
             session.freeze_duration().await;
             let _ = state.persistence.save_run_meta(&session.metadata().await);
@@ -698,6 +705,9 @@ pub async fn drive_run(
         let state_clone = tokio::select! {
             biased;
             _ = session.cancel.cancelled() => {
+                // Mirror the cancel signal onto the GraphLoop so the
+                // polling block can finalize pending sub-runs.
+                gl.check_and_set_cancelled(true);
                 *session.status.write().await = RunStatus::Cancelled;
                 session.freeze_duration().await;
                 let _ = state.persistence.save_run_meta(&session.metadata().await);

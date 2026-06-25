@@ -212,6 +212,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         max_drilldown_depth: 2, // Task 9: drill-down enabled (main + sub + sub-sub)
         is_heartbeat: false,
         graph_schema: None,
+        sub_run_timeout_ms: None,
     };
 
     let mut gl = GraphLoop::new(task.clone(), proposer, verifier, Some(repairer), tools, loop_cfg)

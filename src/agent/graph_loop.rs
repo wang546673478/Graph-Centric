@@ -509,7 +509,25 @@ pub struct GraphLoopConfig {
     /// logged. Default 0 = drill-down disabled (current behavior).
     /// Full config wiring lands in Task 9.
     pub max_drilldown_depth: u32,
+
+    /// Wall-clock timeout (millis) for a pending sub-run. When
+    /// `poll_sub_run_status` observes `now_ms() - handle.started_at >`
+    /// this value, it transitions the handle to `SubRunStatus::Timeout`,
+    /// stamps the complex node as timed-out, and raises
+    /// `drill_down_error` so the polling block surfaces a
+    /// `LoopState::GraphInvalid` on the next tick.
+    ///
+    /// `None` falls back to [`DEFAULT_SUB_RUN_TIMEOUT_MS`] (30 min).
+    /// Optional so existing struct-literal constructors and tests
+    /// don't need to be updated; the web gateway passes a concrete
+    /// value derived from `EngineConfig::sub_run_timeout_ms`.
+    pub sub_run_timeout_ms: Option<u64>,
 }
+
+/// Default sub-run timeout: 30 minutes. Used when
+/// `GraphLoopConfig.sub_run_timeout_ms` is `None` (CLI / tests that
+/// bypass `EngineConfig::load`).
+pub const DEFAULT_SUB_RUN_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
 impl GraphLoopConfig {
     pub fn defaults_at(cwd: impl Into<PathBuf>) -> Self {
@@ -533,6 +551,7 @@ impl GraphLoopConfig {
             force_search_after_filling_stall: 5,
             convergence_stable_rounds: 3,
             max_drilldown_depth: 0, // disabled by default until Task 9 wires it up
+            sub_run_timeout_ms: None,
         }
     }
 }
@@ -552,6 +571,13 @@ pub struct SubRunHandle {
 pub enum SubRunStatus {
     Running,
     Done,
+    /// The sub-run was cancelled — either externally (the parent was
+    /// cancelled and propagated the signal here) or because the sub-run
+    /// itself reached the `Cancelled` terminal. The polling block at the
+    /// top of `step_graph` treats this like `Done` (removes the handle
+    /// from `pending_sub_runs`; the parent continues normally — the
+    /// complex node was effectively "skipped" because it was cancelled).
+    Cancelled,
     Error(String),
     Timeout,
 }
@@ -752,6 +778,19 @@ pub struct GraphLoop {
 
     phase: Phase,
     pending: Pending,
+
+    /// External cancel signal. Set via [`Self::cancel`] by the web
+    /// gateway when the user clicks "stop", or by a test that wants to
+    /// exercise the cancellation propagation path. The polling block at
+    /// the top of `step_graph` checks this every tick; when set, it
+    /// propagates `Cancelled` to every pending sub-run and returns
+    /// `LoopState::Error("parent cancelled")` so the caller's session
+    /// shutdown logic can finalize the run.
+    ///
+    /// `bool` is sufficient — `step_graph` takes `&mut self` so the
+    /// write doesn't need atomic semantics, and the loop is
+    /// single-threaded across `step` calls.
+    pub cancelled: bool,
 }
 
 /// Extract file/function/class entities from Explore output text and produce
@@ -881,6 +920,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Test-only accessor for `now_ms()`. Tests use this to stamp
+/// `SubRunHandle.started_at` with the current wall-clock so the
+/// handle doesn't accidentally trip the timeout producer (which
+/// compares against `now_ms() - started_at > sub_run_timeout_ms`).
+#[cfg(test)]
+pub(crate) fn now_ms_for_test() -> u64 {
+    now_ms()
+}
+
 /// Minimal `Model` impl used by `new_with_depth` for sub-loops. Returns
 /// `ready_for_verify` on the first call (which passes structural verify
 /// on an empty graph and routes the sub-loop to Done) so any spawn made
@@ -994,6 +1042,36 @@ impl GraphLoop {
             ),
             phase: Phase::Graph,
             pending: Pending::None,
+            cancelled: false,
+        }
+    }
+
+    /// External cancel signal. Idempotent; safe to call from any
+    /// thread (the loop is single-threaded across `step` calls, but
+    /// `&mut self` is enough to guarantee exclusive access). After this
+    /// returns, the next `step_graph` call will detect `self.cancelled`
+    /// at the top of its polling block, propagate `Cancelled` to every
+    /// pending sub-run, and return `LoopState::Error("parent cancelled")`.
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+    }
+
+    /// Returns true if [`Self::cancel`] has been called. The polling
+    /// block uses this to decide whether to short-circuit before
+    /// invoking the Proposer. Exposed (rather than `cancelled` accessed
+    /// directly) so callers don't need to know about the internal field
+    /// name.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Convenience setter so callers (e.g. the web gateway driver in
+    /// `api_runs.rs`) can sync an external cancel signal onto the loop
+    /// without having to call [`Self::cancel`] explicitly. Equivalent to
+    /// `if external_cancelled { self.cancel(); }`. Idempotent.
+    pub fn check_and_set_cancelled(&mut self, external_cancelled: bool) {
+        if external_cancelled {
+            self.cancelled = true;
         }
     }
 
@@ -1380,7 +1458,14 @@ impl GraphLoop {
             .sub_run_run_json(&self.run_id, &handle.sub_run_id);
         let status_str = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => return, // sub-run file not yet written; try again next round
+            Err(_) => {
+                // run.json not yet written — but check whether the
+                // handle has aged past the timeout. If so, surface
+                // `SubRunStatus::Timeout` so the polling block can
+                // propagate it as a drill_down_error.
+                self.check_handle_timeout(handle);
+                return;
+            }
         };
         let v: serde_json::Value = match serde_json::from_str(&status_str) {
             Ok(v) => v,
@@ -1390,6 +1475,9 @@ impl GraphLoop {
                     sub_run_id = %handle.sub_run_id,
                     "poll_sub_run_status: run.json present but not valid JSON; treating as Running"
                 );
+                // Even on malformed JSON, still check timeout so a
+                // stuck sub-run that wrote garbage can be escalated.
+                self.check_handle_timeout(handle);
                 return;
             }
         };
@@ -1404,6 +1492,15 @@ impl GraphLoop {
                     handle.sub_run_id
                 ));
                 SubRunStatus::Done
+            }
+            "Cancelled" | "cancelled" => {
+                self.mark_complex_node_cancelled(&handle.complex_node);
+                self.conversation.add_user(format!(
+                    "⊘ drill_down cancelled: {}\n(sub_run_id={})",
+                    handle.complex_node.as_str(),
+                    handle.sub_run_id
+                ));
+                SubRunStatus::Cancelled
             }
             "Error" | "error" => {
                 let err = v
@@ -1420,13 +1517,24 @@ impl GraphLoop {
                 ));
                 SubRunStatus::Error(err)
             }
-            _ => SubRunStatus::Running,
+            _ => {
+                // Status string was not one of the recognized terminal
+                // values — but the sub-run may still have aged past the
+                // timeout. Check that before defaulting to Running.
+                if let Some(_) = self.check_handle_timeout(handle) {
+                    // Already mutated to Timeout by the helper.
+                    SubRunStatus::Timeout
+                } else {
+                    SubRunStatus::Running
+                }
+            }
         };
 
         if let Some(node) = self.graph.nodes.get_mut(&handle.complex_node) {
             let status_str = match &handle.status {
                 SubRunStatus::Running => "running",
                 SubRunStatus::Done => "done",
+                SubRunStatus::Cancelled => "cancelled",
                 SubRunStatus::Error(_) => "error",
                 SubRunStatus::Timeout => "timeout",
             };
@@ -1435,6 +1543,47 @@ impl GraphLoop {
                 serde_json::Value::String(status_str.into()),
             );
         }
+    }
+
+    /// If `now_ms() - handle.started_at > sub_run_timeout_ms`, set
+    /// `handle.status = SubRunStatus::Timeout` and stamp the complex node
+    /// via `mark_complex_node_timeout`. Returns `Some(())` when the
+    /// timeout fired, `None` otherwise. Idempotent and safe on a missing
+    /// node.
+    ///
+    /// `sub_run_timeout_ms` comes from `EngineConfig::sub_run_timeout_ms`
+    /// and is read at call time so config reloads take effect without
+    /// restarting the loop. We fall back to the default
+    /// `DEFAULT_SUB_RUN_TIMEOUT_MS` when the env var / config hasn't been
+    /// propagated to `GraphLoopConfig` (which is the case for tests and
+    /// CLI-only callers that don't go through `EngineConfig::load()`).
+    fn check_handle_timeout(&mut self, handle: &mut SubRunHandle) -> Option<()> {
+        if matches!(handle.status, SubRunStatus::Done | SubRunStatus::Cancelled | SubRunStatus::Error(_)) {
+            return None;
+        }
+        let now = now_ms();
+        let timeout_ms = self.sub_run_timeout_ms();
+        if now.saturating_sub(handle.started_at) > timeout_ms {
+            handle.status = SubRunStatus::Timeout;
+            self.mark_complex_node_timeout(&handle.complex_node);
+            self.conversation.add_user(format!(
+                "⏱ drill_down timeout: {}\n(sub_run_id={}, age_ms={})",
+                handle.complex_node.as_str(),
+                handle.sub_run_id,
+                now.saturating_sub(handle.started_at)
+            ));
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    /// Return the configured sub-run timeout in millis. Today this reads
+    /// `self.config.sub_run_timeout_ms` (a u64 on `GraphLoopConfig` set by
+    /// the web gateway via `EngineConfig`); if absent we fall back to
+    /// [`DEFAULT_SUB_RUN_TIMEOUT_MS`].
+    fn sub_run_timeout_ms(&self) -> u64 {
+        self.config.sub_run_timeout_ms.unwrap_or(DEFAULT_SUB_RUN_TIMEOUT_MS)
     }
 
     /// Stamp a complex node with `status="done"`. Called by
@@ -1470,6 +1619,108 @@ impl GraphLoop {
             );
         }
         self.drill_down_error = Some((node_id.clone(), err.to_string()));
+    }
+
+    /// Stamp a complex node with `status="cancelled"`. Called by
+    /// [`Self::poll_sub_run_status`] when the sub-run reports a
+    /// `Cancelled` terminal status, and by [`Self::propagate_cancel_to_pending_sub_runs`]
+    /// when the parent loop has been cancelled externally and wants to
+    /// leave a "skipped" marker on each pending complex node.
+    ///
+    /// Idempotent and safe on a missing node. Unlike
+    /// [`Self::mark_complex_node_error`], this does NOT raise the
+    /// `drill_down_error` flag — the polling block at the top of
+    /// `step_graph` treats `SubRunStatus::Cancelled` as a soft terminal
+    /// (drop the handle, continue normally) rather than as a
+    /// graph-invalid event.
+    pub fn mark_complex_node_cancelled(&mut self, node_id: &NodeId) {
+        if let Some(node) = self.graph.nodes.get_mut(node_id) {
+            node.metadata.insert(
+                "status".into(),
+                serde_json::Value::String("cancelled".into()),
+            );
+        }
+    }
+
+    /// Stamp a complex node with `status="timeout"`. Called by
+    /// [`Self::check_handle_timeout`] when a pending sub-run has aged
+    /// past `sub_run_timeout_ms`. Idempotent and safe on a missing
+    /// node. Also raises the `drill_down_error` flag so the polling
+    /// block surfaces a `LoopState::GraphInvalid` on the next tick —
+    /// same machinery as `mark_complex_node_error` so reviewers can
+    /// react to a timed-out drill-down instead of silently dropping it.
+    pub fn mark_complex_node_timeout(&mut self, node_id: &NodeId) {
+        if let Some(node) = self.graph.nodes.get_mut(node_id) {
+            node.metadata.insert(
+                "status".into(),
+                serde_json::Value::String("timeout".into()),
+            );
+            node.metadata.insert(
+                "error".into(),
+                serde_json::Value::String("sub-run timeout".into()),
+            );
+        }
+        self.drill_down_error = Some((node_id.clone(), "sub-run timeout".to_string()));
+    }
+
+    /// Write a `{"status": "Cancelled"}` payload to a sub-run's
+    /// `run.json` so external observers (the web UI, future parent
+    /// loops that re-poll after a restart) can see that this sub-run
+    /// was cancelled by its parent rather than completed naturally.
+    /// Best-effort: errors are logged but never propagated, since
+    /// `propagate_cancel_to_pending_sub_runs` runs as part of the
+    /// shutdown path and must not block the parent's exit.
+    fn write_sub_run_cancelled(&self, handle: &SubRunHandle) {
+        let path = self
+            .persistence
+            .sub_run_run_json(&self.run_id, &handle.sub_run_id);
+        let payload = serde_json::json!({
+            "status": "Cancelled",
+            "cancelled_by_parent": true,
+            "parent_run_id": self.run_id,
+            "sub_run_id": handle.sub_run_id,
+        });
+        if let Err(e) = std::fs::write(&path, serde_json::to_string(&payload).unwrap_or_default()) {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                sub_run_id = %handle.sub_run_id,
+                "write_sub_run_cancelled: failed to write cancelled run.json"
+            );
+        }
+    }
+
+    /// When the parent loop has been cancelled externally (via
+    /// [`Self::cancel`]), walk every pending sub-run and:
+    /// 1. Write `{"status":"Cancelled",...}` to its `run.json` so a
+    ///    later restart / observer can detect the cancellation.
+    /// 2. Stamp the complex node's metadata via
+    ///    [`Self::mark_complex_node_cancelled`].
+    /// 3. Drop the handle from `pending_sub_runs`.
+    ///
+    /// Returns the number of pending sub-runs that were cancelled.
+    /// Called by the polling block at the top of `step_graph` after
+    /// `self.cancelled` is observed.
+    pub fn propagate_cancel_to_pending_sub_runs(&mut self) -> usize {
+        // Always clear the fork queue — even when pending_sub_runs is
+        // empty, queued `pending_fork_targets` would otherwise be
+        // drained on the next tick and spawn a new sub-run that the
+        // shutdown sequence would have to abort. The drain is cheap
+        // (a single `Vec::clear`) so we do it unconditionally.
+        self.pending_fork_targets.clear();
+
+        if self.pending_sub_runs.is_empty() {
+            return 0;
+        }
+        let handles: Vec<(NodeId, SubRunHandle)> = std::mem::take(&mut self.pending_sub_runs)
+            .into_iter()
+            .collect();
+        let count = handles.len();
+        for (_complex_node, handle) in handles {
+            self.write_sub_run_cancelled(&handle);
+            self.mark_complex_node_cancelled(&handle.complex_node);
+        }
+        count
     }
 
     /// Apply a [`GraphPatch`] to the graph, then queue a drill-down fork
@@ -1787,6 +2038,22 @@ impl GraphLoop {
     // -----------------------------------------------------------------------
 
     async fn step_graph(&mut self) -> Result<LoopState> {
+        // ── Parent-cancel propagation ──
+        // If [`Self::cancel`] has been called (typically by the web
+        // gateway when the user clicks "stop"), propagate `Cancelled`
+        // to every pending sub-run (write Cancelled run.json + stamp
+        // the complex node), clear the pending_fork_targets queue so
+        // we don't spawn new sub-runs on the way out, and return
+        // `LoopState::Error("parent cancelled")` so the caller's
+        // session-shutdown logic can finalize the run.
+        //
+        // This check is FIRST so a cancel signal observed between
+        // ticks short-circuits before any model call or fork happens.
+        if self.cancelled {
+            self.propagate_cancel_to_pending_sub_runs();
+            return Ok(LoopState::Error("parent cancelled".into()));
+        }
+
         // ── Polling priority: drain pending sub-runs BEFORE invoking the Proposer ──
         // When the parent is waiting on at least one forked sub-GraphLoop,
         // we must poll those handles first. The parent loop must NOT
@@ -1799,12 +2066,15 @@ impl GraphLoop {
         // - If any sub-run is still Running/Timeout, return `LoopState::Running`
         //   without calling the model (caller will call `step()` again next
         //   tick).
-        // - If all sub-runs are terminal (Done/Error), fall through and
-        //   proceed to the normal Proposer round; terminal sub-runs have
+        // - If all sub-runs are terminal (Done/Error/Cancelled), fall through
+        //   and proceed to the normal Proposer round; terminal sub-runs have
         //   already been removed from `pending_sub_runs` by the poll loop
         //   and `poll_sub_run_status` has already stamped the complex node
         //   + added a transcript line. Errors surface in the model's view
         //   on the next round; the existing error-handling path will react.
+        // - Cancelled is treated like Done: drop the handle, continue
+        //   normally. The complex node was effectively "skipped" because
+        //   it was cancelled.
         // ── Drill-down fork queue ──
         // Drain any (complex_node, reason) pairs queued by the
         // patch-apply arm into actual `pending_sub_runs` handles. We do
@@ -1814,7 +2084,12 @@ impl GraphLoop {
         // arm) to avoid triggering a Send-bound at the `tokio::spawn`
         // site inside `fork_sub_graph_for`; see the comment at the
         // patch-apply site for the full rationale.
-        if !self.pending_fork_targets.is_empty() {
+        //
+        // Re-check `self.cancelled` before draining — if the parent was
+        // cancelled between the top-of-loop check and now, skip the
+        // fork entirely. Otherwise we'd spawn a fresh sub-run on the
+        // way out and have to abort it.
+        if !self.cancelled && !self.pending_fork_targets.is_empty() {
             let queued = std::mem::take(&mut self.pending_fork_targets);
             for (complex_node, reason) in queued {
                 self.last_patch_drill_down_reasons
@@ -1845,11 +2120,19 @@ impl GraphLoop {
                         // Proposer round this tick.
                         self.pending_sub_runs.insert(k, handle);
                     }
-                    SubRunStatus::Done | SubRunStatus::Error(_) => {
+                    SubRunStatus::Done | SubRunStatus::Cancelled => {
                         // Terminal — drop the handle. Done case has
                         // already been marked done on the complex node;
-                        // Error case has been marked error + transcript
-                        // line added so the model can react next round.
+                        // Cancelled case has been marked cancelled +
+                        // transcript line added. We don't raise
+                        // drill_down_error for Cancelled: cancellation
+                        // is a graceful shutdown, not a graph defect.
+                    }
+                    SubRunStatus::Error(_) => {
+                        // Terminal — drop the handle; the error has
+                        // already raised drill_down_error inside
+                        // poll_sub_run_status and a transcript line
+                        // was added so the model can react next round.
                     }
                 }
             }
@@ -5936,7 +6219,13 @@ mod tests {
         let h = SubRunHandle {
             sub_run_id: "nonexistent-sub-run-id".into(),
             complex_node: complex.clone(),
-            started_at: 0,
+            // Use now_ms() so the handle is "fresh" — older values
+            // (notably 0, the Unix epoch) would trip the timeout
+            // producer introduced when sub_run_timeout_ms was wired
+            // in. The whole point of this test is the
+            // "file missing → keep Running" branch, not the timeout
+            // branch, so we keep the handle well within its window.
+            started_at: crate::agent::graph_loop::now_ms_for_test(),
             status: SubRunStatus::Running,
         };
         let mut handle = h;
@@ -5975,6 +6264,386 @@ mod tests {
         assert!(
             matches!(&gl.drill_down_error, Some((n, e)) if n == &complex && e == "reviewer failed"),
             "expected drill_down_error to be set after mark_complex_node_error"
+        );
+    }
+
+    // --------------------------------------------------------------
+    // Drill-down Cancelled / Timeout / parent cancel tests
+    // (Task 11 — spec gaps)
+    // --------------------------------------------------------------
+
+    #[test]
+    fn sub_run_status_cancelled_variant_exists() {
+        // The Cancelled variant must exist on SubRunStatus so
+        // poll_sub_run_status can produce it when run.json reports
+        // status=Cancelled. This test guards against accidental
+        // removal of the variant.
+        let s = SubRunStatus::Cancelled;
+        assert!(matches!(s, SubRunStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn poll_recognises_cancelled_status_from_run_json() {
+        // poll_sub_run_status must recognise {"status":"Cancelled"}
+        // and transition the handle to SubRunStatus::Cancelled.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sub_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&handle.sub_run_id);
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Cancelled"}"#).unwrap();
+
+        let mut h = handle;
+        gl.poll_sub_run_status(&mut h).await;
+        assert!(
+            matches!(h.status, SubRunStatus::Cancelled),
+            "expected Cancelled; got {:?}",
+            h.status
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_recognises_lowercase_cancelled_status() {
+        // run.json may use lowercase "cancelled"; both must be
+        // accepted so we don't trip on the canonicalisation.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sub_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&handle.sub_run_id);
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"cancelled"}"#).unwrap();
+
+        let mut h = handle;
+        gl.poll_sub_run_status(&mut h).await;
+        assert!(matches!(h.status, SubRunStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn poll_after_cancelled_stamps_node_metadata() {
+        // After Cancelled is observed, the complex node's metadata
+        // must show status=cancelled + sub_run_status=cancelled so
+        // the web UI can render the cancellation.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sub_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&handle.sub_run_id);
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Cancelled"}"#).unwrap();
+
+        let mut h = handle;
+        gl.poll_sub_run_status(&mut h).await;
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(
+            node.metadata.get("status").and_then(|v| v.as_str()),
+            Some("cancelled"),
+            "complex node should be marked cancelled"
+        );
+        assert_eq!(
+            node.metadata.get("sub_run_status").and_then(|v| v.as_str()),
+            Some("cancelled"),
+            "complex node sub_run_status should reflect cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_transitions_to_timeout_when_handle_aged_past_default() {
+        // Build a handle whose started_at is well in the past (31
+        // min ago, default timeout is 30 min). Write a non-terminal
+        // run.json so the only thing that should move the handle
+        // from Running is the timeout producer. After poll, the
+        // handle must be Timeout and the complex node must be
+        // marked timed-out.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        gl.config.sub_run_timeout_ms = Some(30 * 60 * 1000); // explicit default
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        let mut h = handle;
+        // Rewind started_at to 31 minutes ago — past the 30-min default.
+        h.started_at = crate::agent::graph_loop::now_ms_for_test()
+            .saturating_sub(31 * 60 * 1000);
+        // Make sure the file exists but is in a non-terminal status
+        // (the timeout producer must override the "running" string).
+        let sub_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&h.sub_run_id);
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Running"}"#).unwrap();
+
+        gl.poll_sub_run_status(&mut h).await;
+        assert!(
+            matches!(h.status, SubRunStatus::Timeout),
+            "expected Timeout for handle aged 31 min; got {:?}",
+            h.status
+        );
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(
+            node.metadata.get("status").and_then(|v| v.as_str()),
+            Some("timeout")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_does_not_timeout_when_handle_fresh() {
+        // Sanity: a freshly-started handle (1s ago) must NOT trip
+        // the timeout producer even when run.json reports
+        // status="Running".
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        let mut h = handle;
+        h.started_at = crate::agent::graph_loop::now_ms_for_test().saturating_sub(1000);
+        let sub_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&h.sub_run_id);
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Running"}"#).unwrap();
+
+        gl.poll_sub_run_status(&mut h).await;
+        assert!(
+            matches!(h.status, SubRunStatus::Running),
+            "fresh handle must stay Running; got {:?}",
+            h.status
+        );
+    }
+
+    #[test]
+    fn mark_complex_node_cancelled_stamps_metadata() {
+        // mark_complex_node_cancelled must stamp status=cancelled on
+        // the complex node. It must NOT raise drill_down_error
+        // (cancellation is a soft terminal, not a graph defect).
+        let mut gl = test_graph_loop_with_seed();
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+        gl.mark_complex_node_cancelled(&complex);
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(node.metadata.get("status").and_then(|v| v.as_str()), Some("cancelled"));
+        assert!(
+            gl.drill_down_error.is_none(),
+            "Cancelled must NOT raise drill_down_error"
+        );
+    }
+
+    #[test]
+    fn mark_complex_node_timeout_stamps_metadata_and_raises_error() {
+        // mark_complex_node_timeout must stamp status=timeout +
+        // error="sub-run timeout" AND raise drill_down_error so
+        // the polling block surfaces GraphInvalid on the next tick.
+        let mut gl = test_graph_loop_with_seed();
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+        gl.mark_complex_node_timeout(&complex);
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(node.metadata.get("status").and_then(|v| v.as_str()), Some("timeout"));
+        assert_eq!(node.metadata.get("error").and_then(|v| v.as_str()), Some("sub-run timeout"));
+        assert!(
+            matches!(&gl.drill_down_error, Some((n, _)) if n == &complex),
+            "Timeout must raise drill_down_error so GraphInvalid surfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_propagates_to_pending_sub_runs() {
+        // With a pending sub-run, calling gl.cancel() and then
+        // step_graph must:
+        // - write Cancelled run.json to the sub-run
+        // - mark the complex node as cancelled
+        // - clear pending_sub_runs
+        // - return LoopState::Error("parent cancelled")
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        let handle = gl.fork_sub_graph_for(complex.clone()).await.unwrap();
+        // Give the spawned sub-loop a beat to write its run.json
+        // (it'll be a quick Done), then immediately cancel the
+        // parent. We don't care which state the sub-run wrote; the
+        // parent's cancel must override it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        gl.pending_sub_runs.insert(complex.clone(), handle);
+
+        assert_eq!(gl.pending_sub_runs.len(), 1);
+
+        gl.cancel();
+        let state = gl.step_graph().await.unwrap();
+        match state {
+            LoopState::Error(msg) => {
+                assert!(
+                    msg.contains("parent cancelled"),
+                    "expected LoopState::Error(\"parent cancelled\"); got {msg}"
+                );
+            }
+            other => panic!("expected LoopState::Error; got {other:?}"),
+        }
+
+        // pending_sub_runs must be empty.
+        assert!(
+            gl.pending_sub_runs.is_empty(),
+            "pending_sub_runs should be drained after cancel; still has {} entries",
+            gl.pending_sub_runs.len()
+        );
+
+        // Complex node must be marked cancelled.
+        let node = gl.graph.nodes.get(&complex).unwrap();
+        assert_eq!(
+            node.metadata.get("status").and_then(|v| v.as_str()),
+            Some("cancelled")
+        );
+
+        // Sub-run's run.json must have status=Cancelled.
+        let sub_dirs: Vec<_> = std::fs::read_dir(
+            tmp.path().join("test-run-001").join("sub_runs"),
+        )
+        .unwrap()
+        .flatten()
+        .collect();
+        assert!(!sub_dirs.is_empty(), "expected at least one sub-run dir");
+        let mut found_cancelled = false;
+        for entry in sub_dirs {
+            let path = entry.path().join("run.json");
+            if path.exists() {
+                let s = std::fs::read_to_string(&path).unwrap_or_default();
+                if s.contains("\"Cancelled\"") {
+                    found_cancelled = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_cancelled,
+            "expected at least one sub-run run.json to have status=Cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_skips_pending_fork_targets() {
+        // If the parent has pending_fork_targets queued (from a
+        // prior patch) and is then cancelled BEFORE the polling
+        // block drains them, the drain must skip the fork — we
+        // don't want to spawn a new sub-run on the way out.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        // Simulate a queued fork target without actually calling
+        // fork_sub_graph_for (which would spawn a real task).
+        gl.pending_fork_targets
+            .push((complex.clone(), "test reason".into()));
+
+        gl.cancel();
+        let state = gl.step_graph().await.unwrap();
+        match state {
+            LoopState::Error(msg) => assert!(msg.contains("parent cancelled")),
+            other => panic!("expected LoopState::Error; got {other:?}"),
+        }
+
+        // pending_fork_targets should be cleared, no new sub-run
+        // should have been created.
+        assert!(gl.pending_fork_targets.is_empty());
+        assert!(gl.pending_sub_runs.is_empty());
+    }
+
+    #[test]
+    fn cancel_sets_flag_and_is_idempotent() {
+        // gl.cancel() must set self.cancelled; gl.is_cancelled()
+        // must reflect it; a second call must be a no-op (idempotent).
+        let mut gl = test_graph_loop_with_seed();
+        assert!(!gl.is_cancelled());
+        gl.cancel();
+        assert!(gl.is_cancelled());
+        gl.cancel();
+        assert!(gl.is_cancelled());
+    }
+
+    #[test]
+    fn check_and_set_cancelled_propagates_external_signal() {
+        // gl.check_and_set_cancelled(true) must mirror an external
+        // cancel token onto the loop's internal flag. False is a
+        // no-op (the external cancel hasn't fired yet).
+        let mut gl = test_graph_loop_with_seed();
+        gl.check_and_set_cancelled(false);
+        assert!(!gl.is_cancelled());
+        gl.check_and_set_cancelled(true);
+        assert!(gl.is_cancelled());
+    }
+
+    #[test]
+    fn propagate_cancel_to_pending_sub_runs_writes_cancelled_payload() {
+        // Direct test of the helper: with a pending sub-run that has
+        // a run.json containing status="Done", calling
+        // propagate_cancel_to_pending_sub_runs must overwrite it
+        // with status="Cancelled" + cancelled_by_parent=true.
+        // We construct a `SubRunHandle` directly (rather than going
+        // through `fork_sub_graph_for`) so this can be a sync test.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut gl = test_graph_loop_with_seed_at(tmp.path());
+        gl.config.max_drilldown_depth = 2;
+        let complex = NodeId::from("design-modules");
+        gl.graph.add_node(Node::task("design-modules", "..."));
+
+        // Create a sub-run directory manually with a known
+        // sub_run_id. The handle's `started_at` is in the past but
+        // irrelevant here because we're testing propagation, not
+        // timeout.
+        let sub_run_id = "test-run-001-sub-99-d1".to_string();
+        let sub_dir = tmp.path()
+            .join("test-run-001")
+            .join("sub_runs")
+            .join(&sub_run_id);
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(sub_dir.join("run.json"), r#"{"status":"Done"}"#).unwrap();
+
+        let handle = SubRunHandle {
+            sub_run_id,
+            complex_node: complex.clone(),
+            started_at: 0,
+            status: SubRunStatus::Running,
+        };
+        gl.pending_sub_runs.insert(complex.clone(), handle);
+
+        let n = gl.propagate_cancel_to_pending_sub_runs();
+        assert_eq!(n, 1, "expected 1 sub-run cancelled");
+        assert!(gl.pending_sub_runs.is_empty());
+
+        let payload = std::fs::read_to_string(sub_dir.join("run.json")).unwrap();
+        assert!(payload.contains("\"Cancelled\""), "got {payload}");
+        assert!(
+            payload.contains("\"cancelled_by_parent\""),
+            "expected cancelled_by_parent flag; got {payload}"
         );
     }
 

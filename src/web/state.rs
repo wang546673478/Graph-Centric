@@ -61,6 +61,16 @@ pub struct EngineConfig {
     /// Default: 2 (3 levels total).
     #[serde(default = "default_max_drilldown_depth")]
     pub max_drilldown_depth: usize,
+    /// Wall-clock timeout (millis) for a pending sub-run. When a sub-run
+    /// ages past this many millis without writing a terminal `run.json`,
+    /// `poll_sub_run_status` transitions its handle to `SubRunStatus::Timeout`,
+    /// stamps the complex node as timed-out, and raises `drill_down_error`
+    /// so the parent surfaces a `LoopState::GraphInvalid`.
+    ///
+    /// Default: 1_800_000 (30 min). Override via the
+    /// `GRAPH_HARNESS_SUB_RUN_TIMEOUT_MS` env var.
+    #[serde(default = "default_sub_run_timeout_ms")]
+    pub sub_run_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +177,7 @@ fn default_event_channel_capacity() -> usize { 256 }
 fn default_force_search_after_filling_stall() -> u32 { 5 }
 fn default_convergence_stable_rounds() -> u32 { 3 }
 fn default_max_drilldown_depth() -> usize { 2 }
+fn default_sub_run_timeout_ms() -> u64 { 1_800_000 } // 30 min
 
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
@@ -211,6 +222,11 @@ impl EngineConfig {
                 cfg.max_drilldown_depth = v;
             }
         }
+        if let Ok(s) = std::env::var("GRAPH_HARNESS_SUB_RUN_TIMEOUT_MS") {
+            if let Ok(v) = s.parse::<u64>() {
+                cfg.sub_run_timeout_ms = v;
+            }
+        }
         cfg
     }
 
@@ -251,6 +267,7 @@ impl Default for EngineConfig {
             profiles: std::collections::HashMap::new(),
             active_profile: String::new(),
             max_drilldown_depth: default_max_drilldown_depth(),
+            sub_run_timeout_ms: default_sub_run_timeout_ms(),
             model: ModelTierConfig {
                 base_url: String::new(),
                 api_key: String::new(),
@@ -336,5 +353,27 @@ mod tests {
             std::env::remove_var("GRAPH_HARNESS_MAX_DRILLDOWN_DEPTH");
         }
         assert_eq!(cfg.max_drilldown_depth, 5);
+    }
+
+    #[test]
+    fn engine_config_default_sub_run_timeout_ms_is_30_min() {
+        let cfg = EngineConfig::default();
+        assert_eq!(
+            cfg.sub_run_timeout_ms,
+            1_800_000,
+            "default should be 30 minutes (1_800_000 ms)"
+        );
+    }
+
+    #[test]
+    fn engine_config_from_env_overrides_sub_run_timeout_ms() {
+        unsafe {
+            std::env::set_var("GRAPH_HARNESS_SUB_RUN_TIMEOUT_MS", "60000");
+        }
+        let cfg = EngineConfig::load();
+        unsafe {
+            std::env::remove_var("GRAPH_HARNESS_SUB_RUN_TIMEOUT_MS");
+        }
+        assert_eq!(cfg.sub_run_timeout_ms, 60_000);
     }
 }
