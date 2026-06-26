@@ -313,7 +313,8 @@ impl Verifier {
                     continue;
                 }
             };
-            let cleaned = match extract_json_block(&resp.content) {
+            // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+            let cleaned = match extract_json_block(resp.text_or_reasoning()) {
                 Ok(c) => c,
                 Err(_) => continue,
             };
@@ -402,7 +403,11 @@ impl Verifier {
         // response is logged so the failure is diagnosable — extract_json_block
         // alone drops it. This mirrors the L1 self-check above, which already
         // tolerates unparseable responses with `continue`.
-        let cleaned = match extract_json_block(&resp.content) {
+        //
+        // Reasoning-model fallback (DeepSeek / M3): parse reasoning_content
+        // when content is empty. db2d993d regression.
+        let parse_text = resp.text_or_reasoning();
+        let cleaned = match extract_json_block(parse_text) {
             Ok(c) => c,
             Err(e) => {
                 warn!(

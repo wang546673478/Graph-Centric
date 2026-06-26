@@ -132,7 +132,8 @@ impl LocalRepairer {
 
         let system = load_prompt_file("skills/prompts/l0-repairer.md", SYSTEM_PROMPT_L0_REPAIRER);
         let resp = self.call_model(&system, &user_prompt).await?;
-        let value = parse_json(&resp.content)?;
+        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+        let value = parse_json(resp.text_or_reasoning())?;
         let patch_v = value.get("patch").ok_or_else(|| {
             HarnessError::model("repairer: L0 response missing 'patch' field".to_string())
         })?;
@@ -246,7 +247,8 @@ impl LocalRepairer {
 
         let system = load_prompt_file("skills/prompts/scope-repairer.md", SYSTEM_PROMPT_SCOPE_REPAIRER);
         let resp = self.call_model(&system, &user_prompt).await?;
-        let value = parse_json(&resp.content)?;
+        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+        let value = parse_json(resp.text_or_reasoning())?;
         let patch_v = value.get("patch").ok_or_else(|| {
             HarnessError::model("repairer: ScopeGap response missing 'patch' field".to_string())
         })?;
@@ -288,6 +290,7 @@ impl LocalRepairer {
         let resp = self.model.complete(req).await?;
         debug!(
             content_len = resp.content.len(),
+            reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
             tokens = resp.usage.total_tokens,
             "repairer model response"
         );

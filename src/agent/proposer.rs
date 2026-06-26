@@ -465,13 +465,10 @@ regular Task nodes.");
         let step = if !resp.tool_calls.is_empty() {
             parse_step_from_tool_calls(&resp.tool_calls)?
         } else {
-            // Try content first. If it's empty (DeepSeek puts everything in
-            // reasoning_content), fall back to reasoning_content.
-            let parse_text = if resp.content.trim().is_empty() {
-                resp.reasoning_content.as_deref().unwrap_or("")
-            } else {
-                &resp.content
-            };
+            // DeepSeek / M3 reasoning models put their final JSON in
+            // reasoning_content, leaving content empty. See
+            // ModelResponse::text_or_reasoning and commit 7b8322e.
+            let parse_text = resp.text_or_reasoning();
             if parse_text.trim().is_empty() {
                 return Err(HarnessError::model(
                     "proposer: empty response — model returned neither tool_calls, content, nor reasoning_content"

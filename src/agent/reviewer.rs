@@ -255,8 +255,13 @@ impl Reviewer {
             stop: Vec::new(),
         };
         let resp = model.complete(req).await?;
-        debug!(content_len = resp.content.len(), "reviewer judge response");
-        parse_verdict(&resp.content)
+        debug!(
+            content_len = resp.content.len(),
+            reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
+            "reviewer judge response"
+        );
+        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+        parse_verdict(resp.text_or_reasoning())
     }
 
     /// Translate a [`ReviewResult`] (when failed with Graph/Scope root_cause)

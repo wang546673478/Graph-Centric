@@ -55,6 +55,25 @@ impl ModelResponse {
     pub fn new(content: impl Into<String>, finish_reason: FinishReason, usage: Usage) -> Self {
         Self { content: content.into(), reasoning_content: None, tool_calls: vec![], finish_reason, usage }
     }
+
+    /// Best-effort parser text for callers that need the model's response
+    /// as a string (decomposer, repairer, verifier, reviewer, cascade, etc.).
+    ///
+    /// Returns `content` when it's non-blank, otherwise falls back to
+    /// `reasoning_content`. The fallback handles reasoning-style models
+    /// (DeepSeek, MiniMax M3) that emit their final JSON in
+    /// `reasoning_content` while leaving `content` empty — without it,
+    /// parsers die with `proposer: no '{' in response` on the db2d993d
+    /// failure mode. Both fields blank → returns `""`; callers that
+    /// require *some* text should check `.trim().is_empty()` themselves
+    /// and surface a clear error (e.g. `decomposer: empty response`).
+    pub fn text_or_reasoning(&self) -> &str {
+        if self.content.trim().is_empty() {
+            self.reasoning_content.as_deref().unwrap_or("")
+        } else {
+            self.content.as_str()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,5 +137,51 @@ pub trait Model: Send + Sync {
             usage: resp.usage.clone(),
         });
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resp_with(content: &str, reasoning: Option<&str>) -> ModelResponse {
+        ModelResponse {
+            content: content.to_string(),
+            reasoning_content: reasoning.map(str::to_string),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: Usage::default(),
+        }
+    }
+
+    /// Content wins when it's non-blank (the conventional channel).
+    #[test]
+    fn text_or_reasoning_prefers_content() {
+        let r = resp_with("from content", Some("from reasoning"));
+        assert_eq!(r.text_or_reasoning(), "from content");
+    }
+
+    /// Reasoning-content fallback fires when content is empty —
+    /// the DeepSeek / M3 failure mode that killed db2d993d.
+    #[test]
+    fn text_or_reasoning_falls_back_when_content_empty() {
+        let r = resp_with("", Some("from reasoning"));
+        assert_eq!(r.text_or_reasoning(), "from reasoning");
+    }
+
+    /// Whitespace-only content also triggers the fallback (trim() check).
+    #[test]
+    fn text_or_reasoning_falls_back_on_whitespace_content() {
+        let r = resp_with("   \n\t  ", Some("from reasoning"));
+        assert_eq!(r.text_or_reasoning(), "from reasoning");
+    }
+
+    /// Both empty → empty string; caller is responsible for the
+    /// clear "empty response" error rather than a confusing
+    /// `proposer: no '{' in response`.
+    #[test]
+    fn text_or_reasoning_empty_when_both_blank() {
+        let r = resp_with("", None);
+        assert_eq!(r.text_or_reasoning(), "");
     }
 }

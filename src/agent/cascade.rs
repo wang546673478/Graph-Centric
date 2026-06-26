@@ -261,7 +261,8 @@ Respond with JSON:
         };
 
         let resp = self.model.complete(req).await?;
-        let content = resp.content.trim();
+        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+        let content = resp.text_or_reasoning().trim();
 
         let verdict: serde_json::Value = serde_json::from_str(content).unwrap_or(serde_json::json!({
             "verdict": "PRESERVED",

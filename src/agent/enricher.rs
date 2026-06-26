@@ -220,11 +220,14 @@ impl L1Enricher {
             node = %node_id,
             has_l2,
             content_len = resp.content.len(),
+            reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
             tokens = resp.usage.total_tokens,
             "enricher model response"
         );
 
-        let mut desc = parse_l1_description(&resp.content)?;
+        // Reasoning-model fallback (DeepSeek / M3). See
+        // ModelResponse::text_or_reasoning; db2d993d regression.
+        let mut desc = parse_l1_description(resp.text_or_reasoning())?;
         if !has_l2 {
             // Hard-cap confidence on the L0-only path regardless of what
             // the model claimed. The model promised to stay ≤ 0.6 but we

@@ -139,17 +139,9 @@ impl Decomposer {
             "decomposer model response"
         );
 
-        // Reasoning-model fallback (DeepSeek / MiniMax M3): when the
-        // model put its final JSON in `reasoning_content` and left
-        // `content` empty, parse the reasoning channel instead. This
-        // mirrors the proposer's fallback (commit 7b8322e) and fixes
-        // the db2d993d production failure where the decomposer died
-        // with "proposer: no '{' in response".
-        let parse_text = if resp.content.trim().is_empty() {
-            resp.reasoning_content.as_deref().unwrap_or("")
-        } else {
-            resp.content.as_str()
-        };
+        // Reasoning-model fallback (DeepSeek / MiniMax M3): see
+        // `ModelResponse::text_or_reasoning`. db2d993d regression.
+        let parse_text = resp.text_or_reasoning();
         if parse_text.trim().is_empty() {
             return Err(HarnessError::model(
                 "decomposer: empty response — model returned neither content nor reasoning_content"
