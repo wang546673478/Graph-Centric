@@ -11,7 +11,9 @@ const showKey = ref(false)
 const showAdvanced = ref(false)
 const showAdvisor = ref(false)
 const modelList = ref<string[]>([])
+const advisorModelList = ref<string[]>([])
 const fetching = ref(false)
+const fetchingAdvisor = ref(false)
 const keyDirty = ref(false)
 const origKey = ref('')
 const origAdvisorKey = ref('')
@@ -147,20 +149,39 @@ function deleteProfile(name: string) {
   save()
 }
 
-async function fetchModels() {
-  const baseUrl = config.value.model?.base_url?.trim()
-  if (!baseUrl) return
-  fetching.value = true
+async function fetchModels(target: 'task' | 'advisor' = 'task') {
+  const isAdvisor = target === 'advisor'
+  const baseUrl = (isAdvisor
+    ? config.value.model?.advisor_base_url
+    : config.value.model?.base_url)?.trim()
+  if (!baseUrl) {
+    alert(isAdvisor
+      ? 'Please fill in Advisor Base URL first'
+      : 'Please fill in Base URL first')
+    return
+  }
+  const loadingRef = isAdvisor ? fetchingAdvisor : fetching
+  loadingRef.value = true
   try {
-    // Real key in api_key (unmasked), user-typed in api_key_masked.
-    const key = (config.value.model?.api_key && !config.value.model.api_key.includes('***'))
-      ? config.value.model.api_key
-      : (config.value.model?.api_key_masked || '')
+    // Prefer the real (unmasked) key the user typed; fall back to the
+    // masked form (e.g. "sk-***abcd") if no real key is set.
+    const rawKey = isAdvisor
+      ? config.value.model?.advisor_api_key
+      : config.value.model?.api_key
+    const maskedKey = isAdvisor
+      ? config.value.model?.advisor_api_key_masked
+      : config.value.model?.api_key_masked
+    const key = (rawKey && !rawKey.includes('***')) ? rawKey : (maskedKey || '')
     const resp = await fetch(`/api/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(key)}`)
     const data = await resp.json()
-    modelList.value = data.models || []
+    const list = (data.models || []).filter((m: any) => typeof m === 'string')
+    if (isAdvisor) {
+      advisorModelList.value = list
+    } else {
+      modelList.value = list
+    }
   } catch (e) { alert(String(e)) }
-  finally { fetching.value = false }
+  finally { loadingRef.value = false }
 }
 
 async function save() {
@@ -304,7 +325,16 @@ async function save() {
           </div>
         </label>
         <label>Advisor Model
-          <input v-model="config.model.advisor_model" placeholder="gpt-4o" />
+          <div class="fetch-row">
+            <select v-if="advisorModelList.length" v-model="config.model.advisor_model">
+              <option v-for="m in advisorModelList" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <input v-else v-model="config.model.advisor_model" placeholder="gpt-4o" />
+            <button class="secondary" @click="fetchModels('advisor')" :disabled="fetchingAdvisor">
+              {{ fetchingAdvisor ? 'Fetching…' : '🔍 Fetch Models' }}
+            </button>
+          </div>
+          <span v-if="advisorModelList.length" class="hint">{{ advisorModelList.length }} model(s) found</span>
         </label>
         <p class="hint" style="margin-top: 8px;">
           The advisor and task models are fully independent — different
