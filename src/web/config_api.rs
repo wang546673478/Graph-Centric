@@ -266,6 +266,9 @@ pub async fn post_config(
         if let Some(v) = tuning.get("max_rounds").and_then(|v| v.as_u64()) {
             config.loop_tuning.max_rounds = v as usize;
         }
+        if let Some(v) = tuning.get("max_repair_rounds").and_then(|v| v.as_u64()) {
+            config.loop_tuning.max_repair_rounds = v as usize;
+        }
         if let Some(v) = tuning.get("cascade_backtrack").and_then(|v| v.as_bool()) {
             config.loop_tuning.cascade_backtrack = v;
         }
@@ -274,6 +277,125 @@ pub async fn post_config(
         }
         if let Some(v) = tuning.get("reasoning_effort").and_then(|v| v.as_str()) {
             config.loop_tuning.reasoning_effort = v.to_string();
+        }
+        if let Some(v) = tuning.get("auto_apply_skills").and_then(|v| v.as_bool()) {
+            config.loop_tuning.auto_apply_skills = v;
+        }
+        // Stagnation / stuck / tool failure thresholds
+        if let Some(v) = tuning.get("stagnation_soft_hint").and_then(|v| v.as_u64()) {
+            config.loop_tuning.stagnation_soft_hint = v as u32;
+        }
+        if let Some(v) = tuning.get("stagnation_hard_hint").and_then(|v| v.as_u64()) {
+            config.loop_tuning.stagnation_hard_hint = v as u32;
+        }
+        if let Some(v) = tuning.get("stagnation_terminate").and_then(|v| v.as_u64()) {
+            config.loop_tuning.stagnation_terminate = v as u32;
+        }
+        if let Some(v) = tuning.get("stuck_soft_hint").and_then(|v| v.as_u64()) {
+            config.loop_tuning.stuck_soft_hint = v as u32;
+        }
+        if let Some(v) = tuning.get("stuck_hard_hint").and_then(|v| v.as_u64()) {
+            config.loop_tuning.stuck_hard_hint = v as u32;
+        }
+        if let Some(v) = tuning.get("stuck_terminate").and_then(|v| v.as_u64()) {
+            config.loop_tuning.stuck_terminate = v as u32;
+        }
+        if let Some(v) = tuning.get("tool_failure_warn_after").and_then(|v| v.as_u64()) {
+            config.loop_tuning.tool_failure_warn_after = v as u32;
+        }
+        if let Some(v) = tuning.get("tool_failure_halt_after").and_then(|v| v.as_u64()) {
+            config.loop_tuning.tool_failure_halt_after = v as u32;
+        }
+        if let Some(v) = tuning.get("event_channel_capacity").and_then(|v| v.as_u64()) {
+            config.loop_tuning.event_channel_capacity = v as usize;
+        }
+        if let Some(v) = tuning.get("force_search_after_filling_stall").and_then(|v| v.as_u64()) {
+            config.loop_tuning.force_search_after_filling_stall = v as u32;
+        }
+        if let Some(v) = tuning.get("convergence_stable_rounds").and_then(|v| v.as_u64()) {
+            config.loop_tuning.convergence_stable_rounds = v as u32;
+        }
+    }
+
+    // Drill-down depth + sub-run timeout
+    if let Some(v) = update.get("max_drilldown_depth").and_then(|v| v.as_u64()) {
+        config.max_drilldown_depth = v as usize;
+    }
+    if let Some(v) = update.get("sub_run_timeout_ms").and_then(|v| v.as_u64()) {
+        config.sub_run_timeout_ms = v;
+    }
+
+    // Policy: deny_patterns, implicit_cwd_verbs
+    if let Some(policy) = update.get("policy") {
+        if let Some(arr) = policy.get("deny_patterns").and_then(|v| v.as_array()) {
+            config.policy.deny_patterns = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+        if let Some(arr) = policy.get("implicit_cwd_verbs").and_then(|v| v.as_array()) {
+            config.policy.implicit_cwd_verbs = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+    }
+
+    // AdvancedTuningConfig: 17 fields from src/web/state.rs
+    if let Some(adv) = update.get("advanced") {
+        if let Some(v) = adv.get("subagent_max_steps").and_then(|v| v.as_u64()) {
+            config.advanced.subagent_max_steps = v as usize;
+        }
+        if let Some(v) = adv.get("explore_max_items_per_step").and_then(|v| v.as_u64()) {
+            config.advanced.explore_max_items_per_step = v as usize;
+        }
+        if let Some(v) = adv.get("explore_max_question_chars").and_then(|v| v.as_u64()) {
+            config.advanced.explore_max_question_chars = v as usize;
+        }
+        if let Some(v) = adv.get("enricher_l2_char_cap").and_then(|v| v.as_u64()) {
+            config.advanced.enricher_l2_char_cap = v as usize;
+        }
+        if let Some(v) = adv.get("enricher_neighbor_limit").and_then(|v| v.as_u64()) {
+            config.advanced.enricher_neighbor_limit = v as usize;
+        }
+        if let Some(v) = adv.get("enricher_l0_only_confidence_cap").and_then(|v| v.as_f64()) {
+            config.advanced.enricher_l0_only_confidence_cap = v;
+        }
+        if let Some(v) = adv.get("skill_match_threshold").and_then(|v| v.as_f64()) {
+            config.advanced.skill_match_threshold = v;
+        }
+        if let Some(v) = adv.get("skill_match_trigger_weight").and_then(|v| v.as_f64()) {
+            config.advanced.skill_match_trigger_weight = v;
+        }
+        if let Some(v) = adv.get("skill_match_slug_weight").and_then(|v| v.as_f64()) {
+            config.advanced.skill_match_slug_weight = v;
+        }
+        if let Some(v) = adv.get("cascade_max_expand_depth").and_then(|v| v.as_u64()) {
+            config.advanced.cascade_max_expand_depth = v as usize;
+        }
+        if let Some(v) = adv.get("validator_default_timeout_ms").and_then(|v| v.as_u64()) {
+            config.advanced.validator_default_timeout_ms = v;
+        }
+        if let Some(v) = adv.get("bash_default_timeout_ms").and_then(|v| v.as_u64()) {
+            config.advanced.bash_default_timeout_ms = v;
+        }
+        if let Some(v) = adv.get("bash_max_timeout_ms").and_then(|v| v.as_u64()) {
+            config.advanced.bash_max_timeout_ms = v;
+        }
+        if let Some(v) = adv.get("proposer_default_max_tokens").and_then(|v| v.as_u64()) {
+            config.advanced.proposer_default_max_tokens = v as usize;
+        }
+        if let Some(v) = adv.get("decomposer_default_max_tokens").and_then(|v| v.as_u64()) {
+            config.advanced.decomposer_default_max_tokens = v as usize;
+        }
+        if let Some(v) = adv.get("subagent_default_max_tokens").and_then(|v| v.as_u64()) {
+            config.advanced.subagent_default_max_tokens = v as usize;
+        }
+        if let Some(v) = adv.get("verifier_l2_excerpt_chars").and_then(|v| v.as_u64()) {
+            config.advanced.verifier_l2_excerpt_chars = v as usize;
+        }
+        if let Some(v) = adv.get("max_auto_repair_cycles").and_then(|v| v.as_u64()) {
+            config.advanced.max_auto_repair_cycles = v as usize;
         }
     }
 

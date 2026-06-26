@@ -4,9 +4,10 @@ import { api } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 const { t } = useI18n()
 
-const config = ref<any>({ model: {}, policy: {}, loop_tuning: {} })
+const config = ref<any>({ model: {}, policy: {}, loop_tuning: {}, advanced: {} })
 const saved = ref(false)
 const showKey = ref(false)
+const showAdvanced = ref(false)
 const modelList = ref<string[]>([])
 const fetching = ref(false)
 const keyDirty = ref(false)
@@ -64,6 +65,11 @@ onMounted(async () => {
     config.value = await api.get('/api/config')
     origKey.value = config.value.model?.api_key_masked || ''
     profiles.value = config.value.profiles || {}
+    // Convert policy Vec<String> → textarea string for the UI.
+    config.value.policy.deny_patterns_text = (config.value.policy?.deny_patterns || []).join('\n')
+    config.value.policy.implicit_cwd_verbs_text = (config.value.policy?.implicit_cwd_verbs || []).join('\n')
+    // Ensure advanced sub-object exists.
+    if (!config.value.advanced) config.value.advanced = {}
     heartbeat.value = await api.get('/api/heartbeat')
     if (heartbeat.value?.prompt) {
       hbPrompt.value = heartbeat.value.prompt
@@ -150,6 +156,15 @@ async function fetchModels() {
 async function save() {
   if (!keyDirty.value) {
     config.value.model.api_key_masked = origKey.value
+  }
+  // Convert textarea string → Vec<String> for the API.
+  if (config.value.policy.deny_patterns_text !== undefined) {
+    config.value.policy.deny_patterns = config.value.policy.deny_patterns_text
+      .split('\n').map((s: string) => s.trim()).filter((s: string) => s.length > 0)
+  }
+  if (config.value.policy.implicit_cwd_verbs_text !== undefined) {
+    config.value.policy.implicit_cwd_verbs = config.value.policy.implicit_cwd_verbs_text
+      .split('\n').map((s: string) => s.trim()).filter((s: string) => s.length > 0)
   }
   // Sync current model to the active profile.
   const ap = config.value.active_profile
@@ -244,11 +259,19 @@ async function save() {
     <section>
       <h3>{{ t('settings.policy') }}</h3>
       <label>{{ t('settings.maxConcurrent') }} <input type="number" v-model.number="config.policy.max_concurrent_subagents" /></label>
+      <label>Deny patterns (one per line)
+        <textarea v-model="config.policy.deny_patterns_text" rows="3" class="hb-textarea" placeholder="^rm -rf /$&#10;^kubectl delete "></textarea>
+      </label>
+      <label>Implicit cwd-write verbs (one per line)
+        <textarea v-model="config.policy.implicit_cwd_verbs_text" rows="3" class="hb-textarea" placeholder="cargo&#10;npm&#10;go"></textarea>
+      </label>
     </section>
 
     <section>
       <h3>{{ t('settings.loopTuning') }}</h3>
       <label>{{ t('settings.maxRounds') }} <input type="number" v-model.number="config.loop_tuning.max_rounds" /></label>
+      <label>Max repair rounds
+        <input type="number" v-model.number="config.loop_tuning.max_repair_rounds" min="1" /></label>
       <label><input type="checkbox" v-model="config.loop_tuning.cascade_backtrack" /> {{ t('settings.cascadeBacktrack') }}</label>
       <label><input type="checkbox" v-model="config.loop_tuning.thinking_enabled" /> Thinking Mode (DeepSeek)</label>
       <label v-if="config.loop_tuning.thinking_enabled">Reasoning Effort
@@ -257,6 +280,75 @@ async function save() {
           <option value="max">max</option>
         </select>
       </label>
+      <label><input type="checkbox" v-model="config.loop_tuning.auto_apply_skills" /> Auto-apply matched skills</label>
+      <label>Event channel capacity
+        <input type="number" v-model.number="config.loop_tuning.event_channel_capacity" min="16" /></label>
+    </section>
+
+    <section>
+      <h3>Drill-down</h3>
+      <label>Max drill-down depth
+        <input type="number" v-model.number="config.max_drilldown_depth" min="0" /></label>
+      <label>Sub-run timeout (ms)
+        <input type="number" v-model.number="config.sub_run_timeout_ms" min="1000" /></label>
+    </section>
+
+    <section class="advanced-section">
+      <h3 @click="showAdvanced = !showAdvanced" style="cursor: pointer;">
+        🔧 Advanced tuning
+        <span style="font-size: 0.7rem; color: var(--text-muted); margin-left: 8px;">
+          {{ showAdvanced ? '(click to collapse)' : '(click to expand, 17 fields)' }}
+        </span>
+      </h3>
+      <div v-if="showAdvanced">
+        <p class="hint" style="margin-bottom: 12px;">
+          These were previously hardcoded in source. Defaults match the pre-config behavior.
+        </p>
+
+        <h4 style="margin-top: 12px; color: var(--text-muted); font-size: 0.75rem;">Sub-agent + Proposer</h4>
+        <label>Sub-agent max steps
+          <input type="number" v-model.number="config.advanced.subagent_max_steps" min="1" /></label>
+        <label>Sub-agent default max_tokens
+          <input type="number" v-model.number="config.advanced.subagent_default_max_tokens" min="256" /></label>
+        <label>Proposer default max_tokens
+          <input type="number" v-model.number="config.advanced.proposer_default_max_tokens" min="256" /></label>
+        <label>Decomposer default max_tokens
+          <input type="number" v-model.number="config.advanced.decomposer_default_max_tokens" min="256" /></label>
+        <label>Explore max items per step
+          <input type="number" v-model.number="config.advanced.explore_max_items_per_step" min="1" /></label>
+        <label>Explore max question chars
+          <input type="number" v-model.number="config.advanced.explore_max_question_chars" min="100" /></label>
+
+        <h4 style="margin-top: 16px; color: var(--text-muted); font-size: 0.75rem;">L1 Enricher</h4>
+        <label>L2 char cap
+          <input type="number" v-model.number="config.advanced.enricher_l2_char_cap" min="1000" /></label>
+        <label>Neighbor limit
+          <input type="number" v-model.number="config.advanced.enricher_neighbor_limit" min="1" /></label>
+        <label>L0-only confidence cap (0..1)
+          <input type="number" step="0.05" v-model.number="config.advanced.enricher_l0_only_confidence_cap" min="0" max="1" /></label>
+
+        <h4 style="margin-top: 16px; color: var(--text-muted); font-size: 0.75rem;">Skill matcher</h4>
+        <label>Match threshold
+          <input type="number" step="0.05" v-model.number="config.advanced.skill_match_threshold" min="0" max="1" /></label>
+        <label>Trigger weight
+          <input type="number" step="0.05" v-model.number="config.advanced.skill_match_trigger_weight" min="0" max="1" /></label>
+        <label>Slug weight
+          <input type="number" step="0.05" v-model.number="config.advanced.skill_match_slug_weight" min="0" max="1" /></label>
+
+        <h4 style="margin-top: 16px; color: var(--text-muted); font-size: 0.75rem;">Cascade + Tool timeouts</h4>
+        <label>Max cascade expand depth
+          <input type="number" v-model.number="config.advanced.cascade_max_expand_depth" min="0" /></label>
+        <label>Validator default timeout (ms)
+          <input type="number" v-model.number="config.advanced.validator_default_timeout_ms" min="1000" /></label>
+        <label>Bash default timeout (ms)
+          <input type="number" v-model.number="config.advanced.bash_default_timeout_ms" min="1000" /></label>
+        <label>Bash max timeout (ms)
+          <input type="number" v-model.number="config.advanced.bash_max_timeout_ms" min="1000" /></label>
+        <label>Verifier L2 excerpt chars
+          <input type="number" v-model.number="config.advanced.verifier_l2_excerpt_chars" min="100" /></label>
+        <label>Max auto-repair cycles (CLI demo)
+          <input type="number" v-model.number="config.advanced.max_auto_repair_cycles" min="0" /></label>
+      </div>
     </section>
 
     <button class="primary" @click="save">{{ saved ? t('settings.saved') : t('settings.save') }}</button>
