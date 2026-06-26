@@ -9,6 +9,29 @@
 
 ## 近期变更
 
+- **v2.6（2026-06-26）— 全员 tool_calls 迁移。** 7 个模型层（Proposer、
+  Decomposer、L1Enricher、L0+ScopeGap Repairer、Verifier L1+graph
+  self-checks、Reviewer、CascadeBacktracker）现在都声明 OpenAI
+  `tool` schema 并优先用 `tool_calls` 而不是文本 JSON 解析。触发事件
+  是生产 run db2d993d：DeepSeek-v3 / MiniMax M3 的 reasoning-only
+  响应（`content` 为空，JSON 在 `reasoning_content` 中）把 decomposer
+  杀掉，错误是 `proposer: no '{' in response`。修复：新增
+  `ModelResponse::text_or_reasoning()` 辅助方法，把 `content` →
+  `reasoning_content` 的兜底集中；每一层用
+  `parse_*_from_tool_calls(&[ToolCall]) -> Option<T>` → 文本兜底
+  的模式包起来。`StreamDelta` 新增 `ToolCallArgument` 变体用于实时
+  按片段流式 tool_call；`RunEvent::StreamToolCall` 是其线协议。测试
+  从 477 增至 606。主 agent 和 sub-agent 仍然用**不同**协议——见 §5
+  看完整的"有意收窄"故事。见 `CLAUDE.md` 看 22 条核心思想，其中
+  #5、#14、#15、#18、#22 捕获了相关的子故事。
+
+- **v2.5（2026-06-20）— Intake gate 现在用代码强制。** `intake.rs` 新增
+  `classify_task_clarity`（启发式：EN+ZH 模糊起点短语、短无动词、单词）
+  和 `check_intake_compliance`（对模糊任务在 round 0 上拒绝非
+  `ask_user` 步骤）。§1a 中"未来可以加确定性检查"的注释已经过时——
+  检查已存在，在每一步都跑，并通过 fix-it retry 路径把错误反馈给
+  模型。Mode A vs Mode B 不再只靠 prompt。
+
 - **v2.4（2026-06-18）— 流式输出与持久化。** `ModelWithEvents` 透明
   包装任意模型——`complete()` 调用被路由到 SSE 流式传输
   （`complete_stream()`），每个 token 实时作为 `StreamChunk` 事件
@@ -93,11 +116,14 @@ Mode B 不可省。如果模型可以从一个模糊任务里直接画图,它会
 里没有"猜错第一步"的恢复路径 — verifier 和 sub-agents 都会基于一个
 框错的计划工作。Mode B 在任何规划**之前**强制做一次澄清。
 
-具体落地上,Mode B 由 proposer 的 system prompt("intake" 规则)强制:
-一个新对话里的第一个 `ProposerStep`,在任务缺乏具体成功标准、引用
-模型没有的外部上下文、或者允许多种解读时,应该是 `AskUser`。harness
-在代码层**不**做这道闸(目前依赖模型),这是我们接受的 trade-off —
-后续可以加一个"第一轮是否 ask?"的确定性 check。
+具体落地上,Mode B 由 system prompt **和** `intake.rs::check_intake_compliance`
+里的确定性 gate 一起强制:一个新对话里的第一个 `ProposerStep` 会
+对照 `classify_task_clarity(task)` 做检查。如果任务是 Vague
+（启发式:EN+ZH 模糊起点短语、短无动词、单词）,而步骤不是 `AskUser`,
+gate 就用 `HarnessError` 拒掉,通过 fix-it retry 路径把错误反馈给
+模型。system prompt 也教 Mode A/B,但仅靠 prompt 不构成 load-bearing
+约束——启发式 gate 是第二道防线。分类器倾向于放行（假阳性 = 烦人的
+`ask_user`;假阴性 = 浪费一次 run 在从模糊意图上建出来的图上）。
 
 ---
 
@@ -278,7 +304,25 @@ Reviewer:          每次 Review 阶段跑一次，看 图+结果+任务  (贵 �
 
 ## 5. 子 agent 执行
 
-### JSON-action 协议 vs 原生 tool_calls
+### 三层协议，三种不同宽度（故意）
+
+系统在三处用了不同协议。这是 v2.6 全员 tool_calls 迁移之后的局面
+（见 近期变更）：
+
+| 层 | 协议 | 宽度 | 为何要窄 |
+|---|---|---|---|
+| **主 agent**（Proposer） | OpenAI `tool_calls`（6 种 step 类型）| 宽 | 编排面——需要灵活性来支持模型的创造性工作 |
+| **子 agent**（Dispatcher 内） | 自定义 JSON-action（`use_tool` / `final_answer` / `report_graph_error`）| 窄 | 约束执行环境（`max_steps=8`，无直接图访问）；窄 = 容易验证 |
+| **Skill 编译**（`skills::compiler`）| `NodeKind::Task` + `DependsOn` 边 only | 更窄 | Skill 被缓存、回放、信任；窄 = 安全的缓存 |
+
+看到这种不一致，第一个冲动是**统一**——让子 agent 也用 `tool_calls`，
+让 skill 也输出完整 `GraphPatch`。**别这么做。** 每次收窄都是
+defense-in-depth 决策：边界处协议越窄，模型在该层失控时爆炸半径
+越小。主 agent 是宽的那个，因为创造性工作发生在那里；它里面所有
+东西都在轨道上。如果将来有贡献者提议统一协议，问题只有一个：
+**我们会丢掉什么安全保证？**
+
+### 为什么子 agent 用 JSON-action，不用原生 tool_calls
 
 DeepSeek（以及 OpenAI、Anthropic 等）都支持原生的 function-calling
 ——模型在响应里发出结构化的 `tool_calls`，运行时通过 `role: "tool"`
@@ -296,7 +340,9 @@ DeepSeek（以及 OpenAI、Anthropic 等）都支持原生的 function-calling
    的 JSON 字符串。原生 tool_calls 协议会散在多个结构化字段里。
 
 权衡：我们错过了后端侧的优化，比如并行工具调用和工具结果缓存。
-对 agent-as-orchestrator 来说，可移植性 + 透明度的赢面盖过这些。
+对子 agent——那个便宜可派生的内层循环——这反而是对的选择。
+主 agent（编排工作发生的地方）**确实**用原生 `tool_calls`；只有子
+agent 不用。
 
 ### 为什么 loop 是单层的（不嵌套 GraphLoop）
 
@@ -430,16 +476,21 @@ Layer 2 — model 自检：
     给定（图, 任务, 对话），图是否够支撑任务？缺什么？夸大了什么？
     错了什么？
     一次 model 调用。可跳过（`Verifier::structural_only()`）。
+    v2.6 后：声明 `graph_self_check_verdict` tool schema；优先
+    `tool_calls`，回退文本 JSON。
 
 Layer 3 — L1 采样：
     抽 N 个有非空 L1 的节点。对每个，通过 SourceLoader 取 L2，
     问 model：L1 跟 L2 还对得上吗？
     N 次 model 调用。需要已配置的 loader。
+    v2.6 后：每个节点声明 `l1_check_verdict` tool schema。
 ```
 
 各层由"什么可用"闸控，不由 confidence：结构化检查总是跑；对比
 L2 的检查需要 loader；model 自检需要 model。`Verifier::structural_only()`
-供单元测试绕过 model。
+供单元测试绕过 model。v2.6 之后，模型面（Layer 2 和 3）优先用
+OpenAI `tool_calls`，保留文本 JSON 路径作为兜底——见 近期变更和
+`CLAUDE.md` 的迁移故事。
 
 ### 为什么是三层，不是一层（"问 model"）？
 
@@ -648,7 +699,9 @@ IDE 都懂环境变量。自定义配置格式要 loader、要 schema、要迁�
 
 ## 12. 设计原则展开
 
-六条原则驱动每个组件。简版在 `README.md`；下面是完整推理。
+十二条原则驱动每个组件。简版（带 TL;DR 标题）在 `README.md`；
+下面是完整推理。前六条早于 v2.6；后六条是在 db2d993d 之后的设计
+复盘和 tool_calls 迁移中浮现的。
 
 ### 1. Model-agnostic（模型无关）
 
@@ -660,7 +713,95 @@ IDE 都懂环境变量。自定义配置格式要 loader、要 schema、要迁�
 `cfg.fast_model()` 或 `cfg.deep_model()`。需要特定模型行为的测
 试用 `MockModel` trait impl。
 
-### 2. Time-for-space（拿错误换正确）
+Reasoning-only 模型（DeepSeek-v3、MiniMax M3）是一等公民：每一
+层读取模型文本响应时都走 `ModelResponse::text_or_reasoning()`，
+它在 `content` 非空时优先用它，否则用 `reasoning_content`。
+这是 v2.6 对 db2d993d 生产故障的修复。
+
+### 2. 图是计划、是调度、是审计日志
+
+三件不同的事，同一个数据结构。**计划** — 主 agent 把图当作工作
+记忆来编辑。**调度** — `DagScheduler` 在 `DependsOn` 边上跑 Kahn
+算法，产出 wave-aligned 批；dispatcher 只是执行它们。**审计日志**
+— `CheckpointStore` 在每次有意义的变更后快照 `(round, phase,
+graph, transcript)`，配 `branches` 映射支持 fork。机制分别见
+§2、§8、§13。
+
+### 3. 确定性优先于 LLM 评判（Defense in depth）
+
+系统里有很多"信任模型"的决策。**没有一个是硬门（hard gate）。**
+每个都被至少检查两次——一次是确定性机制，一次是 LLM-as-judge 顾问：
+
+- "图结构一致" — `Graph::find_inconsistencies`（确定性）。无 LLM
+  顾问（太简单了）。
+- "子 agent 工作正确" — `CheckContract` 被**检查两次**：子 agent
+  自己一次，dispatcher 再查一次。
+- "代码能编译" — `PostExecutionValidator` 跑 `cargo check` / `tsc`
+  并对 stderr 做 graph vs task 错误模式匹配。
+- "L1 与 L2 一致" — 子串比较 + drift 严重度（确定性）+ `l1_check_verdict`
+  （顾问式；从不单方面判失败）。
+- "最终结果可接受" — 确定性 reviewer（图一致性、子 agent 成功、
+  verify-phase 状态）+ `judge_verdict`（顾问式；`root_cause` 路由
+  到 repair）。
+
+**不可靠的模型不能让结构上正确的图崩掉。** 这是系统最重要的
+安全属性。任何新的"信任模型"决策必须配套一个确定性的第二线
+检查，否则不能上。
+
+### 4. 边界处窄协议，内部宽协议
+
+主 agent 用宽的 OpenAI `tool_calls`（6 种 step 类型，完整 GraphPatch
+schema）。子 agent 用窄的自定义 JSON-action。Skill 编译用更窄的
+（`Task + DependsOn` only）。完整表格见 §5。看到这种不一致，第一个
+冲动是**统一**——别这么做。每次收窄都是 defense-in-depth 决策：
+边界处协议越窄，模型在该层失控时爆炸半径越小。如果将来有贡献者
+提议统一协议，问题只有一个：**我们会丢掉什么安全保证？**
+
+### 5. 三个正交的记忆层
+
+| 层 | 存储 | 生命周期 |
+|---|---|---|
+| 结构（graph）| 内存中的 `Graph` + checkpoint 到磁盘 | 一次 run |
+| 提示词（conversation）| 内存中的 `Conversation` | 一次 run |
+| 编译后（skills）| `LocalSkillStorage`（文件系统）| 永久 |
+
+这三个**正交**：skill 不漏到 graph，graph 不漏到 conversation，
+conversation 不漏到 skill。每一个是独立的数据结构，有自己的写入
+路径。新的"记忆"功能应选一个层和一条写入路径；抵制"哪里都放一份"
+的诱惑。集成点是 Task 阶段的 `try_match_and_compile_skill`。
+
+### 6. Skill 是结构化记忆，不是提示词记忆
+
+当一次 run 成功到达 `ready_for_verify`，`skills::capture::capture_skill()`
+抽取 `propose_patch` 序列作为编译后的任务 DAG，存到本地。下一次有
+token-Jaccard ≥ 0.25 匹配的任务，**完全跳过 decomposer**，直接用
+编译后的 skill 图。这是结构化记忆：skill 是图拓扑，不是提示词
+片段。成功的 run 会复利——agent 在已经做过的事上越来越快，速度
+提升也建立在那驱动一切的同一种 artifact（`Graph`）上。
+
+编译器（`skills::compiler::compile_skill_to_task_graph`）是**纯函数**：
+同输入同输出。无 I/O、无 model 调用、无随机性。输出直接喂给
+`DagScheduler`；`dag_is_schedulable` 测试断言这个契约成立。
+id 前缀 `skill:<slug>:<node_id>` 防止与宿主 run 的任务图冲突，
+metadata 带 `skill_slug` / `skill_trigger` / `skill_node_id` 记录
+完整 provenance。
+
+### 7. 子 agent 是被约束的，不是被信任的
+
+子 agent 跑的时候有三层独立约束，**全部**用代码强制：
+
+1. **`max_steps`**（默认 8）—— 每个子 agent 的模型调用次数硬上限。
+2. **`ScopeGuard`** —— 每个 `use_tool` action 在调用**前**对照
+   允许路径策略做检查。一个被派去"修 `auth.rs`"的子 agent 不能写
+   `/var/log` 或 `~/.ssh/`。
+3. **`CheckContract`** —— 子 agent 的 `final_answer` 对照一个确定性
+   谓词做验证（`KnowHow` / `Exploratory` / `MustEdit`）。检查
+   **跑两遍**——子 agent 自己一遍，dispatcher 再查一遍。
+
+再加一个 `report_graph_error` action，让子 agent 在发现图本身
+有问题时**把 `GraphError` 冒泡**到主循环。
+
+### 8. Time-for-space（拿错误换正确）
 
 宁可多修小处，不修一次大处。每个执行中抓到的错误都是精度信号
 ——别把它们打包。
@@ -671,15 +812,17 @@ IDE 都懂环境变量。自定义配置格式要 loader、要 schema、要迁�
 这个原则来自用户早期对"打包错误然后一起修"建议的反弹。论点是：
 打包丢失了每个错误编码的具体矛盾信号。
 
-### 3. Local graph repair, never bulk（局部图修复，从不批量）
+### 9. Local graph repair, never bulk（局部图修复，从不批量）
 
 verifier 找到问题时，逐个用子图 scope 内的 patch 修。全图重建是
 显式 opt-in，不是错误路径。
 
 代码上：`LocalRepairer::validate_scope` 拒绝动到 issue scope 外
 节点的 patch。没有"从零重建图"的 API——那是不同层级的不同操作。
+这让完整的执行历史可 checkpoint：每个 repair 都是一步小、可检
+查、可回退的操作。
 
-### 4. Universality lives in the model, structure lives in the graph
+### 10. Universality lives in the model, structure lives in the graph
 （通用性在模型，结构在图）
 
 harness 在领域间是通用的；领域特定判断委托给模型。别把领域
@@ -693,7 +836,7 @@ Task / Other(String)`。具名变体是通用抽象；领域特定种类进
 `NodeKind::TerraformResource`。塞 `Other("terraform_resource")`
 加 metadata 即可；harness 通用地处理它。
 
-### 5. Reviewer needs deterministic backstops（Reviewer 需要确定性 backstops）
+### 11. Reviewer needs deterministic backstops（Reviewer 需要确定性 backstops）
 
 LLM-as-judge 单干不可靠。在信任 model 裁定之前叠多层确定性
 检查。
@@ -704,7 +847,9 @@ LLM-as-judge 单干不可靠。在信任 model 裁定之前叠多层确定性
 fail 覆盖 judge pass（由测试 `deterministic_fail_overrides_judge_pass`
 验证）。
 
-### 6. Scanners are seeds, not the product（Scanner 是种子，不是产品）
+这是上面 #3 的具体实例化——#3 是系统范围版，本条特指 Reviewer。
+
+### 12. Scanners are seeds, not the product（Scanner 是种子，不是产品）
 
 code/data/infra scanner 产出低置信度（≤ 0.6）的起始图。模型才是
 真正的图构建器。别在 scanner 巧妙性上过度投入。
@@ -746,6 +891,38 @@ harness 里的缓解：
 - 分层把高频调用路由到 `flash`（非推理），没这问题
 - JSON 解析器容忍纯文本响应（子 agent 当成 final_answer；其他地方
   作为 `ProposerStep` parse 错误浮出来）
+
+更深的问题——也是 v2.6 tool_calls 迁移重要的原因——是对于
+**reasoning-only 模型**（DeepSeek-v3、MiniMax M3），最终 JSON
+经常在 `reasoning_content` 里而不是 `content`。纯文本 JSON 解析
+在这些模型上必死。`ModelResponse::text_or_reasoning()` 辅助方法
+是核心修复；`tool_calls` 迁移是结构性修复（API 强制结构化输出，
+不管模型选在哪 emit）。
+
+### 边界处协议收窄（v2.6 的权衡）
+
+v2.6 全员 tool_calls 迁移**没有**统一主 agent 和 sub-agent 的
+协议。三层、三种协议、三种不同宽度——见 §5 的完整表格。
+
+代价是真实的：
+
+- **三个解析器，三套测试。** 文本兜底路径在每一层都保留（没有
+  function-calling 支持的模型仍要能跑），所以迁移是加法，不是
+  替换。代码库同时携带 `parse_*_from_tool_calls` 和
+  `parse_*_from_text` 两条路径。
+- **协议越窄，边界处的契约验证越重要。** 子 agent 尤其窄协议
+  （JSON-action，三种 action 类型）；模型如果 emit 这三种之外
+  的 action，会拿到一个结构化的拒绝 + retry 提示。
+- **实时 tool_call 流式是不对称的。** 非流式 `complete()` 路径
+  对每个 tool_call 发一个组装好的 `StreamToolCall`；SSE
+  `complete_stream()` 路径发按片段的 `StreamDelta::ToolCallArgument`
+  事件，前端要按 `index` 组装。前端 `RunView.vue` 现在只消费组装
+  好的形态；按片段的路径是给未来 SSE UX 留的。
+
+收益是代价换来的：在子 agent 层失控的模型不能外泄它的窄契约
+（没法生造新的 "action" 而不被 parser 抓到）；在 skill 层失控
+的模型不能夹带 `GraphPatch`（编译器只收 `Task + DependsOn`）。
+协议越窄，爆炸半径越小。**别统一。**
 
 ### 子 agent 里不嵌套 GraphLoop（还没有）
 

@@ -11,6 +11,32 @@ first if you haven't.
 
 ## Recent changes
 
+- **v2.6 (2026-06-26) — Universal tool_calls migration.** All 7 model layers
+  (Proposer, Decomposer, L1Enricher, L0+ScopeGap Repairer, Verifier L1+
+  graph self-checks, Reviewer, CascadeBacktracker) now declare an OpenAI
+  `tool` schema and prefer `tool_calls` over text-JSON parsing. The
+  trigger was production run db2d993d: a DeepSeek-v3 / MiniMax M3
+  reasoning-only response (empty `content`, JSON in `reasoning_content`)
+  killed the decomposer with `proposer: no '{' in response`. Fix: a
+  `ModelResponse::text_or_reasoning()` helper centralizes the
+  `content` → `reasoning_content` fallback; each layer wraps it in a
+  `parse_*_from_tool_calls(&[ToolCall]) -> Option<T>` → text fallback
+  path. `StreamDelta` gained a `ToolCallArgument` variant for live
+  per-fragment tool_call streaming; `RunEvent::StreamToolCall` is the
+  wire shape. 477 → 606 tests. The main agent and sub-agent still use
+  *different* protocols — see §5 for the deliberate-narrowing story.
+  See `CLAUDE.md` for the 22 core ideas, of which #5, #14, #15, #18, #22
+  capture the relevant sub-story.
+
+- **v2.5 (2026-06-20) — Intake gate is now code-enforced.** `intake.rs`
+  adds `classify_task_clarity` (heuristic: vague EN+ZH starter phrases,
+  short + no verb, single word) and `check_intake_compliance` (rejects
+  non-`ask_user` steps on round 0 for vague tasks). The §1a note
+  "future change could add a deterministic check" is now obsolete —
+  the check exists, runs on every step, and feeds errors back to the
+  model via the fix-it retry path. Mode A vs Mode B is no longer
+  prompt-only.
+
 - **v2.4 (2026-06-18) — Streaming Output & Persistence.** `ModelWithEvents`
   transparently wraps any model — `complete()` calls are routed through SSE
   streaming (`complete_stream()`), forwarding each token as a real-time
@@ -111,13 +137,17 @@ the only thing the rest of the loop sees. There is no recovery from a
 sub-agents will all be working off a misframed plan. Mode B forces the
 clarification step **before** any planning.
 
-Concretely, Mode B is enforced by the proposer's system prompt (the
-"intake" rule): the first `ProposerStep` from a fresh conversation is
-expected to be `AskUser` whenever the task lacks a concrete success
-criterion, references external context the model doesn't have, or is
-otherwise open to multiple readings. The harness does not gate on this
-in code — it relies on the model. (A future change could add a
-deterministic "did you ask?" check on the first round.)
+Concretely, Mode B is enforced by the system prompt **and** by a
+deterministic gate in `intake.rs::check_intake_compliance`: the first
+`ProposerStep` from a fresh conversation is checked against
+`classify_task_clarity(task)`. If the task is Vague (heuristic: vague
+EN+ZH starter phrases, short with no verb, single word) and the step
+isn't `AskUser`, the gate rejects the step with a `HarnessError` that
+feeds back to the model via the fix-it retry path. The system prompt
+teaches Mode A/B too, but prompt-only is not load-bearing — the
+heuristic gate is the second line of defense. The classifier errs on
+the side of letting through (false positive = annoying `ask_user`;
+false negative = wasted run on a graph built from a vague intent).
 
 ---
 
@@ -317,7 +347,29 @@ often than needed. Each layer's cost matches its strategic role.
 
 ## 5. Sub-agent execution
 
-### JSON-action protocol vs native tool_calls
+### Three protocol layers, deliberately different widths
+
+The system uses three different protocols at three different layers. This
+is a deliberate design choice, not an inconsistency. After the v2.6
+universal tool_calls migration (see Recent changes), the picture is:
+
+| Layer | Protocol | Width | Why narrow |
+|---|---|---|---|
+| **Main agent** (Proposer) | OpenAI `tool_calls` (6 step types) | Rich | Orchestration surface — needs flexibility for the model's creative work |
+| **Sub-agent** (in Dispatcher) | Custom JSON-action (`use_tool` / `final_answer` / `report_graph_error`) | Narrow | Constrained exec env (`max_steps=8`, no direct graph access); narrow = easy to verify |
+| **Skill compile** (in `skills::compiler`) | `NodeKind::Task` + `DependsOn` edges only | Narrower still | Skills are cached, replayed, trusted; narrow = safe cache |
+
+The first instinct on encountering this is to **unify** — make the
+sub-agent also use `tool_calls`, make skills emit full `GraphPatch`es.
+Don't. Each narrowing is a defense-in-depth decision: the narrower the
+contract at a boundary, the smaller the blast radius if a model
+misbehaves at that layer. The main agent is the rich one because that's
+where the creative work happens; everything inside it is on rails. If
+a future contributor proposes unifying protocols, the question to ask
+is: **what's the safety guarantee we'd lose?** If there's no good
+answer, keep them split.
+
+### Why the sub-agent uses JSON-action, not native tool_calls
 
 DeepSeek (and OpenAI, Anthropic, etc.) all support native function-calling
 where the model emits structured `tool_calls` in its response and the
@@ -338,8 +390,10 @@ object with `{"action": ..., ...}` in plain message content. Three reasons:
    spreads across multiple structured fields.
 
 The trade-off: we miss out on backend-side optimizations like parallel
-tool calls and tool-result caching. For agent-as-orchestrator, the wins
-in portability + transparency outweigh those.
+tool calls and tool-result caching. For sub-agents — the cheap-to-spawn
+inner loop — this is the right call. The main agent (where orchestration
+work happens) **does** use native `tool_calls`; only the sub-agent
+doesn't.
 
 ### Why the loop is single-tier (no nested GraphLoop)
 
@@ -496,17 +550,22 @@ Layer 2 — model self-check:
     Given (graph, task, conv), is the graph sufficient for the task?
     What's missing / overstated / wrong?
     One model call. Skippable (`Verifier::structural_only()`).
+    After v2.6: declares the `graph_self_check_verdict` tool schema;
+    prefers `tool_calls`, falls back to text JSON.
 
 Layer 3 — L1 sampling:
     Sample N nodes with non-blank L1. For each, fetch L2 via SourceLoader,
     ask model: does L1 still match L2?
     N model calls. Requires a configured loader.
+    After v2.6: declares the `l1_check_verdict` tool schema per node.
 ```
 
 The layers are gated on what's available, not on confidence: structural
 checks always run; L2-comparing checks need a loader; model self-check
 needs a model. A `Verifier::structural_only()` for unit tests bypasses
-the model entirely.
+the model entirely. After v2.6, the model-facing layers (2 and 3) prefer
+OpenAI `tool_calls` with the legacy text-JSON path as a fallback — see
+the Recent changes entry and CLAUDE.md for the full migration story.
 
 ### Why three, not one (just "ask the model")?
 
@@ -739,8 +798,10 @@ entirely and pass values directly.
 
 ## 12. Design principles, expanded
 
-Six principles drive every component. The shortlist is in `README.md`;
-here's the full reasoning.
+Twelve principles drive every component. The shortlist (with TL;DR
+captions) is in `README.md`; here's the full reasoning. The first six
+predate v2.6; the latter six emerged from the post-db2d993d design
+review and the tool_calls migration.
 
 ### 1. Model-agnostic
 
@@ -753,7 +814,108 @@ In code, this means: anywhere you'd write `"gpt-4o"` or `"claude-opus"`,
 you write `cfg.fast_model()` or `cfg.deep_model()` instead. Test code
 that needs a specific model behavior uses a `MockModel` trait impl.
 
-### 2. Time-for-space (拿错误换正确)
+Reasoning-only models (DeepSeek-v3, MiniMax M3) are first-class: every
+layer routes its text-response read through `ModelResponse::text_or_reasoning()`,
+which prefers `content` if non-blank else `reasoning_content`. This was
+the v2.6 fix for the db2d993d production failure.
+
+### 2. The graph is the plan, the schedule, and the audit log
+
+Three different jobs, one data structure. **Plan** — the main agent
+edits the graph as working memory. **Schedule** — `DagScheduler` runs
+Kahn over `DependsOn` edges and produces wave-aligned batches; the
+dispatcher just executes them. **Audit log** — `CheckpointStore`
+snapshots `(round, phase, graph, transcript)` after every meaningful
+change, with a `branches` map for forks. See §2, §8, §13 for the
+mechanics of each.
+
+### 3. Determinism before LLM judgment (defense in depth)
+
+The system has many "trust the model" decisions. **None of them is
+the hard gate.** Every one is checked at least twice — once by a
+deterministic mechanism, once by an LLM-as-judge advisor:
+
+- "Graph is structurally consistent" — `Graph::find_inconsistencies`
+  (deterministic). No LLM advisor (too simple).
+- "Sub-agent's work is right" — `CheckContract` is checked **twice**:
+  once by the sub-agent itself, once re-checked by the dispatcher.
+- "Code compiles" — `PostExecutionValidator` runs `cargo check` / `tsc`
+  and pattern-matches stderr for graph vs task errors.
+- "L1 matches L2" — substring + drift severity (deterministic) +
+  `l1_check_verdict` (advisory; never unilaterally fails).
+- "Final result is acceptable" — deterministic reviewer (graph
+  consistency, sub-agent success, verify-phase status) + `judge_verdict`
+  (advisory; `root_cause` routes to repair).
+
+**A flaky model cannot take down a structurally sound graph.** This is
+the single most important safety property of the system. Any new "trust
+the model" decision must come with a deterministic second-line check,
+or it doesn't ship.
+
+### 4. Narrow protocols at boundaries, rich protocols inside
+
+Main agent uses rich OpenAI `tool_calls` (6 step types, full GraphPatch
+schema). Sub-agent uses narrow custom JSON-action. Skill compile uses
+narrower still (`Task + DependsOn` only). See §5 for the full table.
+The first instinct on encountering this is to **unify** — don't.
+Each narrowing is a defense-in-depth decision; the narrower the
+contract at a boundary, the smaller the blast radius if a model
+misbehaves at that layer. If a future contributor proposes unifying
+protocols, the question to ask is: **what safety guarantee do we
+lose?**
+
+### 5. Three orthogonal memory tiers
+
+| Tier | Storage | Lifetime |
+|---|---|---|
+| Structural (graph) | `Graph` in memory + checkpointed | The run |
+| Prompt (conversation) | `Conversation` in memory | The run |
+| Compiled (skills) | `LocalSkillStorage` (filesystem) | Permanent |
+
+These are **orthogonal**: skills don't leak into the graph, the graph
+doesn't leak into the conversation, the conversation doesn't leak
+into skills. Each is a separate data structure with its own write
+path. New "memory" features should pick a tier and a write path; resist
+the urge to put it everywhere. The integration point is
+`try_match_and_compile_skill` in the Task phase.
+
+### 6. Skills are structural memory, not prompt memory
+
+When a run successfully reaches `ready_for_verify`,
+`skills::capture::capture_skill()` extracts the `propose_patch`
+sequence as a compiled task DAG and stores it locally. The next run
+with a token-Jaccard ≥ 0.25 task **skips the decomposer entirely** and
+uses the compiled skill graph directly. This is structural memory: the
+skill is a graph topology, not a prompt snippet. Successful runs
+compound — the agent gets faster at things it's already done, and the
+speedup is grounded in the same kind of artifact that drives everything
+else (a `Graph`).
+
+The compiler (`skills::compiler::compile_skill_to_task_graph`) is a
+**pure function**: same `Skill` in → same task graph out. No I/O, no
+model calls, no randomness. Output is fed directly into `DagScheduler`;
+the test `dag_is_schedulable` asserts this contract holds. The id prefix
+`skill:<slug>:<node_id>` prevents collision with the host run's task
+graph, and the metadata carries `skill_slug` / `skill_trigger` /
+`skill_node_id` for full provenance.
+
+### 7. Sub-agents are constrained, not trusted
+
+Sub-agents run with three independent constraints, all enforced in code:
+
+1. **`max_steps`** (default 8) — hard cap on model calls per sub-agent.
+2. **`ScopeGuard`** — every `use_tool` action is checked against an
+   allowed-path policy **before** invocation. A sub-agent dispatched to
+   "fix `auth.rs`" literally cannot write to `/var/log` or `~/.ssh/`.
+3. **`CheckContract`** — the sub-agent's `final_answer` is validated
+   against a deterministic predicate (`KnowHow` / `Exploratory` /
+   `MustEdit`). The check runs **twice** — by the sub-agent itself, and
+   re-checked by the dispatcher. Either layer can fail the run.
+
+Plus a `report_graph_error` action that lets a sub-agent **bubble** a
+`GraphError` up to the main loop when it discovers the graph is wrong.
+
+### 8. Time-for-space (拿错误换正确)
 
 Prefer many small precise corrections over fewer bulk corrections. Each
 error caught during execution is a precision signal — don't batch them.
@@ -766,7 +928,7 @@ This principle came from the user pushing back on a "batch errors then
 fix together" suggestion early in design. The argument was: batching
 loses the signal that each error encodes a specific contradiction.
 
-### 3. Local graph repair, never bulk
+### 9. Local graph repair, never bulk
 
 When the verifier finds issues, fix them one at a time with a
 subgraph-scoped patch. Global rebuilds are an explicit opt-in, not an
@@ -775,9 +937,10 @@ error path.
 In code: `LocalRepairer::validate_scope` rejects patches that touch
 nodes outside the issue's scope. There's no "rebuild the graph from
 scratch" API — that would be a different operation handled at a
-different layer.
+different layer. This is what makes the full execution history
+checkpointable: every repair is one small, inspectable, revertible step.
 
-### 4. Universality lives in the model, structure lives in the graph
+### 10. Universality lives in the model, structure lives in the graph
 
 The harness is generic across domains; domain-specific judgment is
 delegated to the model. Don't put domain enums into shared types.
@@ -792,7 +955,7 @@ modify shared types to introduce, say, `NodeKind::TerraformResource`.
 You stuff it in `Other("terraform_resource")` plus metadata; the
 harness handles it generically.
 
-### 5. Reviewer needs deterministic backstops
+### 11. Reviewer needs deterministic backstops
 
 LLM-as-judge is unreliable alone. Layer multiple deterministic checks
 before trusting the model's verdict.
@@ -803,7 +966,11 @@ the LLM judge. The verdict is `passed = det_passed && judge_passed`
 (both must pass), and deterministic fail overrides judge pass (verified
 by test `deterministic_fail_overrides_judge_pass`).
 
-### 6. Scanners are seeds, not the product
+This is the same shape as Principle #3 above — it's the specific
+instantiation for the Reviewer. #3 is the system-wide version; this
+one names the Reviewer.
+
+### 12. Scanners are seeds, not the product
 
 Code/data/infra scanners produce low-confidence starter graphs (≤ 0.6).
 The model is the real graph builder. Don't over-invest in scanner
@@ -853,6 +1020,46 @@ Mitigation in the harness:
   where this isn't a problem
 - The JSON parser tolerates plain-text responses (treats them as final
   answer in SubAgent; surfaces as `ProposerStep` parse error elsewhere)
+
+The deeper issue — and the reason the v2.6 tool_calls migration
+mattered — is that for **reasoning-only models** (DeepSeek-v3, MiniMax
+M3), the final JSON often lives in `reasoning_content` rather than
+`content`. Pure text-JSON parsing dies on these models. The
+`ModelResponse::text_or_reasoning()` helper is the central fix; the
+`tool_calls` migration is the structural fix (the API guarantees
+structured output regardless of where the model chose to emit it).
+
+### Protocol narrowing at boundaries (the v2.6 trade-off)
+
+The v2.6 universal tool_calls migration did *not* unify the main agent
+and sub-agent protocols. Three layers, three protocols, deliberately
+different widths — see §5 for the table.
+
+The cost of this is real:
+
+- **Three parsers, three test suites.** The text-fallback path is
+  preserved on every layer (it still has to work for models without
+  function-calling support), so the migration was additive, not
+  replacement. The codebase carries both the `parse_*_from_tool_calls`
+  and the `parse_*_from_text` paths.
+- **The narrower the protocol, the more the layer relies on contract
+  validation at the boundary.** Sub-agents in particular are
+  narrow-protocol (JSON-action with three action types); a model that
+  emits an action outside those three types gets a structured
+  rejection with a retry hint.
+- **Live tool_call streaming is asymmetric.** The non-streaming
+  `complete()` path emits one assembled `StreamToolCall` per
+  tool_call; the SSE `complete_stream()` path emits per-fragment
+  `StreamDelta::ToolCallArgument` events that the frontend has to
+  assemble by `index`. The frontend in `RunView.vue` only consumes
+  the assembled shape; the per-fragment path is for future SSE UX.
+
+The benefit is what the cost buys you: a model that misbehaves at
+the sub-agent layer can't exfiltrate its narrow contract (no way to
+invent a new "action" without the parser catching it); a model that
+misbehaves at the skill layer can't smuggle a `GraphPatch` (the
+compiler only accepts `Task + DependsOn`). The narrower the contract,
+the smaller the blast radius. Don't unify.
 
 ### No nested GraphLoop in sub-agents (yet)
 
