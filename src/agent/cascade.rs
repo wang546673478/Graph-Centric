@@ -8,7 +8,7 @@
 use crate::context::SourceLoader;
 use crate::error::Result;
 use crate::graph::{Edge, Graph, Node, NodeId, RelationType};
-use crate::model::{Message, Model, ModelRequest};
+use crate::model::{Message, Model, ModelRequest, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -254,15 +254,25 @@ Respond with JSON:
 
         let req = ModelRequest {
             messages: vec![Message::system(prompt)],
-            tools: vec![],
+            tools: vec![cascade_verdict_tool_schema()],
             temperature: self.temperature,
             max_tokens: Some(512),
             stop: vec![],
         };
 
         let resp = self.model.complete(req).await?;
-        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+        // Strategy A: prefer native tool_calls; fall back to text if the
+        // model emitted none; silently PRESERVED on both being unparseable
+        // (preserves prior lenient behavior so a flaky model can't cascade).
+        if let Some(v) = parse_cascade_verdict_from_tool_calls(&resp.tool_calls) {
+            return Ok(v);
+        }
         let content = resp.text_or_reasoning().trim();
+        if content.is_empty() {
+            // No tool_call AND no text — silent Preserved. Was the existing
+            // behavior for fully empty responses (cascade.rs before tool_calls).
+            return Ok(PredecessorVerdict::Preserved);
+        }
 
         let verdict: serde_json::Value = serde_json::from_str(content).unwrap_or(serde_json::json!({
             "verdict": "PRESERVED",
@@ -277,6 +287,46 @@ Respond with JSON:
             "NEEDS_REEXECUTION" => Ok(PredecessorVerdict::NeedsReexecution(rationale)),
             _ => Ok(PredecessorVerdict::Preserved),
         }
+    }
+}
+
+/// Tool schema for the cascade predecessor verdict.
+fn cascade_verdict_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "classify_predecessor_verdict",
+            "description": "Classify whether a predecessor node still satisfies its successor's requirements after the successor was redesigned.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["PRESERVED", "NEEDS_REPAIR", "NEEDS_REEXECUTION"],
+                        "description": "PRESERVED: design and output both still valid. NEEDS_REPAIR: predecessor design is wrong for the new successor (trigger re-planning). NEEDS_REEXECUTION: design is fine but output is stale (trigger re-execution)."
+                    },
+                    "rationale": {
+                        "type": "string",
+                        "description": "One sentence explaining the verdict."
+                    }
+                },
+                "required": ["verdict"]
+            }
+        }
+    })
+}
+
+/// Parse the cascade verdict from a native tool_call. Returns None when
+/// tool_calls is empty or the structured args don't match — caller falls
+/// back to text parsing.
+fn parse_cascade_verdict_from_tool_calls(tool_calls: &[ToolCall]) -> Option<PredecessorVerdict> {
+    let tc = tool_calls.iter().find(|tc| tc.name == "classify_predecessor_verdict")?;
+    let v = tc.arguments.get("verdict").and_then(|x| x.as_str()).unwrap_or("PRESERVED");
+    let rationale = tc.arguments.get("rationale").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    match v {
+        "NEEDS_REPAIR" => Some(PredecessorVerdict::NeedsRepair(rationale)),
+        "NEEDS_REEXECUTION" => Some(PredecessorVerdict::NeedsReexecution(rationale)),
+        _ => Some(PredecessorVerdict::Preserved),
     }
 }
 
@@ -320,6 +370,39 @@ mod tests {
                 tool_calls: vec![],
                 finish_reason: FinishReason::Stop,
                 reasoning_content: None,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    /// Records every request the cascade sends so tests can assert the
+    /// retry-once behavior (strategy A).
+    struct ToolCallModel {
+        verdict: String,
+        calls: std::sync::Mutex<Vec<ModelRequest>>,
+    }
+
+    #[async_trait]
+    impl Model for ToolCallModel {
+        fn name(&self) -> &str {
+            "tool_call_cascade"
+        }
+        async fn complete(&self, req: ModelRequest) -> Result<ModelResponse> {
+            self.calls.lock().unwrap().push(req);
+            // Return a tool_call with the configured verdict — this is the
+            // native structured path we want cascade to take.
+            Ok(ModelResponse {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: vec![crate::model::ToolCall {
+                    id: "call_1".into(),
+                    name: "classify_predecessor_verdict".into(),
+                    arguments: serde_json::json!({
+                        "verdict": self.verdict,
+                        "rationale": "tool_call_path"
+                    }),
+                }],
+                finish_reason: FinishReason::ToolCalls,
                 usage: Usage::default(),
             })
         }
@@ -398,5 +481,51 @@ mod tests {
         assert!(result.preserved.is_empty());
         assert!(result.needs_repair.is_empty());
         assert!(result.needs_reexec.is_empty());
+    }
+
+    // --- tool_calls migration regression tests ----------------------------
+
+    /// When the model returns a tool_call with `verdict: NEEDS_REPAIR`,
+    /// the cascade must route that through the structured path — NOT fall
+    /// back to silently returning Preserved.
+    #[tokio::test]
+    async fn backtrack_uses_tool_call_when_model_emits_one() {
+        let g = make_test_graph();
+        let model = Arc::new(ToolCallModel {
+            verdict: "NEEDS_REPAIR".into(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let cascade = CascadeBacktracker::new(model.clone());
+        let result = cascade
+            .backtrack_from(&NodeId::from("c"), &g, "task", &StubLoader)
+            .await
+            .unwrap();
+
+        // b is the predecessor of c — must be flagged.
+        assert!(
+            result.needs_repair.contains(&NodeId::from("b")),
+            "tool_call NEEDS_REPAIR must surface, not silently fall back to PRESERVED"
+        );
+        assert!(result.preserved.is_empty());
+        // Single round trip — tool_call succeeded first try.
+        assert_eq!(model.calls.lock().unwrap().len(), 1);
+    }
+
+    /// Model returning NEEDS_REEXECUTION via tool_call also routes through
+    /// the structured path.
+    #[tokio::test]
+    async fn backtrack_tool_call_needs_reexec_routes_correctly() {
+        let g = make_test_graph();
+        let model = Arc::new(ToolCallModel {
+            verdict: "NEEDS_REEXECUTION".into(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let cascade = CascadeBacktracker::new(model);
+        let result = cascade
+            .backtrack_from(&NodeId::from("c"), &g, "task", &StubLoader)
+            .await
+            .unwrap();
+
+        assert!(result.needs_reexec.contains(&NodeId::from("b")));
     }
 }

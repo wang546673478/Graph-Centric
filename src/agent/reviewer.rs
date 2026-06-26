@@ -249,7 +249,7 @@ impl Reviewer {
                 Message::system(load_prompt_file("skills/prompts/reviewer.md", SYSTEM_PROMPT_REVIEWER)),
                 Message::user(user_prompt),
             ],
-            tools: Vec::new(),
+            tools: vec![reviewer_verdict_tool_schema()],
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             stop: Vec::new(),
@@ -258,8 +258,13 @@ impl Reviewer {
         debug!(
             content_len = resp.content.len(),
             reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
+            tool_calls = resp.tool_calls.len(),
             "reviewer judge response"
         );
+        // Strategy A: prefer native tool_calls; fall back to text.
+        if let Some(v) = parse_verdict_from_tool_calls(&resp.tool_calls) {
+            return Ok(v);
+        }
         // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
         parse_verdict(resp.text_or_reasoning())
     }
@@ -353,6 +358,77 @@ fn parse_verdict(text: &str) -> Result<JudgeVerdict> {
         .clamp(0.0, 1.0);
 
     Ok(JudgeVerdict {
+        passed,
+        root_cause,
+        detail,
+        confidence,
+    })
+}
+
+/// Tool schema for the reviewer judge verdict. Same wire shape as the
+/// text-fallback path's JSON; enum constraints are advisory (the parser
+/// tolerates missing/invalid values per the legacy default-to-fail rule).
+fn reviewer_verdict_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "judge_verdict",
+            "description": "Decide whether the work satisfactorily addresses the original task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["pass", "fail"],
+                        "description": "pass = task genuinely addressed. fail = concrete shortfall you can name."
+                    },
+                    "root_cause": {
+                        "type": "string",
+                        "enum": ["graph", "task", "scope"],
+                        "description": "Why it failed. graph = relationship graph is wrong. task = sub-agents produced bad work. scope = graph's scope too narrow. Omit (or use null) when verdict=pass."
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "One sentence explaining the verdict."
+                    },
+                    "confidence": {
+                        "type": "number",
+                        "description": "0..1. 0.9+ when you have direct evidence; 0.5 when uncertain."
+                    }
+                },
+                "required": ["verdict"]
+            }
+        }
+    })
+}
+
+/// Parse a JudgeVerdict from a native tool_call. Returns None when
+/// tool_calls is empty or no matching tool_call was emitted.
+fn parse_verdict_from_tool_calls(
+    tool_calls: &[crate::model::ToolCall],
+) -> Option<JudgeVerdict> {
+    let tc = tool_calls.iter().find(|tc| tc.name == "judge_verdict")?;
+    let verdict = tc.arguments.get("verdict").and_then(|v| v.as_str()).unwrap_or("fail");
+    let passed = verdict == "pass";
+    let root_cause = match tc.arguments.get("root_cause").and_then(|v| v.as_str()) {
+        Some("graph") => Some(RootCause::GraphIssue),
+        Some("task") => Some(RootCause::TaskIssue),
+        Some("scope") => Some(RootCause::ScopeIssue),
+        _ => None,
+    };
+    let detail = tc
+        .arguments
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let confidence = tc
+        .arguments
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    Some(JudgeVerdict {
         passed,
         root_cause,
         detail,
@@ -523,6 +599,28 @@ mod tests {
         }
     }
 
+    /// Mock model that returns a configured tool_call on first request.
+    /// Mirrors the cascade test helper for symmetry.
+    struct ToolCallJudgeModel {
+        tool_call: Mutex<Option<crate::model::ToolCall>>,
+    }
+    #[async_trait]
+    impl Model for ToolCallJudgeModel {
+        fn name(&self) -> &str {
+            "tool_call_judge"
+        }
+        async fn complete(&self, _: ModelRequest) -> Result<ModelResponse> {
+            let tc = self.tool_call.lock().unwrap().take();
+            Ok(ModelResponse {
+                content: String::new(),
+                reasoning_content: None,
+                tool_calls: tc.into_iter().collect(),
+                finish_reason: FinishReason::ToolCalls,
+                usage: Usage::default(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn deterministic_only_passes_clean_graph_and_ok_outcome() {
         let r = Reviewer::deterministic_only();
@@ -632,6 +730,34 @@ mod tests {
         let r = Reviewer::with_model(Arc::new(MockModel::new(resp)));
         let result = r.review("task", &clean_graph(), Some(&ok_outcome()), None).await.unwrap();
         assert!(result.passed);
+    }
+
+    /// When the model returns a native tool_call with verdict=fail +
+    /// root_cause=graph, the reviewer must route the failure to graph
+    /// invalid errors (not silently pass via the text-fallback path).
+    #[tokio::test]
+    async fn judge_uses_tool_call_when_model_emits_one() {
+        let tool_call = crate::model::ToolCall {
+            id: "c1".into(),
+            name: "judge_verdict".into(),
+            arguments: serde_json::json!({
+                "verdict": "fail",
+                "root_cause": "graph",
+                "detail": "tool_call path: missing edge",
+                "confidence": 0.9
+            }),
+        };
+        let model = ToolCallJudgeModel { tool_call: Mutex::new(Some(tool_call)) };
+        let r = Reviewer::with_model(Arc::new(model));
+        let result = r
+            .review("task", &clean_graph(), Some(&ok_outcome()), None)
+            .await
+            .unwrap();
+        assert!(!result.passed, "tool_call fail must surface, not silently pass");
+        assert!(matches!(
+            result.root_cause(),
+            Some(crate::agent::RootCause::GraphIssue)
+        ));
     }
 
     #[tokio::test]
