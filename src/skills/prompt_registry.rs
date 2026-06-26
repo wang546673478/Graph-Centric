@@ -147,9 +147,19 @@ This is an UNATTENDED automation loop. There is NO human watching.
             } else { None }
         }));
 
-        // Code editor role
+        // Code editor role — only triggers for actual code-editor sub-agents,
+        // NOT for the main proposer. The main proposer's tool list is the
+        // 6 step kinds (propose_patch / explore / ask_user / ready_for_verify
+        // / block / consult_advisor) — it has NO read_file / edit_file /
+        // write_file. Telling it to use those tools makes the model call
+        // them, the parse step rejects them as "unknown tool_call", and
+        // the run salvages into ask_user. This block used to fire on
+        // any role containing "edit" or "code", which incorrectly hit
+        // the main proposer (whose role is set to "edit" in proposer.rs).
+        // Restrict to a literal "edit" role so only the SubAgent's
+        // sub-edit role gets the file-tools hint.
         reg.add_dynamic("builtin/role-edit", false, Arc::new(|ctx: &PromptContext| {
-            if ctx.role == "edit" || ctx.role.contains("code") || ctx.role.contains("edit") {
+            if ctx.role == "edit" {
                 Some(format!(
                     "## Role: Code Editor\n\
 You are a code modification specialist.\n\
