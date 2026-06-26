@@ -64,6 +64,8 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ---- Config ----
     let cfg = ModelConfig::load()?;
+    let engine_cfg = graph_harness::web::state::EngineConfig::load();
+    let advanced = engine_cfg.advanced.clone();
     info!(
         base_url = %cfg.base_url,
         fast = %cfg.fast,
@@ -147,14 +149,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ReadOnly policy as the main agent, with a max_steps cap on its
     // tool-calling loop. This lets sub-agents `bash cat <file>` to fetch
     // real L2 when their assigned slice involves files.
-    let decomposer = Decomposer::new(decomposer_model);
+    let decomposer = Decomposer::new(decomposer_model)
+        .with_max_tokens(advanced.decomposer_default_max_tokens);
     let subagent = Arc::new(
         SubAgent::new(subagent_model)
             .with_tools(tools.clone())
             .with_policy(Arc::new(ReadOnly))
             .with_tool_cwd(cwd.clone())
             .with_tool_output_cap(6_000)
-            .with_max_steps(6),
+            .with_max_steps(advanced.subagent_max_steps)
+            .with_max_tokens(advanced.subagent_default_max_tokens),
     );
     // 2 subagents in parallel = 1 main + 2 subagents total
     // (per [[project-concurrency-limits]]). Main runs single-threaded

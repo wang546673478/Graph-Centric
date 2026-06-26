@@ -51,6 +51,11 @@ pub struct EngineConfig {
     pub model: ModelTierConfig,
     pub policy: ToolPolicyConfig,
     pub loop_tuning: LoopTuningConfig,
+    /// Advanced tuning — knobs that were once hardcoded in source.
+    /// Defaults match the pre-config behavior; UI exposes them in a
+    /// collapsed "Advanced" section.
+    #[serde(default)]
+    pub advanced: AdvancedTuningConfig,
     /// Named model profiles for quick switching.
     #[serde(default)]
     pub profiles: std::collections::HashMap<String, ModelTierConfig>,
@@ -71,6 +76,82 @@ pub struct EngineConfig {
     /// `GRAPH_HARNESS_SUB_RUN_TIMEOUT_MS` env var.
     #[serde(default = "default_sub_run_timeout_ms")]
     pub sub_run_timeout_ms: u64,
+}
+
+/// v2.7: advanced tuning knobs that were once hardcoded in source.
+/// Every field's default reproduces the pre-config behavior exactly —
+/// no tuning should be required to keep current results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvancedTuningConfig {
+    // Sub-agent control
+    /// Max model calls per sub-agent before it's force-stopped. Default 8.
+    #[serde(default = "default_subagent_max_steps")]
+    pub subagent_max_steps: usize,
+
+    // Proposer explore limits
+    /// Max items per single `explore` step. Default 1.
+    #[serde(default = "default_explore_max_items_per_step")]
+    pub explore_max_items_per_step: usize,
+    /// Max chars per explore-item question. Default 2000.
+    #[serde(default = "default_explore_max_question_chars")]
+    pub explore_max_question_chars: usize,
+
+    // Enricher
+    /// Tail-keep cap for L2 injected into enrichment prompts (chars). Default 12_000.
+    #[serde(default = "default_enricher_l2_char_cap")]
+    pub enricher_l2_char_cap: usize,
+    /// Number of neighbor edges sampled when rendering L1 context. Default 12.
+    #[serde(default = "default_enricher_neighbor_limit")]
+    pub enricher_neighbor_limit: usize,
+    /// Hard cap on L1 confidence when L2 was unavailable. Default 0.6.
+    #[serde(default = "default_enricher_l0_only_confidence_cap")]
+    pub enricher_l0_only_confidence_cap: f64,
+
+    // Skill matching
+    /// Min score to auto-apply a skill. Default 0.25.
+    #[serde(default = "default_skill_match_threshold")]
+    pub skill_match_threshold: f64,
+    /// Weight of trigger-text Jaccard in skill score. Default 0.7.
+    #[serde(default = "default_skill_match_trigger_weight")]
+    pub skill_match_trigger_weight: f64,
+    /// Weight of slug-token Jaccard in skill score. Default 0.3.
+    #[serde(default = "default_skill_match_slug_weight")]
+    pub skill_match_slug_weight: f64,
+
+    // Cascade expansion
+    /// Max L0→L1→L2 expansion depth. Default 3.
+    #[serde(default = "default_cascade_max_expand_depth")]
+    pub cascade_max_expand_depth: usize,
+
+    // Tool timeouts
+    /// PostExecutionValidator default command timeout (ms). Default 300_000 (5 min).
+    #[serde(default = "default_validator_default_timeout_ms")]
+    pub validator_default_timeout_ms: u64,
+    /// Bash tool default per-call timeout (ms). Default 120_000 (2 min).
+    #[serde(default = "default_bash_default_timeout_ms")]
+    pub bash_default_timeout_ms: u64,
+    /// Bash tool max per-call timeout (ms). Default 600_000 (10 min).
+    #[serde(default = "default_bash_max_timeout_ms")]
+    pub bash_max_timeout_ms: u64,
+
+    // Token caps (per-layer defaults)
+    /// Proposer default max_tokens. Default 4096.
+    #[serde(default = "default_proposer_default_max_tokens")]
+    pub proposer_default_max_tokens: usize,
+    /// Decomposer default max_tokens. Default 8192.
+    #[serde(default = "default_decomposer_default_max_tokens")]
+    pub decomposer_default_max_tokens: usize,
+    /// SubAgent default max_tokens. Default 4096.
+    #[serde(default = "default_subagent_default_max_tokens")]
+    pub subagent_default_max_tokens: usize,
+    /// Verifier L2-excerpt cap when sampling L1. Default 4000.
+    #[serde(default = "default_verifier_l2_excerpt_chars")]
+    pub verifier_l2_excerpt_chars: usize,
+
+    // CLI auto-repair loop (used by bin/agent_a demo)
+    /// Max auto-repair cycles in the CLI demo. Default 3.
+    #[serde(default = "default_max_auto_repair_cycles")]
+    pub max_auto_repair_cycles: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,6 +260,51 @@ fn default_convergence_stable_rounds() -> u32 { 3 }
 fn default_max_drilldown_depth() -> usize { 2 }
 fn default_sub_run_timeout_ms() -> u64 { 1_800_000 } // 30 min
 
+// AdvancedTuningConfig defaults — match the pre-config hardcoded values.
+fn default_subagent_max_steps() -> usize { 8 }
+fn default_explore_max_items_per_step() -> usize { 1 }
+fn default_explore_max_question_chars() -> usize { 2000 }
+fn default_enricher_l2_char_cap() -> usize { 12_000 }
+fn default_enricher_neighbor_limit() -> usize { 12 }
+fn default_enricher_l0_only_confidence_cap() -> f64 { 0.6 }
+fn default_skill_match_threshold() -> f64 { 0.25 }
+fn default_skill_match_trigger_weight() -> f64 { 0.7 }
+fn default_skill_match_slug_weight() -> f64 { 0.3 }
+fn default_cascade_max_expand_depth() -> usize { 3 }
+fn default_validator_default_timeout_ms() -> u64 { 300_000 } // 5 min
+fn default_bash_default_timeout_ms() -> u64 { 120_000 } // 2 min
+fn default_bash_max_timeout_ms() -> u64 { 600_000 } // 10 min
+fn default_proposer_default_max_tokens() -> usize { 4096 }
+fn default_decomposer_default_max_tokens() -> usize { 8192 }
+fn default_subagent_default_max_tokens() -> usize { 4096 }
+fn default_verifier_l2_excerpt_chars() -> usize { 4000 }
+fn default_max_auto_repair_cycles() -> usize { 3 }
+
+impl Default for AdvancedTuningConfig {
+    fn default() -> Self {
+        Self {
+            subagent_max_steps: default_subagent_max_steps(),
+            explore_max_items_per_step: default_explore_max_items_per_step(),
+            explore_max_question_chars: default_explore_max_question_chars(),
+            enricher_l2_char_cap: default_enricher_l2_char_cap(),
+            enricher_neighbor_limit: default_enricher_neighbor_limit(),
+            enricher_l0_only_confidence_cap: default_enricher_l0_only_confidence_cap(),
+            skill_match_threshold: default_skill_match_threshold(),
+            skill_match_trigger_weight: default_skill_match_trigger_weight(),
+            skill_match_slug_weight: default_skill_match_slug_weight(),
+            cascade_max_expand_depth: default_cascade_max_expand_depth(),
+            validator_default_timeout_ms: default_validator_default_timeout_ms(),
+            bash_default_timeout_ms: default_bash_default_timeout_ms(),
+            bash_max_timeout_ms: default_bash_max_timeout_ms(),
+            proposer_default_max_tokens: default_proposer_default_max_tokens(),
+            decomposer_default_max_tokens: default_decomposer_default_max_tokens(),
+            subagent_default_max_tokens: default_subagent_default_max_tokens(),
+            verifier_l2_excerpt_chars: default_verifier_l2_excerpt_chars(),
+            max_auto_repair_cycles: default_max_auto_repair_cycles(),
+        }
+    }
+}
+
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
     pub fn load() -> Self {
@@ -266,6 +392,7 @@ impl Default for EngineConfig {
         Self {
             profiles: std::collections::HashMap::new(),
             active_profile: String::new(),
+            advanced: AdvancedTuningConfig::default(),
             max_drilldown_depth: default_max_drilldown_depth(),
             sub_run_timeout_ms: default_sub_run_timeout_ms(),
             model: ModelTierConfig {

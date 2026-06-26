@@ -45,6 +45,9 @@ const DEFAULT_L2_CHAR_CAP: usize = 12_000;
 /// How many immediate neighbors to include in the L0 context block.
 const DEFAULT_NEIGHBOR_LIMIT: usize = 12;
 
+/// Hard cap on L1 confidence when L2 was unavailable (inference-only path).
+const DEFAULT_L0_ONLY_CONFIDENCE_CAP: f64 = 0.6;
+
 #[derive(Clone)]
 pub struct L1Enricher {
     pub model: Arc<dyn Model>,
@@ -53,6 +56,9 @@ pub struct L1Enricher {
     pub max_tokens: Option<usize>,
     pub l2_char_cap: usize,
     pub neighbor_limit: usize,
+    /// Hard cap on L1 confidence when L2 was unavailable (inference-only
+    /// path). Default 0.6, matching the pre-config behavior.
+    pub l0_only_confidence_cap: f64,
 }
 
 impl L1Enricher {
@@ -64,6 +70,7 @@ impl L1Enricher {
             max_tokens: Some(1024),
             l2_char_cap: DEFAULT_L2_CHAR_CAP,
             neighbor_limit: DEFAULT_NEIGHBOR_LIMIT,
+            l0_only_confidence_cap: DEFAULT_L0_ONLY_CONFIDENCE_CAP,
         }
     }
 
@@ -74,6 +81,11 @@ impl L1Enricher {
 
     pub fn with_neighbor_limit(mut self, n: usize) -> Self {
         self.neighbor_limit = n;
+        self
+    }
+
+    pub fn with_l0_only_confidence_cap(mut self, cap: f64) -> Self {
+        self.l0_only_confidence_cap = cap;
         self
     }
 
@@ -239,7 +251,7 @@ impl L1Enricher {
             // Hard-cap confidence on the L0-only path regardless of what
             // the model claimed. The model promised to stay ≤ 0.6 but we
             // enforce it server-side as the source of truth.
-            desc.confidence = desc.confidence.min(0.6);
+            desc.confidence = desc.confidence.min(self.l0_only_confidence_cap);
         }
         Ok(desc)
     }

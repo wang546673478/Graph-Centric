@@ -5028,7 +5028,7 @@ mod tests {
         ];
         for s in &steps {
             let serialized = render_step_as_json(s);
-            let parsed = crate::agent::proposer::parse_step(&serialized).unwrap();
+            let parsed = crate::agent::proposer::parse_step(&serialized, 1, 2000).unwrap();
             assert_eq!(parsed.kind(), s.kind());
         }
     }

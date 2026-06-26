@@ -189,6 +189,10 @@ pub struct GraphProposer {
     /// step routes its question to this model. When None, consult_advisor
     /// degrades gracefully (a hint is injected, no crash).
     pub advisor: Option<Arc<dyn Model>>,
+    /// Max items per `explore` step. Default 1 — see `MAX_EXPLORE_ITEMS_PER_STEP`.
+    pub max_explore_items_per_step: usize,
+    /// Max chars per explore-item question. Default 2000.
+    pub max_explore_question_chars: usize,
 }
 
 impl GraphProposer {
@@ -205,6 +209,8 @@ impl GraphProposer {
             temperature: 0.2,
             max_tokens: Some(32768),
             advisor: None,
+            max_explore_items_per_step: MAX_EXPLORE_ITEMS_PER_STEP,
+            max_explore_question_chars: MAX_EXPLORE_QUESTION_CHARS,
         }
     }
 
@@ -224,6 +230,18 @@ impl GraphProposer {
     /// higher if the model truncates large payloads mid-string.
     pub fn with_max_tokens(mut self, n: usize) -> Self {
         self.max_tokens = Some(n);
+        self
+    }
+
+    /// Override the per-step explore-items cap. Default 1.
+    pub fn with_max_explore_items(mut self, n: usize) -> Self {
+        self.max_explore_items_per_step = n;
+        self
+    }
+
+    /// Override the per-item explore-question char cap. Default 2000.
+    pub fn with_max_explore_question_chars(mut self, n: usize) -> Self {
+        self.max_explore_question_chars = n;
         self
     }
 
@@ -474,7 +492,7 @@ regular Task nodes.");
                     "proposer: empty response — model returned neither tool_calls, content, nor reasoning_content"
                 ));
             }
-            parse_step(parse_text)?
+            parse_step(parse_text, self.max_explore_items_per_step, self.max_explore_question_chars)?
         };
 
         // Layer 3: post-Explore commit gate. After an Explore step the
@@ -659,7 +677,7 @@ Respond with JSON:
         };
 
         let resp = self.model.complete(req).await?;
-        let step = match parse_step(&resp.content) {
+        let step = match parse_step(&resp.content, self.max_explore_items_per_step, self.max_explore_question_chars) {
             Ok(s) => s,
             Err(e) => {
                 // Salvage: model returned prose instead of JSON.
@@ -1122,7 +1140,11 @@ fn parse_step_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Result<P
     }
 }
 
-pub fn parse_step(text: &str) -> Result<ProposerStep> {
+pub fn parse_step(
+    text: &str,
+    max_explore_items: usize,
+    max_explore_question_chars: usize,
+) -> Result<ProposerStep> {
     let cleaned = extract_json_block(text)?;
     let value: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
         HarnessError::model(format!(
@@ -1219,12 +1241,12 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                 // on a 6-item step in production 2026-06-06). The
                 // fix-it retry path surfaces this back to the model,
                 // which splits into two `Explore` steps.
-                if arr.len() > MAX_EXPLORE_ITEMS_PER_STEP {
+                if arr.len() > max_explore_items {
                     return Err(HarnessError::model(format!(
                         "proposer: explore items[] has {} entries; the cap is \
                          {}. Split into two `Explore` steps with fewer items each.",
                         arr.len(),
-                        MAX_EXPLORE_ITEMS_PER_STEP
+                        max_explore_items
                     )));
                 }
                 let mut out = Vec::with_capacity(arr.len());
@@ -1249,13 +1271,13 @@ pub fn parse_step(text: &str) -> Result<ProposerStep> {
                     // JSON well-formedness — quote escaping, line
                     // continuation, etc. Split into multiple focused
                     // items instead.
-                    if question.len() > MAX_EXPLORE_QUESTION_CHARS {
+                    if question.len() > max_explore_question_chars {
                         return Err(HarnessError::model(format!(
                             "proposer: explore items[{i}] question is {} chars; \
                              cap is {}. Split the question into multiple \
                              `Explore` items, each with a focused question.",
                             question.len(),
-                            MAX_EXPLORE_QUESTION_CHARS
+                            max_explore_question_chars
                         )));
                     }
                     out.push(ExploreItem { scope, question });
@@ -1954,7 +1976,7 @@ mod tests {
     #[test]
     fn parse_step_ask_user() {
         let s = r#"{"step":"ask_user","question":"How many users?","rationale":"need scale"}"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::AskUser { question, options: _, rationale } => {
                 assert_eq!(question, "How many users?");
                 assert_eq!(rationale, "need scale");
@@ -1966,7 +1988,7 @@ mod tests {
     #[test]
     fn parse_step_call_tool() {
         let s = r#"{"step":"call_tool","tool":"bash","args":{"command":"ls"},"rationale":"see files"}"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::CallTool { tool, args, .. } => {
                 assert_eq!(tool, "bash");
                 assert_eq!(args.get("command").unwrap().as_str(), Some("ls"));
@@ -1978,7 +2000,7 @@ mod tests {
     #[test]
     fn parse_step_consult_advisor() {
         let s = r#"{"step":"consult_advisor","question":"which algo?","context":"sorting 1M items","rationale":"unsure"}"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::ConsultAdvisor { question, context, .. } => {
                 assert_eq!(question, "which algo?");
                 assert_eq!(context, "sorting 1M items");
@@ -2068,7 +2090,7 @@ mod tests {
           },
           "rationale":"new info from user"
         }"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::ProposePatch { patch, .. } => {
                 assert_eq!(patch.add_nodes.len(), 1);
                 assert_eq!(patch.add_nodes[0].id.as_str(), "u");
@@ -2103,6 +2125,8 @@ mod tests {
         // changes, this fails.
         let s = parse_step(
             r#"{"step":"block","reason":"need credential","needed_from_user":"which key?","rationale":"I tried"}"#,
+            1,
+            2000,
         )
         .unwrap();
         match s {
@@ -2138,6 +2162,8 @@ mod tests {
         // this fails.
         let s = parse_step(
             r#"{"step":"explore","items":[{"scope":"src/agent/","question":"what's the orchestrator pattern?"}],"rationale":"seen dir, not read files"}"#,
+            1,
+            2000,
         )
         .unwrap();
         match s {
@@ -2158,6 +2184,8 @@ mod tests {
         // parse, with a single-item vec.
         let s = parse_step(
             r#"{"step":"explore","scope":"src/agent/","question":"what's the orchestrator pattern?","rationale":"r"}"#,
+            1,
+            2000,
         )
         .unwrap();
         match s {
@@ -2182,6 +2210,8 @@ mod tests {
                 {"scope":"src/agent/","question":"what's the orchestrator?"},
                 {"scope":"src/web/","question":"what's the web entrypoint?"}
             ],"rationale":"two scopes"}"#,
+            1,
+            2000,
         );
         let err = r.unwrap_err();
         let msg = format!("{err:?}");
@@ -2193,17 +2223,23 @@ mod tests {
     fn explore_step_rejects_empty_items_or_empty_item_fields() {
         // No items at all → fail (the dispatcher would no-op).
         assert!(parse_step(
-            r#"{"step":"explore","items":[],"rationale":"r"}"#
+            r#"{"step":"explore","items":[],"rationale":"r"}"#,
+            1,
+            2000,
         )
         .is_err());
         // An item with empty scope → fail.
         assert!(parse_step(
-            r#"{"step":"explore","items":[{"scope":"","question":"x"}],"rationale":"r"}"#
+            r#"{"step":"explore","items":[{"scope":"","question":"x"}],"rationale":"r"}"#,
+            1,
+            2000,
         )
         .is_err());
         // An item with empty question → fail.
         assert!(parse_step(
-            r#"{"step":"explore","items":[{"scope":"x","question":""}],"rationale":"r"}"#
+            r#"{"step":"explore","items":[{"scope":"x","question":""}],"rationale":"r"}"#,
+            1,
+            2000,
         )
         .is_err());
     }
@@ -2218,7 +2254,7 @@ mod tests {
             "reason":""
           }
         }"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::ProposePatch { patch, .. } => match &patch.add_nodes[0].kind {
                 NodeKind::Other(name) => assert_eq!(name, "BoardMeeting"),
                 other => panic!("expected NodeKind::Other, got {other:?}"),
@@ -2237,7 +2273,7 @@ mod tests {
             "add_edges":[{"source":"a","target":"b","relation":"SoftCoupling","confidence":0.5,"evidence":""}]
           }
         }"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::ProposePatch { patch, .. } => {
                 match &patch.add_edges[0].relation {
                     RelationType::Other(s) => assert_eq!(s, "SoftCoupling"),
@@ -2264,7 +2300,7 @@ mod tests {
             "add_edges":[{"source":"start","target":"mid","relation":"LeadsTo","confidence":0.9,"evidence":""}]
           }
         }"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::ProposePatch { patch, .. } => {
                 assert_eq!(
                     patch.add_edges[0].relation,
@@ -2283,7 +2319,7 @@ mod tests {
     #[test]
     fn parse_step_ready_for_verify_minimal() {
         let s = r#"{"step":"ready_for_verify"}"#;
-        match parse_step(s).unwrap() {
+        match parse_step(s, 1, 2000).unwrap() {
             ProposerStep::ReadyForVerify { rationale } => assert!(rationale.is_empty()),
             other => panic!("expected ReadyForVerify, got {other:?}"),
         }
@@ -2292,21 +2328,21 @@ mod tests {
     #[test]
     fn parse_step_missing_step_field_errors() {
         let s = r#"{"foo":"bar"}"#;
-        let err = parse_step(s).unwrap_err();
+        let err = parse_step(s, 1, 2000).unwrap_err();
         assert!(format!("{err}").contains("missing 'step'"));
     }
 
     #[test]
     fn parse_step_unknown_step_errors() {
         let s = r#"{"step":"refactor_universe"}"#;
-        let err = parse_step(s).unwrap_err();
+        let err = parse_step(s, 1, 2000).unwrap_err();
         assert!(format!("{err}").contains("unknown step"));
     }
 
     #[test]
     fn parse_step_malformed_json_errors() {
         let s = "not even JSON here";
-        let err = parse_step(s).unwrap_err();
+        let err = parse_step(s, 1, 2000).unwrap_err();
         // Either no `{` or invalid JSON — both are acceptable here.
         assert!(format!("{err}").to_lowercase().contains("json")
             || format!("{err}").contains("'{'"));

@@ -488,6 +488,9 @@ pub async fn drive_run(
     // which is why the main agent could call bash directly
     // and got stuck in `ls` loops. Splitting the registries
     // is the root fix.
+    // v2.7: read advanced tuning knobs from config so the UI Settings page
+    // can override them without code changes.
+    let advanced = state.config.engine.advanced.clone();
     let main_tool_registry = Arc::new(ToolRegistry::new());
     let subagent_tool_registry = Arc::new({
         let mut reg = ToolRegistry::new();
@@ -515,7 +518,10 @@ pub async fn drive_run(
         main_tool_registry.clone(),
         Some(state.skills.clone()),
     )
-    .with_prompt_registry(prompt_registry.clone());
+    .with_prompt_registry(prompt_registry.clone())
+    .with_max_tokens(advanced.proposer_default_max_tokens)
+    .with_max_explore_items(advanced.explore_max_items_per_step)
+    .with_max_explore_question_chars(advanced.explore_max_question_chars);
 
     // Optional advisor backend (consult_advisor). Wrapped so its output
     // streams to the UI under the "advisor" label.
@@ -529,7 +535,10 @@ pub async fn drive_run(
     let verifier = Verifier::with_model(fast_model.clone());
     let loader: Arc<dyn crate::context::SourceLoader> =
         Arc::new(crate::context::NullSourceLoader);
-    let enricher = L1Enricher::new(deep_model.clone(), loader.clone());
+    let enricher = L1Enricher::new(deep_model.clone(), loader.clone())
+        .with_l2_char_cap(advanced.enricher_l2_char_cap)
+        .with_neighbor_limit(advanced.enricher_neighbor_limit)
+        .with_l0_only_confidence_cap(advanced.enricher_l0_only_confidence_cap);
     let repairer = LocalRepairer::new(deep_model.clone()).with_l1_enricher(enricher.clone());
 
     // Phase 3 — Decomposer + Dispatcher + SubAgent.
@@ -538,7 +547,9 @@ pub async fn drive_run(
     // the FULL tool registry — it actually executes the
     // sub-tasks. The main agent gets the empty one (see
     // `main_tool_registry` above).
-    let decomposer = Decomposer::new(deep_model.clone());
+    let advanced = state.config.engine.advanced.clone();
+    let decomposer = Decomposer::new(deep_model.clone())
+        .with_max_tokens(advanced.decomposer_default_max_tokens);
     let subagent = Arc::new(
         SubAgent::new(fast_model.clone())
             .with_tools(subagent_tool_registry.clone())
@@ -546,12 +557,14 @@ pub async fn drive_run(
             .with_prompt_registry(prompt_registry)
             .with_tool_cwd(state.config.project_root.clone())
             .with_tool_output_cap(6_000)
-            .with_max_steps(usize::MAX),
+            .with_max_steps(advanced.subagent_max_steps)
+            .with_max_tokens(advanced.subagent_default_max_tokens),
     );
     // 2 subagents in parallel = 1 main + 2 subagents total
     // (per [[project-concurrency-limits]]). Main runs single-threaded
     // as the orchestrator; the pool below caps subagent fan-out.
-    let dispatcher = Dispatcher::new(subagent).with_max_concurrent(2);
+    let dispatcher = Dispatcher::new(subagent)
+        .with_max_concurrent(state.config.engine.policy.max_concurrent_subagents);
 
     // Phase 4 — Reviewer + PostExecutionValidator.
     let reviewer = Reviewer::with_model(deep_model.clone());
