@@ -19,7 +19,7 @@ cargo build --bin serve
 cargo run --bin serve
 
 # Tests
-cargo test --lib                    # ~477 tests
+cargo test --lib                    # ~606 tests (post tool_calls migration)
 cargo test --lib skills::matcher::  # skill matching tests only
 
 # Frontend
@@ -37,14 +37,21 @@ src/
 ├── agent/           # Core loop: GraphLoop, Proposer, Verifier, Reviewer,
 │   │                #   Decomposer, Dispatcher, SubAgent, CascadeBacktracker
 │   ├── proposer.rs  #   Model-driven step engine (ask_user/propose_patch/explore/...)
+│   ├── decomposer.rs#   World graph → task DAG via emit_task_decomposition tool
+│   ├── enricher.rs  #   L2 → L1 via write_l1_description tool
+│   ├── repairer.rs  #   Per-issue GraphPatch via propose_repair_patch tool
+│   ├── verifier.rs  #   L1 drift + graph self-check via l1_check_verdict /
+│   │                #     graph_self_check_verdict tools
+│   ├── reviewer.rs  #   Final review via judge_verdict tool
+│   ├── cascade.rs   #   Cascade backtracking via classify_predecessor_verdict tool
 │   ├── graph_loop.rs#   FSM: Graph → Task → Review → Done
-│   ├── cascade.rs   #   Cascade backtracking on sub-agent failure
 │   └── subagent.rs  #   Tool-calling sub-agent (JSON-action protocol)
 ├── graph/           # L0/L1/L2 data model: Node, Edge, Graph, GraphPatch
 ├── model/           # Model trait + OpenAI-compatible HTTP client
-│   ├── mod.rs       #   Model trait, StreamDelta, ModelResponse
-│   ├── openai_compat.rs  # SSE streaming + retry logic
-│   └── streaming.rs #   ModelWithEvents wrapper
+│   ├── mod.rs       #   Model trait, StreamDelta, ModelResponse,
+│   │                #   ModelResponse::text_or_reasoning() helper
+│   ├── openai_compat.rs  # SSE streaming + tool_call fragment forwarding
+│   └── streaming.rs #   ModelWithEvents wrapper (forwards StreamDelta to RunEvent)
 ├── skills/          # Skill capture & reuse
 │   ├── matcher.rs   #   Token-based skill scoring (Jaccard)
 │   ├── compiler.rs  #   Skill → task DAG compiler
@@ -56,6 +63,7 @@ src/
 ├── web/             # axum HTTP/WS server
 │   ├── api_runs.rs  #   /api/runs/* + drive_run (the main run driver)
 │   ├── ws.rs        #   WebSocket handler (/ws/runs/:id)
+│   ├── events.rs    #   RunEvent enum (StreamChunk / StreamToolCall / StreamEnd / ...)
 │   ├── heartbeat.rs #   Self-improving loop across process lifetimes
 │   ├── persistence.rs # Run persistence (data/runs/<id>/)
 │   ├── checkpoint.rs  # CheckpointStore + branching
@@ -75,7 +83,7 @@ src/
 
 4. **Per-issue repair, never bulk**: `LocalRepairer` fixes one `VerifyIssue` at a time.
 
-5. **Native tool_calls preferred**: Proposer prefers structured `tool_calls` (no JSON parsing errors). Falls back to `parse_step()` for models without function-calling.
+5. **Native tool_calls everywhere**: All 7 model layers (Proposer, Decomposer, L1Enricher, L0+ScopeGapRepairer, Verifier L1+graph self-checks, Reviewer, CascadeBacktracker) declare an OpenAI `tool` schema and prefer `tool_calls` over text-JSON parsing. Each layer's `parse_*_from_tool_calls()` returns `Option<T>`; on `None` the caller falls through to the text fallback. This is the only way to robustly handle DeepSeek / MiniMax M3 reasoning-only responses (where `content` is empty and the final JSON is in `reasoning_content`). See "Tool calls migration" below for the per-layer pattern.
 
 6. **Skill auto-matching**: When a task matches a stored skill (Jaccard token overlap ≥ 0.25), the skill's compiled task DAG substitutes the decomposer output in the Task phase. Controlled by `auto_apply_skills` (default: true).
 
@@ -85,12 +93,69 @@ src/
 
 ## JSON parsing robustness
 
-`extract_json_block()` in proposer.rs handles model responses that mix thinking/prose with JSON:
+`extract_json_block()` in proposer.rs is now the **text-fallback path**, not the primary parser. It handles model responses that mix thinking/prose with JSON:
 - Strips `<think>...</think>` blocks (DeepSeek reasoning)
 - Strips markdown code fences (` ```json ... ``` `)
 - Finds ALL outermost `{...}` blocks (brace depth 0)
 - Tries each candidate right-to-left, returns first valid JSON
 - Works with or without thinking, with or without nested JSON examples in prose
+
+The primary path is `parse_*_from_tool_calls()` on each layer (see "Tool calls migration"). If a model supports function calling, `tool_calls` carries the structured response and the text path is never reached.
+
+## Tool calls migration
+
+Every model layer follows the same pattern. New layers being added should copy this — **don't add a layer that only does text-JSON parsing**.
+
+```rust
+// In the layer's call site:
+let req = ModelRequest {
+    messages: vec![/* system + user prompt */],
+    tools: vec![my_layer_tool_schema()],   // ← declare the schema
+    temperature: /* ... */, max_tokens: /* ... */, stop: vec![],
+};
+let resp = self.model.complete(req).await?;
+
+// Strategy A: prefer native tool_calls; fall back to text.
+if let Some(v) = parse_my_layer_from_tool_calls(&resp.tool_calls) {
+    return Ok(v);
+}
+// Reasoning-model fallback (DeepSeek / M3): see ModelResponse::text_or_reasoning.
+let parse_text = resp.text_or_reasoning();
+if parse_text.trim().is_empty() {
+    return Err(HarnessError::model("my_layer: empty response — ...".into()));
+}
+parse_my_layer_from_text(parse_text)
+```
+
+Three pieces per layer (~50 LOC each):
+1. `*_tool_schema()` — `serde_json::json!({...})` with the function name, description, and parameter schema.
+2. `parse_*_from_tool_calls(&[ToolCall]) -> Option<T>` — `None` on missing tool_call or missing required field → caller falls back.
+3. The existing `parse_*_from_text()` function — kept as the fallback, unchanged.
+
+**Each layer's `*_tool_schema()` function is the source of truth for the wire shape.** Reuse the proposer's `propose_patch` schema for any layer that produces a `GraphPatch` (repairer, future replanner) to keep the wire shape consistent.
+
+### Per-layer tool names (canonical reference)
+
+| Layer | Tool name | Failure semantics on parse fail |
+|---|---|---|
+| Proposer | `propose_patch` / `explore` / `ask_user` / `ready_for_verify` / `block` / `consult_advisor` | retry 1x (existing `next_step_with_retry`) |
+| Decomposer | `emit_task_decomposition` | clear "empty response" error |
+| L1 Enricher | `write_l1_description` | existing `parse_l1_description` behavior |
+| L0 Repairer + ScopeGap | `propose_repair_patch` | existing `parse_json` behavior |
+| Verifier L1 self-check | `l1_check_verdict` | `continue` (silently skip node) |
+| Verifier graph self-check | `graph_self_check_verdict` | `return (empty, 0.5)` (no model opinion) |
+| Reviewer | `judge_verdict` | default-fail |
+| Cascade probe | `classify_predecessor_verdict` | silent `Preserved` |
+
+The "failure semantics" column matters: flaky models in the middle of a run shouldn't take the whole run down. Migration is **additive** — the text fallback still exists for every layer, and each layer preserves its pre-migration failure semantics.
+
+### Streaming for tool_calls (frontend)
+
+`StreamDelta` has a `ToolCallArgument` variant carrying `(index, id, name, arguments_fragment)` per OpenAI's `delta.tool_calls[i].function.arguments` shape. `openai_compat.rs::complete_stream` forwards each fragment as it arrives; the non-streaming `complete()` path emits one assembled variant per tool_call. The wire event is `RunEvent::StreamToolCall` with `type: "stream_tool_call"`, which the frontend in `RunView.vue` can render as "agent is calling X with…" in real time.
+
+### `ModelResponse::text_or_reasoning()` helper
+
+Reasoning-only models (DeepSeek-v3, MiniMax M3) return an empty `content` field and put the final JSON in `reasoning_content`. This helper centralizes the fallback: returns `content` if non-blank, else `reasoning_content`, else `""`. **Use it everywhere a layer reads the model's text response** — direct field access on `resp.content` is a regression risk. db2d993d's root cause was exactly this.
 
 ## HeartBeat state machine
 
@@ -109,10 +174,11 @@ Round lifecycle:
 
 ## Common issues & fixes
 
-- **"no '{' in response"**: model returned plain text without JSON. Fixed by native tool_calls + robust `extract_json_block`. If it happens on a model without tool_calls support, the response likely has thinking content; check the model's raw output.
-- **"fix-it retry did not converge"**: both the initial attempt AND the retry failed to parse. Usually a deeper issue (model refuses to output JSON at all).
+- **"no '{' in response"** / **"decomposer failed: model: proposer: no '{' in response"**: pre-tool_calls symptom of a reasoning-only model response. As of the tool_calls migration, the 7 model layers all prefer `tool_calls` first and only fall back to text parsing on `None`. If you still see this error, it means: (a) a new layer was added that doesn't follow the tool_calls pattern (see "Tool calls migration"); (b) the model genuinely doesn't support function calling — check the backend's `tools` support; (c) the prompt is asking the model to refuse / use a different tool name. The error should now be **rare** rather than the default failure mode. The fix when it does happen is: declare a `*_tool_schema()` for the affected layer, write a `parse_*_from_tool_calls()`, and replace the direct `resp.content` access with `resp.text_or_reasoning()`.
+- **"fix-it retry did not converge"** (proposer only): both the initial attempt AND the retry failed to parse. The retry path is in `next_step_with_retry`. If this happens often, the proposer tool schema's `description` field may be unclear — model is calling the right tool with garbage args. Tighten the description and add an `enum` constraint where possible.
 - **Server won't bind**: `serve.exe` from a previous run may still be holding port 8080. `Stop-Process -Name serve -Force`.
 - **Heartbeat stopped**: check `.graph_harness_heartbeat.json`. If `current_run_id` points to a zombie, restart the server — the startup logic detects and replaces it.
+- **A new model layer is added without tool_calls support**: regression. Add a `*_tool_schema()` + `parse_*_from_tool_calls()` per the "Tool calls migration" section. Direct `resp.content` access is the regression risk; route through `text_or_reasoning()` even on the text path.
 
 ## When adding new features
 
@@ -121,3 +187,4 @@ Round lifecycle:
 - New `LoopTuningConfig` fields: add `#[serde(default = "...")]` + update `EngineConfig::default()`.
 - New web routes: add to `src/web/mod.rs` router.
 - New prompt blocks: register in `PromptRegistry::new()` and add to `compose()` ordering.
+- **New model layer that calls `self.model.complete(...)`**: must declare a `*_tool_schema()`, add a `parse_*_from_tool_calls()` returning `Option<T>`, and use the `text_or_reasoning()` helper for the text-fallback path. Do NOT add a layer that only does text-JSON parsing — that's the regression we're protecting against. See "Tool calls migration" above.
