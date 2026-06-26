@@ -71,10 +71,12 @@ just different triggers.
 ## What this is
 
 - **Generic LLM agent orchestrator** in pure Rust. ~15K LOC, single binary,
-  zero runtime dependencies, 310 unit/integration tests.
+  zero runtime dependencies, 606 unit/integration tests.
 - **Model-agnostic.** Speaks OpenAI-compatible HTTP — works with DeepSeek,
   vLLM, Ollama, OpenAI, OpenRouter, Anthropic-via-proxy, or anything that
-  serves `/v1/chat/completions`.
+  serves `/v1/chat/completions`. Reasoning-only models (DeepSeek-v3,
+  MiniMax M3) are first-class: every layer has a `text_or_reasoning()`
+  fallback that reads from `reasoning_content` when `content` is empty.
 - **Three-layer relationship graph** (L0 structure / L1 semantics / L2 data)
   as the shared substrate between the main agent, sub-agents, and the user.
 - **State machine with explicit phase transitions**, not a free-form ReAct
@@ -146,6 +148,137 @@ L0 patches trigger L1 re-enrichment for the new nodes. L1 drift relative to
 L2 triggers re-enrichment of the drifted node. L2 changes (e.g., sub-agent
 edits a file) eventually trigger L0 + L1 updates.
 
+## Architecture philosophy
+
+The Core Idea section above is the **what** — plan, dispatch, review. This
+section is the **why**: the design choices that shape every component, and
+the trade-offs they accept. If you're contributing, these are the decisions
+to preserve.
+
+### The graph is the plan, the schedule, and the audit log
+
+Three different jobs, all held by the same data structure:
+
+- **Plan** — the main agent edits the graph as its working memory. There is
+  no separate "scratchpad" or hidden state; every intent the model has is
+  a `GraphPatch`.
+- **Schedule** — `DagScheduler` runs Kahn's algorithm over the `DependsOn`
+  edges and produces **wave-aligned batches**. Two independent tasks
+  automatically land in the same wave; a dependent task waits for its
+  prerequisites' wave to complete. The graph's structure determines the
+  concurrency — the dispatcher doesn't invent scheduling, it executes
+  what the graph already encodes.
+- **Audit log** — `CheckpointStore` snapshots `(round, phase, graph, transcript)`
+  after every meaningful change, with a `branches` map for forks. You can
+  rewind, replay, or branch an exploratory variant from any historical
+  state. Combined with `Graph::version` (bumped on every patch), every
+  step is traceable.
+
+### Determinism before LLM judgment (defense in depth)
+
+The system has many "trust the model" decisions. None of them is the
+**hard gate**. Every one is checked at least twice — once by a
+deterministic mechanism, once by an LLM-as-judge advisor:
+
+| "Trust the model" decision | Deterministic second line | LLM advisor |
+|---|---|---|
+| "Graph is structurally consistent" | `Graph::find_inconsistencies` (dangling edges, cycles, duplicates) | (none — too simple for LLM) |
+| "Sub-agent's work is right" | `CheckContract` (`KnowHow` mention, `Exploratory` cap, `MustEdit` write-call count) — checked **twice**: by the sub-agent and re-checked by the dispatcher | (none) |
+| "Code compiles" | `PostExecutionValidator` runs `cargo check`/`tsc` and pattern-matches stderr for graph vs task errors | (none) |
+| "L1 matches L2" | substring comparison + drift severity | `l1_check_verdict` (advisory; never unilaterally fails) |
+| "Sub-agent's claim of done is honest" | dispatcher re-evaluates the contract after the sub-agent returns | (none) |
+| "Final result is acceptable" | deterministic reviewer (graph consistency, sub-agent success, verify-phase status) | `judge_verdict` (advisory; root_cause routes to repair) |
+
+**A flaky model cannot take down a structurally sound graph.** This is the
+single most important safety property of the system. Any new "trust the
+model" decision must come with a deterministic second-line check, or it
+doesn't ship.
+
+### Narrow protocols at boundaries, rich protocols inside
+
+A pattern that recurs across the codebase: **the deeper into the system,
+the narrower the protocol.** This is a deliberate design choice, not an
+oversight.
+
+| Layer | Protocol | Width | Why narrow |
+|---|---|---|---|
+| Main agent | OpenAI `tool_calls` (6 step types) | Rich | Orchestration needs flexibility |
+| Sub-agent | Custom JSON-action (`use_tool` / `final_answer` / `report_graph_error`) | Narrow | Constrained exec env (`max_steps=8`, no direct graph access); narrow = easy to verify |
+| Skill compile | `NodeKind::Task` + `DependsOn` only | Narrower | Skills are cached, replayed, trusted; narrow = safe cache |
+
+The first instinct on encountering this is to **unify** — make the sub-agent
+also use `tool_calls`, make skills emit full `GraphPatch`es. Don't. Each
+narrowing is a defense-in-depth decision: the narrower the contract at a
+boundary, the smaller the blast radius if a model misbehaves at that layer.
+If a future contributor proposes unifying protocols across boundaries, the
+question to ask is: **what safety guarantee do we lose?**
+
+### Three orthogonal memory tiers
+
+The system has three distinct, complementary "memories":
+
+| Tier | Storage | Lifetime | What's in it |
+|---|---|---|---|
+| **Structural** (graph) | `Graph` in memory + checkpointed | The run | L0 nodes/edges + L1 descriptions — the orchestrator's plan |
+| **Prompt** (conversation) | `Conversation` in memory | The run | LLM chat history — what the model has seen, including `ask_user` exchanges, verifier rejections, repair attempts |
+| **Compiled** (skills) | `LocalSkillStorage` (filesystem) | Permanent | Extracted task DAGs that worked, indexed by Jaccard-token similarity |
+
+These are **orthogonal**: skills don't leak into the graph, the graph doesn't
+leak into the conversation, the conversation doesn't leak into skills. New
+"memory" features should pick a tier and a write path; resist the urge to
+put it everywhere.
+
+### Skills are structural memory, not prompt memory
+
+When a run successfully reaches `ready_for_verify`, the orchestrator extracts
+the `propose_patch` sequence as a compiled task DAG and stores it locally
+(`LocalSkillStorage`). The next run with a token-Jaccard ≥ 0.25 task
+**skips the decomposer entirely** and uses the compiled skill graph directly.
+This is structural memory: the skill is a graph topology, not a prompt
+snippet. Successful runs compound — the agent gets faster at things it's
+already done, and the speedup is grounded in the same kind of artifact
+that drives everything else (a `Graph`).
+
+### Sub-agents are constrained, not trusted
+
+Sub-agents run with three independent constraints, all enforced in code:
+
+1. **`max_steps`** (default 8) — hard cap on the number of model calls per sub-agent.
+2. **`ScopeGuard`** — every `use_tool` action is checked against an allowed-path
+   policy **before** invocation. A sub-agent dispatched to "fix `auth.rs`"
+   cannot write to `/var/log` or `~/.ssh/`. The bounded context is enforced
+   at the **filesystem level**, not just the cognitive level.
+3. **`CheckContract`** — the sub-agent's `final_answer` is validated against
+   a deterministic predicate (must mention expected phrases, must stay
+   within a region, must have made write tool calls for "must-edit" tasks).
+   The check runs **twice** — by the sub-agent itself, and re-checked by
+   the dispatcher. Either layer can fail the run.
+
+Plus a `report_graph_error` action that lets a sub-agent **bubble** a
+`GraphError` up to the main loop when it discovers the graph is wrong —
+this is the sub-agent's voice in the repair process.
+
+### Two intake modes, code-gated
+
+Round 0 (the first round of a fresh conversation) has a gate. Vague
+tasks (heuristic: vague starter phrases EN+ZH, short with no verb, single
+word) must emit `ask_user` before drawing any graph nodes. Clear tasks
+may emit `propose_patch` directly. The gate is the second line of defense
+— the system prompt also teaches Mode A vs Mode B, but prompt-only is
+not load-bearing. **Errs on the side of letting through**: a false
+positive is an annoying `ask_user`; a false negative wastes the run on a
+graph built from a vague intent.
+
+### The graph is the public API
+
+Despite `graph_loop.rs` being ~6.7K LOC, the entire public API of the run
+loop is **5 variants** in `LoopState`: `Running` (continue stepping),
+`Paused` (waiting for `ask_user` answer), `GraphInvalid` (caller must
+repair), `Done` (terminal success), `Error` (terminal failure). The web
+gateway only ever sees these 5; everything inside the loop is private.
+This is the discipline that lets the core refactor freely without
+breaking the gateway.
+
 ## State machine
 
 `GraphLoop::step()` advances one beat and returns a `LoopState`:
@@ -183,21 +316,28 @@ review or escalation policies of their choice.
 | Module | Role | Key Types |
 |---|---|---|
 | `graph::` | L0 storage + traversal + validation | `Graph`, `Node`, `Edge`, `NodeId`, `NodeKind`, `RelationType`, `GraphPatch`, `Inconsistency`, `L1Description`, `L1Store` |
-| `scheduler::` | Topological batch scheduling | `DagScheduler`, `Schedule` |
+| `scheduler::` | Topological batch scheduling (Kahn-based waves) | `DagScheduler`, `Schedule` |
 | `context::` | Sub-agent context assembly | `ContextBuilder`, `ContextBudget`, `SourceLoader`, `FilesystemSources`, `InMemorySources`, `NullSourceLoader` |
-| `model::` | Model abstraction + OpenAI-compat client | `Model` trait, `OpenAICompatModel`, `ModelConfig`, `Message`, `ModelRequest`, `ModelResponse` |
-| `tools::` | Tool surface + Bash execution | `Tool` trait, `ToolRegistry`, `ToolDef`, `ToolOutput`, `ToolContext`, `Policy` (`AllowAll`/`ReadOnly`/`AllowList`), `BashTool`, `truncate_tail` |
+| `model::` | Model abstraction + OpenAI-compat client | `Model` trait, `OpenAICompatModel`, `ModelConfig`, `Message`, `ModelRequest`, `ModelResponse`, `StreamDelta` |
+| `model::text_or_reasoning()` | Reasoning-content fallback (DeepSeek/M3) | (method on `ModelResponse`) |
+| `tools::` | Tool surface + Bash execution | `Tool` trait, `ToolRegistry`, `ToolDef`, `ToolOutput`, `ToolContext`, `Policy` (`AllowAll`/`ReadOnly`/`AllowList`), `BashTool`, `ScopeGuard`, `truncate_tail` |
 | `agent::conversation` | Multi-turn dialog state | `Conversation` |
-| `agent::proposer` | Builds the graph through model-emitted JSON steps | `GraphProposer`, `ProposerStep` (`AskUser`, `CallTool`, `ProposePatch`, `ReadyForVerify`) |
+| `agent::intake` | Mode A/B intake gate (vague → ask_user) | `classify_task_clarity`, `check_intake_compliance` |
+| `agent::proposer` | Main-agent step engine (6 step types) | `GraphProposer`, `ProposerStep` (`AskUser` / `Explore` / `ProposePatch` / `ReadyForVerify` / `Block` / `ConsultAdvisor`) |
 | `agent::verifier` | Three-layer verification (structural + model self-check + L1 sampling) | `Verifier`, `VerifyIssue`, `VerificationResult`, `Severity` |
 | `agent::repairer` | Scope-bounded local repair (L0Structural / L1Semantic / ScopeGap) | `LocalRepairer` |
 | `agent::enricher` | Model reads L2, writes L1 | `L1Enricher` |
 | `agent::decomposer` | Model breaks task into sub-task DAG | `Decomposer` |
-| `agent::subagent` | Single sub-task executor with tool-calling loop | `SubAgent`, `SubTask`, `SubAgentResult` |
-| `agent::dispatcher` | Concurrent batch execution | `Dispatcher`, `SubAgentPool`, `DispatchOutcome` |
-| `agent::reviewer` | Final acceptance gate | `Reviewer`, `ReviewResult`, `JudgeVerdict`, `RootCause` |
+| `agent::subagent` | Sub-task executor (JSON-action protocol + ScopeGuard + contract self-check) | `SubAgent`, `SubTask`, `SubAgentResult` |
+| `agent::dispatcher` | Wave-aligned concurrent batch execution | `Dispatcher`, `SubAgentPool`, `DispatchOutcome` |
+| `agent::reviewer` | Final acceptance gate (deterministic + LLM judge) | `Reviewer`, `ReviewResult`, `JudgeVerdict`, `RootCause` |
 | `agent::validator` | Post-execution validator (between Task and Review) | `PostExecutionValidator`, `ValidationVerdict`, `BashCheckValidator` |
+| `agent::cascade` | Cascade backtracking on sub-agent failure | `CascadeBacktracker`, `PredecessorVerdict` |
+| `agent::cascade_expand` | L0→L1→L2 expansion in Task phase | `expand_graph` |
+| `agent::contract` | Sub-agent dispatch contracts (deterministic) | `CheckContract` (`KnowHow` / `Exploratory` / `MustEdit` / `None`) |
 | `agent::graph_loop` | The state machine | `GraphLoop`, `LoopState`, `GraphError`, `L0ErrorType`, `ErrorSource`, `FinalResult` |
+| `skills::` | Skill capture, match, compile, store | `matcher` (Jaccard), `capture`, `compiler` (pure Skill → task DAG), `retrieve`, `LocalSkillStorage` |
+| `web::` | HTTP/WS gateway | `api_runs`, `ws`, `events`, `heartbeat`, `persistence`, `checkpoint` (CheckpointStore + branching), `state` |
 | `domain::` | Domain-injection seam | `Domain`, `Scanner`, `ToolRegistry` (trait), `DomainValidator`, `TaskNeeds` |
 | `domain::code::` | Example domain: code project scanner | `CodeScanner` |
 
@@ -261,7 +401,7 @@ The `ReadOnly` policy permits only commands that classify as read-only.
 ## Tests
 
 ```bash
-cargo test --lib                 # all 310 unit + integration tests
+cargo test --lib                 # all 606 unit + integration tests
 cargo test --lib agent::         # only agent layer
 cargo test --lib tools::bash::   # only bash tool
 cargo test --lib graph::         # only graph types
@@ -299,25 +439,48 @@ src/
 ├── scheduler/mod.rs           # DAG topological scheduler with batching
 ├── context/mod.rs             # ContextBuilder, three-layer rendering, distance-based compression
 ├── model/
-│   ├── mod.rs                 # Model trait, Message, ModelRequest, ModelResponse
-│   ├── openai_compat.rs       # OpenAI-compatible HTTP client (reqwest)
+│   ├── mod.rs                 # Model trait, Message, ModelRequest, ModelResponse,
+│   │                          #   ModelResponse::text_or_reasoning() helper
+│   ├── openai_compat.rs       # OpenAI-compatible HTTP client (reqwest) + SSE streaming
 │   └── config.rs              # ModelConfig — env-driven tiered loading
 ├── tools/
 │   ├── mod.rs                 # Tool trait, ToolRegistry, Policy, ToolContext, truncate_tail
-│   └── bash.rs                # BashTool with classify_read_only + ReadOnly-policy whitelist
+│   ├── bash.rs                # BashTool with classify_read_only + ReadOnly-policy whitelist
+│   ├── file.rs                # ReadFile / WriteFile / EditFile
+│   └── policy.rs              # ScopeGuard (filesystem-level path policy)
 ├── agent/
 │   ├── mod.rs                 # agent-layer re-exports
 │   ├── conversation.rs        # Multi-turn dialog state
-│   ├── proposer.rs            # Model emits 4 JSON step kinds
-│   ├── verifier.rs            # Three-layer verification
+│   ├── intake.rs              # Mode A/B intake gate (vague → ask_user)
+│   ├── proposer.rs            # Main-agent step engine (6 step kinds, OpenAI tool_calls)
+│   ├── verifier.rs            # Three-layer verification (structural + L1 + graph self-check)
 │   ├── repairer.rs            # Scope-bounded local patch generation (3 paths)
 │   ├── enricher.rs            # Model reads L2 -> writes L1
 │   ├── decomposer.rs          # Model -> task DAG (NodeKind::Task + DependsOn edges)
-│   ├── subagent.rs            # Single sub-task executor with tool-calling loop
-│   ├── dispatcher.rs          # Concurrent batch execution (SubAgentPool + Dispatcher)
+│   ├── subagent.rs            # JSON-action sub-task executor + ScopeGuard
+│   ├── dispatcher.rs          # Wave-aligned batch execution (SubAgentPool + Dispatcher)
 │   ├── reviewer.rs            # Deterministic + LLM-as-judge acceptance gate
 │   ├── validator.rs           # PostExecutionValidator trait + BashCheckValidator
-│   └── graph_loop.rs          # The state machine
+│   ├── cascade.rs             # Cascade backtracking on sub-agent failure
+│   ├── cascade_expand.rs      # L0→L1→L2 cascade expansion in Task phase
+│   ├── contract.rs            # CheckContract (KnowHow / Exploratory / MustEdit / None)
+│   └── graph_loop.rs          # The state machine (Phase + GraphPhase enums)
+├── skills/                    # Skill capture, match, compile, store
+│   ├── matcher.rs             # Token-based skill scoring (Jaccard)
+│   ├── compiler.rs            # Pure Skill → task DAG transformation
+│   ├── capture.rs             # Auto-capture from successful runs
+│   ├── retrieve.rs            # list_for_prompt + find_and_load_matching_skills
+│   ├── prompt_registry.rs     # Dynamic prompt blocks (Claude Code style)
+│   ├── storage.rs             # LocalSkillStorage (~/.local/share/...)
+│   └── types.rs               # Skill, SkillMeta
+├── web/                       # axum HTTP/WS server
+│   ├── api_runs.rs            # /api/runs/* + drive_run (the main run driver)
+│   ├── ws.rs                  # WebSocket handler (/ws/runs/:id)
+│   ├── events.rs              # RunEvent enum (StreamChunk / StreamToolCall / StreamEnd / ...)
+│   ├── heartbeat.rs           # Self-improving loop across process lifetimes
+│   ├── persistence.rs         # Run persistence (data/runs/<id>/)
+│   ├── checkpoint.rs          # CheckpointStore + branching (git-for-runs)
+│   └── state.rs               # WebState, EngineConfig, LoopTuningConfig
 ├── domain/
 │   ├── mod.rs                 # Domain, Scanner, ToolRegistry trait, DomainValidator, TaskNeeds
 │   └── code/                  # Example domain: code-project scanner stub
@@ -329,25 +492,46 @@ src/
 
 ## Design principles
 
-These shape every component:
+These shape every component. Most are explained in detail in the
+**Architecture philosophy** section above; this list is the TL;DR.
 
 1. **Model-agnostic.** Never hardcode a model name in source; all model
-   selection flows through `ModelConfig` reading env.
-2. **Time-for-space.** Many small precise corrections beat fewer batched
+   selection flows through `ModelConfig` reading env. Reasoning-only
+   models (DeepSeek-v3, MiniMax M3) are first-class — every layer
+   routes through `ModelResponse::text_or_reasoning()`.
+2. **The graph is the plan, the schedule, and the audit log.** Three
+   jobs, one data structure. See *Architecture philosophy* for details.
+3. **Determinism before LLM judgment.** Every "trust the model" decision
+   has a deterministic second-line check. A flaky model cannot take down
+   a structurally sound graph. See *Architecture philosophy*.
+4. **Narrow protocols at boundaries, rich protocols inside.** Main
+   agent uses OpenAI `tool_calls`; sub-agent uses custom JSON-action;
+   skill compile uses Task + DependsOn. Each narrowing is a
+   defense-in-depth decision. See *Architecture philosophy*.
+5. **Three orthogonal memory tiers.** Structural (graph), prompt
+   (conversation), compiled (skills) — never leak between them. See
+   *Architecture philosophy*.
+6. **Skills are structural memory, not prompt memory.** Successful runs
+   capture their `propose_patch` sequence as compiled task DAGs and store
+   them for reuse at Jaccard ≥ 0.25. See *Architecture philosophy*.
+7. **Sub-agents are constrained, not trusted.** `max_steps` + `ScopeGuard`
+   + `CheckContract` (double-checked) + `report_graph_error` bubble. See
+   *Architecture philosophy*.
+8. **Time-for-space.** Many small precise corrections beat fewer batched
    ones. Each error caught during execution is a precision signal — never
    batch errors for "efficiency."
-3. **Local graph repair, never bulk.** When the verifier finds issues, fix
+9. **Local graph repair, never bulk.** When the verifier finds issues, fix
    one at a time with a subgraph-scoped patch. Global rebuilds are an
    explicit opt-in, not an error path.
-4. **Universality lives in the model, structure lives in the graph.** The
-   harness is generic across domains; domain-specific judgment is delegated
-   to the model. Don't put domain enums into shared types.
-5. **Reviewer needs deterministic backstops.** LLM-as-judge is unreliable
-   alone. Layer multiple deterministic checks (graph consistency, sub-agent
-   success, post-execution validation) BEFORE trusting the model's verdict.
-6. **Scanners are seeds, not the product.** Code/data/infra scanners
-   produce low-confidence starter graphs (≤ 0.6). The model is the real
-   graph builder; don't over-invest in scanner cleverness.
+10. **Universality lives in the model, structure lives in the graph.** The
+    harness is generic across domains; domain-specific judgment is delegated
+    to the model. Don't put domain enums into shared types.
+11. **Reviewer needs deterministic backstops.** LLM-as-judge is unreliable
+    alone. Layer multiple deterministic checks (graph consistency, sub-agent
+    success, post-execution validation) BEFORE trusting the model's verdict.
+12. **Scanners are seeds, not the product.** Code/data/infra scanners
+    produce low-confidence starter graphs (≤ 0.6). The model is the real
+    graph builder; don't over-invest in scanner cleverness.
 
 ## Honest scope
 

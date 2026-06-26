@@ -59,10 +59,12 @@
 ## 这是什么
 
 - **通用的 LLM agent 编排器**，纯 Rust 实现。约 15K 行代码，单一二进制，
-  零运行时依赖，**310 个单元/集成测试**。
+  零运行时依赖，**606 个单元/集成测试**。
 - **模型无关（model-agnostic）**。走 OpenAI 兼容的 HTTP——支持 DeepSeek、
   vLLM、Ollama、OpenAI、OpenRouter、Anthropic-via-proxy，或者任何提供
-  `/v1/chat/completions` 的服务。
+  `/v1/chat/completions` 的服务。Reasoning-only 模型（DeepSeek-v3、
+  MiniMax M3）是一等公民：每一层都有 `text_or_reasoning()` 兜底，
+  当 `content` 为空时读 `reasoning_content`。
 - **三层关系图**（L0 结构 / L1 语义 / L2 数据），作为主 agent、子 agent
   和用户之间的共享基底。
 - **带显式状态转移的状态机**，不是自由形式的 ReAct 循环。每一个
@@ -128,6 +130,121 @@ cargo run --bin agent_a -- "你的任务"
 L0 patch 触发新节点的 L1 自动补全；L1 条目的 confidence 偏低会触发
 重新补全；L2 变化（比如子 agent 改文件）最终触发 L0 + L1 更新。
 
+## 架构理念
+
+前面 "核心思想" 章节讲的是 **what**（plan → dispatch → review）。
+本节讲 **why**：塑造每个组件的设计决策，以及它们接受的权衡。
+如果你是贡献者，下面这些决策是你要保留的。
+
+### 图是计划、是调度、是审计日志
+
+同一个数据结构，干三件不同的事：
+
+- **计划（plan）** — 主 agent 把图当作工作记忆来编辑。没有独立的
+  "scratchpad" 或隐藏状态；模型的每一个意图都是一个 `GraphPatch`。
+- **调度（schedule）** — `DagScheduler` 在 `DependsOn` 边上跑 Kahn
+  算法，产出 **wave-aligned 批**。两个独立任务自动落在同一 wave；
+  依赖任务等待它的前置 wave 完成。图的**结构决定并发性**
+  ——dispatcher 不发明调度，它只执行图已经编码好的调度。
+- **审计日志（audit log）** — `CheckpointStore` 在每次有意义的变更
+  后快照 `(round, phase, graph, transcript)`，配 `branches` 映射
+  支持 fork。你可以 rewind、replay、或者从任意历史状态 fork 出一个
+  探索性变体。结合每次 patch 都会 bump 的 `Graph::version`，每一步
+  都可追溯。
+
+### 确定性优先于 LLM 评判（Defense in depth）
+
+系统里有很多"信任模型"的决策。**没有一个是硬门（hard gate）**。
+每个都被至少检查两次——一次是确定性机制，一次是 LLM-as-judge 顾问：
+
+| "信任模型"的决策 | 确定性第二线 | LLM 顾问 |
+|---|---|---|
+| "图结构一致" | `Graph::find_inconsistencies`（悬空边、环、重复） | （无 —— 太简单了不需要 LLM）|
+| "子 agent 工作正确" | `CheckContract`（`KnowHow` 关键字 / `Exploratory` 数量上限 / `MustEdit` 写调用计数）——被**检查两次**：子 agent 一次，dispatcher 再查一次 | （无）|
+| "代码能编译" | `PostExecutionValidator` 跑 `cargo check` / `tsc` 并对 stderr 做 graph vs task 错误模式匹配 | （无）|
+| "L1 与 L2 一致" | 子串比较 + drift 严重度 | `l1_check_verdict`（顾问式；从不单方面判失败）|
+| "子 agent 声称 done 是诚实的" | dispatcher 在子 agent 返回后**重新**评估 contract | （无）|
+| "最终结果可接受" | 确定性 reviewer（图一致性、子 agent 成功、verify-phase 状态）| `judge_verdict`（顾问式；root_cause 路由到 repair）|
+
+**不可靠的模型不能让结构上正确的图崩掉。** 这是系统最重要的安全属性。
+任何新的"信任模型"决策必须配套一个确定性的第二线检查，否则不能上。
+
+### 边界处窄协议，内部宽协议
+
+代码库里反复出现的模式：**越深入系统，协议越窄。** 这是有意识的设计
+选择，不是疏漏。
+
+| 层 | 协议 | 宽度 | 为何要窄 |
+|---|---|---|---|
+| 主 agent | OpenAI `tool_calls`（6 种 step 类型）| 宽 | 编排需要灵活性 |
+| 子 agent | 自定义 JSON-action（`use_tool` / `final_answer` / `report_graph_error`）| 窄 | 约束执行环境（`max_steps=8`，无直接图访问）；窄 = 容易验证 |
+| Skill 编译 | `NodeKind::Task` + `DependsOn` only | 更窄 | Skill 被缓存、回放、信任；窄 = 安全的缓存 |
+
+看到这种不一致，第一个冲动是**统一**——让子 agent 也用 `tool_calls`，
+让 skill 也输出完整 `GraphPatch`。**别这么做。** 每次收窄都是
+defense-in-depth 决策：边界处协议越窄，如果模型在该层失控，爆炸半径
+越小。如果将来有贡献者提议跨边界统一协议，要问的问题只有一个：
+**我们丢掉的安全保证是什么？**
+
+### 三个正交的记忆层
+
+系统有三种截然不同、互补的"记忆"：
+
+| 层 | 存储 | 生命周期 | 内容 |
+|---|---|---|---|
+| **结构**（graph）| 内存中的 `Graph` + checkpoint 到磁盘 | 一次 run | L0 节点/边 + L1 描述 —— orchestrator 的计划 |
+| **提示词**（conversation）| 内存中的 `Conversation` | 一次 run | LLM 对话历史 —— 模型看到过的东西，包括 `ask_user` 交换、verifier 拒绝、repair 尝试 |
+| **编译后**（skills）| `LocalSkillStorage`（文件系统）| 永久 | 抽取出来的、跑成功过的任务 DAG，按 Jaccard-token 相似度索引 |
+
+这三个**正交**：skill 不漏到 graph，graph 不漏到 conversation，conversation
+不漏到 skill。新的"记忆"功能应选一个层和一条写入路径；抵制"哪里都放
+一份"的诱惑。
+
+### Skill 是结构化记忆，不是提示词记忆
+
+当一次 run 成功到达 `ready_for_verify`，orchestrator 抽取 `propose_patch`
+序列作为编译后的任务 DAG，存到本地（`LocalSkillStorage`）。下一次
+有 token-Jaccard ≥ 0.25 匹配的任务，**完全跳过 decomposer**，直接
+用编译后的 skill 图。这是结构化记忆：skill 是图拓扑，不是提示词
+片段。成功的 run 会复利 —— agent 在已经做过的事上越来越快，速度
+提升也建立在那驱动一切的同一种 artifact（`Graph`）上。
+
+### 子 agent 是被约束的，不是被信任的
+
+子 agent 跑的时候有三层独立约束，**全部**用代码强制：
+
+1. **`max_steps`**（默认 8）—— 每个子 agent 的模型调用次数硬上限。
+2. **`ScopeGuard`** —— 每个 `use_tool` action 在调用**前**对照允许路径
+   策略做检查。一个被派去"修 `auth.rs`"的子 agent 不能写 `/var/log`
+   或 `~/.ssh/`。bounded context 在**文件系统层**强制，不只在
+   认知层。
+3. **`CheckContract`** —— 子 agent 的 `final_answer` 对照一个确定性
+   谓词做验证（必须提到期望短语、必须留在 region 内、"must-edit"
+   任务必须有过写工具调用）。检查**跑两遍**——子 agent 自己一遍，
+   dispatcher 再查一遍。任何一层都能让 run 失败。
+
+再加一个 `report_graph_error` action，让子 agent 在发现图本身有问题
+时**把 `GraphError` 冒泡**到主循环——这是子 agent 在 repair 流程中的
+发言权。
+
+### 两种 intake 模式，代码门控
+
+Round 0（一次新对话的第一轮）有一道门。模糊任务（启发式：EN+ZH
+模糊起点短语、很短且无动词、单词）必须先发 `ask_user` 再画任何
+图节点。清晰任务可以直接发 `propose_patch`。这道门是第二道防线
+——system prompt 也教 Mode A vs Mode B，但仅靠 prompt 不构成
+load-bearing 约束。**倾向于放行**：假阳性只是一个烦人的 `ask_user`；
+假阴性是拿一次 run 浪费在一张从模糊意图上建出来的图上。
+
+### 图是公开 API
+
+虽然 `graph_loop.rs` 有大约 6.7K 行，但 run loop 的整个公开 API 只是
+`LoopState` 里的 **5 个变体**：`Running`（继续 stepping）、`Paused`
+（等 `ask_user` 回答）、`GraphInvalid`（调用方要修复）、`Done`（终态
+成功）、`Error`（终态失败）。web gateway 只看到这 5 个；循环内部
+一切都是私有的。正是这种纪律，让核心层可以自由重构而不破坏
+gateway。
+
 ## 状态机
 
 `GraphLoop::step()` 推进一步并返回 `LoopState`：
@@ -163,21 +280,30 @@ pub enum LoopState {
 | 模块 | 职责 | 关键类型 |
 |---|---|---|
 | `graph::` | L0 存储 + 遍历 + 校验 | `Graph`, `Node`, `Edge`, `NodeId`, `NodeKind`, `RelationType`, `GraphPatch`, `Inconsistency`, `L1Description`, `L1Store` |
-| `scheduler::` | 拓扑批调度 | `DagScheduler`, `Schedule` |
+| `scheduler::` | 拓扑批调度（Kahn 风格的 wave） | `DagScheduler`, `Schedule` |
 | `context::` | 子 agent 上下文组装 | `ContextBuilder`, `ContextBudget`, `SourceLoader`, `FilesystemSources`, `InMemorySources`, `NullSourceLoader` |
-| `model::` | 模型抽象 + OpenAI-兼容客户端 | `Model` trait, `OpenAICompatModel`, `ModelConfig`, `Message`, `ModelRequest`, `ModelResponse` |
+| `model::` | 模型抽象 + OpenAI-兼容客户端 | `Model` trait, `OpenAICompatModel`, `ModelConfig`, `Message`, `ModelRequest`, `ModelResponse`, `StreamDelta` |
+| `model::text_or_reasoning()` | 推理内容兜底（DeepSeek / M3） | `ModelResponse` 上的方法 |
 | `tools::` | 工具表面 + Bash 执行 + 两道护栏 | `Tool` trait, `ToolRegistry`, `ToolDef`, `ToolOutput`, `ToolContext`, `Policy` (`DangerousCommandDeny`/`ReadOnly`/`AllowAll`/`AllowList`), `BashTool`, `ScopeGuard`, `truncate_tail` |
 | `agent::conversation` | 多轮对话状态 | `Conversation` |
-| `agent::proposer` | 通过 model 输出的 JSON step 构建图 | `GraphProposer`, `ProposerStep` (`AskUser`, `CallTool`, `ProposePatch`, `ReadyForVerify`) |
-| `agent::verifier` | 三层校验 | `Verifier`, `VerifyIssue` |
+| `agent::intake` | Mode A/B intake gate（模糊 → ask_user） | `classify_task_clarity`, `check_intake_compliance` |
+| `agent::proposer` | 主 agent 步进引擎（6 种 step 类型，OpenAI tool_calls） | `GraphProposer`, `ProposerStep` (`AskUser` / `Explore` / `ProposePatch` / `ReadyForVerify` / `Block` / `ConsultAdvisor`) |
+| `agent::verifier` | 三层校验（结构 + model 自检 + L1 抽样） | `Verifier`, `VerifyIssue`, `VerificationResult`, `Severity` |
 | `agent::enricher` | L1 补全（model-driven） | `L1Enricher` |
-| `agent::repairer` | 局部图修复 | `LocalRepairer`, `GraphError` |
+| `agent::repairer` | 局部图修复（L0Structural / L1Semantic / ScopeGap） | `LocalRepairer` |
 | `agent::decomposer` | 任务分解 | `Decomposer` |
-| `agent::dispatcher` | 并发子 agent 派发 | `Dispatcher`, `SubAgentPool` |
-| `agent::subagent` | 单次工具循环子 agent | `SubAgent`, `SubTask`, `SubAgentResult` |
-| `agent::validator` | 执行后确定性检查 | `PostExecutionValidator` (`BashCheckValidator`, `AlwaysPasses`) |
+| `agent::dispatcher` | wave-aligned 并发批执行 | `Dispatcher`, `SubAgentPool`, `DispatchOutcome` |
+| `agent::subagent` | JSON-action 子任务执行器 + ScopeGuard | `SubAgent`, `SubTask`, `SubAgentResult` |
+| `agent::validator` | 执行后确定性检查 | `PostExecutionValidator`, `ValidationVerdict`, `BashCheckValidator` |
 | `agent::reviewer` | 最终验收 | `Reviewer`, `JudgeVerdict`, `RootCause` |
+| `agent::cascade` | 子 agent 失败时级联回溯 | `CascadeBacktracker`, `PredecessorVerdict` |
+| `agent::cascade_expand` | Task 阶段 L0→L1→L2 级联展开 | `expand_graph` |
+| `agent::contract` | 子 agent 派发契约（确定性） | `CheckContract`（`KnowHow` / `Exploratory` / `MustEdit` / `None`）|
 | `agent::graph_loop` | 顶层状态机 | `GraphLoop`, `GraphLoopConfig`, `LoopState`, `FinalResult` |
+| `skills::` | Skill 捕获、匹配、编译、存储 | `matcher`（Jaccard）、`capture`、`compiler`（纯函数）、`retrieve`、`LocalSkillStorage` |
+| `web::` | HTTP/WS gateway | `api_runs`, `ws`, `events`, `heartbeat`, `persistence`, `checkpoint`（CheckpointStore + branching），`state` |
+| `domain::` | 领域接缝（scanner、tool 注册、validator） | `Domain`, `Scanner`, `ToolRegistry` trait, `DomainValidator`, `TaskNeeds` |
+| `domain::code::` | code 域的实例 | `CodeScanner` |
 
 三个二进制：
 
@@ -190,7 +316,7 @@ pub enum LoopState {
 ## 测试
 
 ```bash
-cargo test --lib                 # 全部 310 个单元 + 集成测试
+cargo test --lib                 # 全部 606 个单元 + 集成测试
 cargo test --lib agent::         # 只跑 agent 层
 cargo test --lib tools::bash::   # 只跑 bash 工具
 cargo test --lib tools::scope_guard::  # 只跑 scope guard
@@ -236,6 +362,42 @@ src/
 tests/
 └── integration_tool_guards.rs # 端到端护栏测试（rm -rf 拦截、scope 越界等）
 ```
+
+## 设计原则
+
+这些原则塑造每个组件。**架构理念** 章节有详细解释；这里是
+TL;DR 列表。
+
+1. **模型无关**。源代码里不写死模型名；所有模型选择走 `ModelConfig`
+   读环境变量。Reasoning-only 模型（DeepSeek-v3、MiniMax M3）是一等
+   公民——每一层都走 `ModelResponse::text_or_reasoning()` 兜底。
+2. **图是计划、是调度、是审计日志**。三件事，同一个数据结构。详见
+   *架构理念*。
+3. **确定性优先于 LLM 评判**。每个"信任模型"的决策都有确定性第二
+   线检查。不可靠的模型不能拖垮结构上正确的图。详见 *架构理念*。
+4. **边界处窄协议，内部宽协议**。主 agent 用 OpenAI `tool_calls`；
+   子 agent 用自定义 JSON-action；Skill 编译用 Task + DependsOn。
+   每次收窄都是 defense-in-depth 决策。详见 *架构理念*。
+5. **三个正交的记忆层**。结构（graph）、提示词（conversation）、
+   编译后（skills）——三者之间不互相泄漏。详见 *架构理念*。
+6. **Skill 是结构化记忆，不是提示词记忆**。成功的 run 抽取
+   `propose_patch` 序列作为编译后的任务 DAG，Jaccard ≥ 0.25 时复用。
+   详见 *架构理念*。
+7. **子 agent 是被约束的，不是被信任的**。`max_steps` + `ScopeGuard`
+   + `CheckContract`（双重检查）+ `report_graph_error` 冒泡。详见
+   *架构理念*。
+8. **时间换精度**。很多小而精确的修正胜过少量批量修正。每次执行
+   中捕捉的错误都是一个精度信号——永远不要为了"效率"批量处理错误。
+9. **局部图修复，不批量**。当 verifier 找到问题时，一次修一个，
+   用 subgraph-scoped patch。全局重建是显式 opt-in，不是错误路径。
+10. **通用性在模型里，结构在图里**。harness 跨领域通用；领域相关
+    的判断委托给模型。不要把领域 enum 塞进共享类型。
+11. **Reviewer 需要确定性后盾**。LLM-as-judge 单独不可靠。在信任
+    模型裁决**之前**叠加多层确定性检查（图一致性、子 agent 成功、
+    执行后校验）。
+12. **Scanner 是种子，不是产品**。代码/数据/基础设施 scanner 产出
+    低置信度（≤ 0.6）的种子图。模型才是真正的图构造器；不要在
+    scanner 巧妙性上过度投入。
 
 ## 诚实范围（Honest scope）
 
