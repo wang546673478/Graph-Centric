@@ -134,11 +134,30 @@ impl Decomposer {
         let resp = self.model.complete(req).await?;
         debug!(
             content_len = resp.content.len(),
+            reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
             tokens = resp.usage.total_tokens,
             "decomposer model response"
         );
 
-        let parsed = parse_decomposer_response(&resp.content)?;
+        // Reasoning-model fallback (DeepSeek / MiniMax M3): when the
+        // model put its final JSON in `reasoning_content` and left
+        // `content` empty, parse the reasoning channel instead. This
+        // mirrors the proposer's fallback (commit 7b8322e) and fixes
+        // the db2d993d production failure where the decomposer died
+        // with "proposer: no '{' in response".
+        let parse_text = if resp.content.trim().is_empty() {
+            resp.reasoning_content.as_deref().unwrap_or("")
+        } else {
+            resp.content.as_str()
+        };
+        if parse_text.trim().is_empty() {
+            return Err(HarnessError::model(
+                "decomposer: empty response — model returned neither content nor reasoning_content"
+                    .to_string(),
+            ));
+        }
+
+        let parsed = parse_decomposer_response(parse_text)?;
         let task_graph = build_task_graph(parsed, world_graph)?;
         info!(
             tasks = task_graph.node_count(),
@@ -419,13 +438,26 @@ mod tests {
     use std::sync::Mutex;
 
     struct MockModel {
-        response: Mutex<Option<String>>,
+        content: Mutex<Option<String>>,
+        reasoning: Mutex<Option<String>>,
     }
 
     impl MockModel {
+        /// Backwards-compat constructor: stores the string in `content` only.
         fn new(s: &str) -> Self {
             Self {
-                response: Mutex::new(Some(s.to_string())),
+                content: Mutex::new(Some(s.to_string())),
+                reasoning: Mutex::new(None),
+            }
+        }
+
+        /// Simulate a reasoning model (DeepSeek / M3) that puts the
+        /// final JSON in `reasoning_content` and leaves `content` empty
+        /// (the shape that triggered the db2d993d production failure).
+        fn new_split(content: &str, reasoning: &str) -> Self {
+            Self {
+                content: Mutex::new(Some(content.to_string())),
+                reasoning: Mutex::new(Some(reasoning.to_string())),
             }
         }
     }
@@ -437,16 +469,17 @@ mod tests {
         }
         async fn complete(&self, _: ModelRequest) -> Result<ModelResponse> {
             let content = self
-                .response
+                .content
                 .lock()
                 .unwrap()
                 .take()
-                .unwrap_or_else(|| "{}".to_string());
+                .unwrap_or_default();
+            let reasoning = self.reasoning.lock().unwrap().take();
             Ok(ModelResponse {
                 content,
                 tool_calls: Vec::new(),
                 finish_reason: FinishReason::Stop,
-                reasoning_content: None,
+                reasoning_content: reasoning,
                 usage: Usage::default(),
             })
         }
@@ -585,5 +618,43 @@ mod tests {
         assert!(st.needs.can_read);
         assert!(st.needs.can_write);
         assert!(!st.needs.can_execute);
+    }
+
+    /// Regression for db2d993d: the model put its final JSON in
+    /// `reasoning_content` and left `content` empty. The decomposer
+    /// must fall back to `reasoning_content` instead of failing with
+    /// `proposer: no '{' in response`.
+    #[tokio::test]
+    async fn decompose_falls_back_to_reasoning_content_when_content_empty() {
+        let json = r#"{
+          "tasks": [
+            {"id":"t1","description":"x","involved_nodes":["a"],"dependencies":[],"needs":{}}
+          ]
+        }"#;
+        // Content is empty (DeepSeek / M3 reasoning-model shape);
+        // reasoning_content carries the final JSON.
+        let d = Decomposer::new(Arc::new(MockModel::new_split("", json)));
+        let tg = d
+            .decompose(&three_node_world(), "x", None)
+            .await
+            .expect("decomposer must succeed when JSON is in reasoning_content");
+        assert_eq!(tg.node_count(), 1);
+    }
+
+    /// Even when both fields are populated, prefer `content` (the
+    /// conventional channel). Reasoning content is the fallback.
+    #[tokio::test]
+    async fn decompose_prefers_content_over_reasoning_content() {
+        let content_json = r#"{"tasks":[{"id":"t-content","description":"x","involved_nodes":["a"],"dependencies":[],"needs":{}}]}"#;
+        let reasoning_json = r#"{"tasks":[{"id":"t-reasoning","description":"x","involved_nodes":["a"],"dependencies":[],"needs":{}}]}"#;
+        let d = Decomposer::new(Arc::new(MockModel::new_split(
+            content_json, reasoning_json,
+        )));
+        let tg = d.decompose(&three_node_world(), "x", None).await.unwrap();
+        let node = tg.get_node(&NodeId::from("t-content")).unwrap();
+        assert_eq!(
+            node.summary, "x",
+            "must parse the content-channel JSON, not the reasoning-channel one"
+        );
     }
 }
