@@ -7,6 +7,7 @@ A universal LLM agent orchestrator in Rust (~15K LOC). Core thesis: **every agen
 - **Model-agnostic**: speaks OpenAI-compatible HTTP (`/v1/chat/completions`)
 - **State machine**: fixed FSM (Graph / Task / Review / Done), not free-form ReAct
 - **Three-layer graph**: L0 (nodes+edges) / L1 (semantic descriptions) / L2 (raw source, on-demand)
+- **Defense in depth**: every "trust the model" decision is checked at least twice (sub-agent + dispatcher; verifier + reviewer; graph self-check + post-execution validator). The hard gate is always deterministic.
 - **Web gateway**: axum HTTP/WS server + Vue 3 + Vite frontend
 
 ## Core ideas
@@ -133,6 +134,18 @@ This is **graph-versioned execution history**. The frontend (`api_runs.rs::GET /
 
 `SubAgentPool::auto_git_checkpoint` defaults to `false` (dispatcher.rs:64). The design intent is documented in the field's docstring: *"task execution should not mutate git history as a hidden side effect. Failed work is reported through the graph/result flow rather than being reverted with reset/checkout."* When the caller opts in, the pool does the minimum: on sub-agent success it runs `git add -A` + `git commit -m "🤖 subagent: <description>"` (truncated to 80 chars). On failure it does **not** auto-revert — the working tree is left as-is so a human can inspect what went wrong. This is the principle: **the run annotates itself in git history when it makes progress; it never silently erases work**. The default keeps the agent from being a black box that quietly rewrites your repo.
 
+### 22. Narrow protocols at the boundary, rich protocols in the middle
+
+Across three rounds of reading the code, one pattern keeps surfacing: **the system deliberately uses different protocols at different layers, narrowing the surface area as you go deeper.**
+
+| Layer | Protocol | Shape | Why narrow |
+|---|---|---|---|
+| Main agent | OpenAI `tool_calls` | Rich (6 step types, full GraphPatch schema) | This is the orchestration surface — needs the most flexibility |
+| Sub-agent | Custom JSON-action | Narrow (`use_tool` / `final_answer` / `report_graph_error`) | Constrained execution env (`max_steps=8`, no direct graph access); narrow = easy to verify |
+| Skill compile | `NodeKind::Task` + `DependsOn` only | Narrower still (no L1 mutability, no relation choice) | Skills are cached, replayed, and trusted; the narrower the contract, the safer the cache |
+
+The first instinct on encountering this is to **unify** — make the sub-agent also use `tool_calls`, make skills emit full `GraphPatch`es. Resist. Each narrowing is a **defense-in-depth decision**: the narrower the protocol at a boundary, the easier it is to validate at that boundary, and the smaller the blast radius if a model misbehaves at that layer. The main agent is the rich one because that's where the creative work happens; everything inside it is on rails. If a future contributor proposes unifying these protocols, the question to ask is: **what's the safety guarantee we'd lose?** If there's no good answer, keep them split.
+
 ## Build & run
 
 ```bash
@@ -143,7 +156,7 @@ cargo build --bin serve
 cargo run --bin serve
 
 # Tests
-cargo test --lib                    # ~606 tests (post tool_calls migration)
+cargo test --lib                    # 606 tests (post tool_calls migration)
 cargo test --lib skills::matcher::  # skill matching tests only
 
 # Frontend
@@ -158,43 +171,57 @@ cp .env.example .env                # MODEL_BASE_URL, MODEL_API_KEY, etc.
 
 ```
 src/
-├── agent/           # Core loop: GraphLoop, Proposer, Verifier, Reviewer,
-│   │                #   Decomposer, Dispatcher, SubAgent, CascadeBacktracker
-│   ├── proposer.rs  #   Model-driven step engine (ask_user/propose_patch/explore/...)
-│   ├── decomposer.rs#   World graph → task DAG via emit_task_decomposition tool
-│   ├── enricher.rs  #   L2 → L1 via write_l1_description tool
-│   ├── repairer.rs  #   Per-issue GraphPatch via propose_repair_patch tool
-│   ├── verifier.rs  #   L1 drift + graph self-check via l1_check_verdict /
-│   │                #     graph_self_check_verdict tools
-│   ├── reviewer.rs  #   Final review via judge_verdict tool
-│   ├── cascade.rs   #   Cascade backtracking via classify_predecessor_verdict tool
-│   ├── graph_loop.rs#   FSM: Graph → Task → Review → Done
-│   └── subagent.rs  #   Tool-calling sub-agent (JSON-action protocol)
-├── graph/           # L0/L1/L2 data model: Node, Edge, Graph, GraphPatch
-├── model/           # Model trait + OpenAI-compatible HTTP client
-│   ├── mod.rs       #   Model trait, StreamDelta, ModelResponse,
-│   │                #   ModelResponse::text_or_reasoning() helper
-│   ├── openai_compat.rs  # SSE streaming + tool_call fragment forwarding
-│   └── streaming.rs #   ModelWithEvents wrapper (forwards StreamDelta to RunEvent)
-├── skills/          # Skill capture & reuse
-│   ├── matcher.rs   #   Token-based skill scoring (Jaccard)
-│   ├── compiler.rs  #   Skill → task DAG compiler
-│   ├── capture.rs   #   Auto-capture from successful runs
-│   ├── retrieve.rs  #   list_for_prompt + find_and_load_matching_skills
-│   ├── prompt_registry.rs  # Dynamic prompt blocks (Claude Code style)
-│   └── storage.rs   #   LocalSkillStorage (~/.local/share/...)
-├── tools/           # Bash, ReadFile, WriteFile, EditFile, WebSearch, WebFetch
-├── web/             # axum HTTP/WS server
-│   ├── api_runs.rs  #   /api/runs/* + drive_run (the main run driver)
-│   ├── ws.rs        #   WebSocket handler (/ws/runs/:id)
-│   ├── events.rs    #   RunEvent enum (StreamChunk / StreamToolCall / StreamEnd / ...)
-│   ├── heartbeat.rs #   Self-improving loop across process lifetimes
-│   ├── persistence.rs # Run persistence (data/runs/<id>/)
-│   ├── checkpoint.rs  # CheckpointStore + branching
-│   └── state.rs     #   WebState, EngineConfig, LoopTuningConfig
+├── agent/                # Core orchestrator
+│   ├── graph_loop.rs     #   FSM: Graph → Task → Review → Done (Phase + GraphPhase enums)
+│   ├── proposer.rs       #   Main-agent step engine (6 step types, tool_calls)
+│   ├── decomposer.rs     #   World graph → task DAG via emit_task_decomposition tool
+│   ├── enricher.rs       #   L2 → L1 via write_l1_description tool
+│   ├── repairer.rs       #   Per-issue GraphPatch via propose_repair_patch tool
+│   ├── verifier.rs       #   L1 drift + graph self-check (2 tool schemas)
+│   ├── reviewer.rs       #   Final review via judge_verdict tool
+│   ├── cascade.rs        #   Cascade backtracking via classify_predecessor_verdict tool
+│   ├── dispatcher.rs     #   Wave-aligned batch dispatch (SubAgentPool + DagScheduler)
+│   ├── subagent.rs       #   JSON-action ReAct loop + ScopeGuard + contract self-check
+│   ├── validator.rs      #   PostExecutionValidator (cargo/tsc failure classifier)
+│   ├── intake.rs         #   Mode A/B intake gate (vague → ask_user)
+│   ├── contract.rs       #   CheckContract (KnowHow/Exploratory/MustEdit/None)
+│   ├── cascade_expand.rs #   L0→L1→L2 cascade expansion in Task phase
+│   ├── conversation.rs   #   LLM prompt history
+│   └── mod.rs            #   agent module root
+├── graph/                # L0/L1/L2 data model: Node, Edge, Graph, GraphPatch
+├── scheduler/            # DagScheduler (Kahn-based wave decomposition)
+├── model/                # Model trait + OpenAI-compatible HTTP client
+│   ├── mod.rs            #   Model trait, StreamDelta, ModelResponse,
+│   │                     #   ModelResponse::text_or_reasoning() helper
+│   ├── openai_compat.rs  #   SSE streaming + tool_call fragment forwarding
+│   └── streaming.rs      #   ModelWithEvents wrapper (forwards StreamDelta to RunEvent)
+├── skills/               # Skill capture & reuse
+│   ├── matcher.rs        #   Token-based skill scoring (Jaccard ≥ 0.25)
+│   ├── compiler.rs       #   Pure Skill → task DAG transformation
+│   ├── capture.rs        #   Auto-capture from successful runs
+│   ├── retrieve.rs       #   list_for_prompt + find_and_load_matching_skills
+│   ├── prompt_registry.rs #  Dynamic prompt blocks (Claude Code style)
+│   ├── storage.rs        #   LocalSkillStorage (~/.local/share/...)
+│   ├── storage_composite.rs
+│   ├── storage_repo.rs
+│   ├── slug.rs
+│   └── types.rs
+├── tools/                # Bash, ReadFile, WriteFile, EditFile, WebSearch, WebFetch,
+│                         #   ScopeGuard (filesystem-level path policy)
+├── web/                  # axum HTTP/WS server
+│   ├── api_runs.rs       #   /api/runs/* + drive_run (the main run driver)
+│   ├── ws.rs             #   WebSocket handler (/ws/runs/:id)
+│   ├── events.rs         #   RunEvent enum (StreamChunk / StreamToolCall / StreamEnd / ...)
+│   ├── heartbeat.rs      #   Self-improving loop across process lifetimes
+│   ├── persistence.rs    #   Run persistence (data/runs/<id>/)
+│   ├── checkpoint.rs     #   CheckpointStore + branching
+│   ├── run_session.rs    #   Per-run session state
+│   ├── config_api.rs     #   Runtime config endpoint
+│   ├── mod.rs            #   web module root + router
+│   └── state.rs          #   WebState, EngineConfig, LoopTuningConfig
 └── bin/
-    ├── serve.rs     # Web gateway binary (main entry)
-    └── agent_a.rs   # CLI demo binary
+    ├── serve.rs          #   Web gateway binary (main entry)
+    └── agent_a.rs        #   CLI demo binary
 ```
 
 ## Key architectural decisions
@@ -205,15 +232,23 @@ src/
 
 3. **Two model tiers**: fast (Proposer, Verifier, SubAgent) vs deep (L1Enricher, Decomposer, Reviewer, CascadeBacktracker).
 
-4. **Per-issue repair, never bulk**: `LocalRepairer` fixes one `VerifyIssue` at a time.
+4. **Per-issue repair, never bulk**: `LocalRepairer` fixes one `VerifyIssue` at a time. CascadeBacktracker walks inbound edges one predecessor at a time. Graph repair is monotonic within a run; every patch bumps `Graph::version` and is checkpointed.
 
 5. **Native tool_calls everywhere**: All 7 model layers (Proposer, Decomposer, L1Enricher, L0+ScopeGapRepairer, Verifier L1+graph self-checks, Reviewer, CascadeBacktracker) declare an OpenAI `tool` schema and prefer `tool_calls` over text-JSON parsing. Each layer's `parse_*_from_tool_calls()` returns `Option<T>`; on `None` the caller falls through to the text fallback. This is the only way to robustly handle DeepSeek / MiniMax M3 reasoning-only responses (where `content` is empty and the final JSON is in `reasoning_content`). See "Tool calls migration" below for the per-layer pattern.
 
 6. **Skill auto-matching**: When a task matches a stored skill (Jaccard token overlap ≥ 0.25), the skill's compiled task DAG substitutes the decomposer output in the Task phase. Controlled by `auto_apply_skills` (default: true).
 
-7. **Streaming output**: Every model call emits `StreamChunk`/`StreamEnd` events via WebSocket. Frontend renders `thinking` blocks + incremental `assistant_streaming` text.
+7. **Streaming output**: Every model call emits `StreamChunk` / `StreamToolCall` / `StreamEnd` events via WebSocket. Frontend renders `thinking` blocks + tool-call timeline + incremental `assistant_streaming` text.
 
 8. **HeartBeat self-improvement**: `POST /api/heartbeat/default` starts a 10-round autonomous optimization loop. Each round: Explore → ProposePatch → SubAgent → Review. On success, auto-spawns next round. Survives restarts (`.graph_harness_heartbeat.json`).
+
+9. **Deterministic backstops beat LLM-as-judge**: The hard gate is always deterministic (`Graph::find_inconsistencies`, sub-agent success flag, `replay_from_anchor` reachability BFS, contract `KnowHow`/`MustEdit` checks, `PostExecutionValidator` exit-code + stderr pattern-match). LLM-as-judge layers (verifier L1 sampling, graph self-check, reviewer) are advisory. A flaky model cannot take down a structurally sound graph. Any new "trust the model" decision must come with a deterministic second-line check.
+
+10. **The graph IS the schedule**: `DagScheduler` runs Kahn over `DependsOn` edges and produces wave-aligned batches. The dispatcher's job is just to execute the waves; concurrency is determined by the graph structure, not invented by the dispatcher. Cycles are errors, not silent truncation. This is what makes the system "naturally parallel" without an explicit orchestration language.
+
+11. **Full execution history is checkpointed and branchable**: `CheckpointStore` maintains an append-only log of `(round, phase, graph_snapshot, transcript)` triples, plus a `branches: HashMap<usize, Vec<String>>` map for forks. The frontend can rewind, replay, or fork a variant from any historical state. The combination of `Graph::version` + checkpoints + branches is the auditability foundation for local repair and the 5-variant `LoopState` public API.
+
+12. **Narrow protocols at the boundary, rich in the middle**: Main agent uses rich OpenAI `tool_calls`; sub-agent uses narrow custom JSON-action; skill compile uses narrower still (Task + DependsOn only). The narrowing is intentional — each layer's narrow contract is what makes it easy to verify. Don't unify protocols across boundaries without asking "what safety guarantee do we lose?"
 
 ## JSON parsing robustness
 
@@ -300,6 +335,9 @@ Round lifecycle:
 
 - **"no '{' in response"** / **"decomposer failed: model: proposer: no '{' in response"**: pre-tool_calls symptom of a reasoning-only model response. As of the tool_calls migration, the 7 model layers all prefer `tool_calls` first and only fall back to text parsing on `None`. If you still see this error, it means: (a) a new layer was added that doesn't follow the tool_calls pattern (see "Tool calls migration"); (b) the model genuinely doesn't support function calling — check the backend's `tools` support; (c) the prompt is asking the model to refuse / use a different tool name. The error should now be **rare** rather than the default failure mode. The fix when it does happen is: declare a `*_tool_schema()` for the affected layer, write a `parse_*_from_tool_calls()`, and replace the direct `resp.content` access with `resp.text_or_reasoning()`.
 - **"fix-it retry did not converge"** (proposer only): both the initial attempt AND the retry failed to parse. The retry path is in `next_step_with_retry`. If this happens often, the proposer tool schema's `description` field may be unclear — model is calling the right tool with garbage args. Tighten the description and add an `enum` constraint where possible.
+- **Dispatcher reports `all_succeeded: false` for a single contract violation**: this is the **double-check** (#18) working as designed. The sub-agent's self-check should have caught the contract first; if it didn't, the dispatcher's re-check does. Inspect which layer missed: look at the sub-agent's max_steps log (did it retry?) and the dispatcher's `results[].error` (does it say "contract violated" or "max_steps"?). Either way, the run correctly failed-soft instead of accepting bad work.
+- **Sub-agent reports a `GraphError` mid-batch**: the dispatcher aggregates them into `DispatchOutcome.graph_errors`; the graph loop surfaces `LoopState::GraphInvalid { source: DuringExecution }`. Don't paper over with auto-retry — the graph is wrong, repair it.
+- **Reachability check bounces back to `Filling` after `ready_for_verify`**: some node isn't on a `LeadsTo` path from `start` to `deliverable`. Inspect the orphan list in the warning log; either add a `LeadsTo` edge or remove the orphan.
 - **Server won't bind**: `serve.exe` from a previous run may still be holding port 8080. `Stop-Process -Name serve -Force`.
 - **Heartbeat stopped**: check `.graph_harness_heartbeat.json`. If `current_run_id` points to a zombie, restart the server — the startup logic detects and replaces it.
 - **A new model layer is added without tool_calls support**: regression. Add a `*_tool_schema()` + `parse_*_from_tool_calls()` per the "Tool calls migration" section. Direct `resp.content` access is the regression risk; route through `text_or_reasoning()` even on the text path.
@@ -312,3 +350,6 @@ Round lifecycle:
 - New web routes: add to `src/web/mod.rs` router.
 - New prompt blocks: register in `PromptRegistry::new()` and add to `compose()` ordering.
 - **New model layer that calls `self.model.complete(...)`**: must declare a `*_tool_schema()`, add a `parse_*_from_tool_calls()` returning `Option<T>`, and use the `text_or_reasoning()` helper for the text-fallback path. Do NOT add a layer that only does text-JSON parsing — that's the regression we're protecting against. See "Tool calls migration" above.
+- **New sub-agent tool or capability**: go through `ScopeGuard` (filesystem-level policy) and `CheckContract` (text-level predicate). The narrow JSON-action protocol is the contract boundary; widening it (e.g. adding a new `action` variant) requires updating `parse_action` + all sub-agent prompts + the contract checker. Don't bypass.
+- **New `Skill` shape**: must compile to `NodeKind::Task` + `DependsOn` edges via `skills::compiler::compile_skill_to_task_graph` (a pure function). The compiled DAG must be `DagScheduler`-schedulable. Skill metadata (`skill_slug` / `skill_trigger` / `skill_node_id`) is part of the wire contract — preserve it.
+- **New checkpoint-affecting change**: every patch that mutates the graph should bump `Graph::version` and trigger a `CheckpointStore::push`. The auditability story (ideas #5, #11, #20) depends on the history being complete.
