@@ -29,6 +29,8 @@ Round 0 has a gate (`intake.rs`): vague tasks must emit `ask_user` first, clear 
 
 Every sub-agent dispatch in `contract.rs::CheckContract` is one of: `KnowHow` (must mention expected phrases, min length), `Exploratory` (must stay within `region` + `max_items`), `MustEdit` (must make ≥1 write tool call), or `None`. The check runs inside the sub-agent (self-check before `final_answer`) AND in the dispatcher (second-line defense). LLM-as-judge is reserved for the final Review phase, never for per-sub-task verification. This is the **bounded-context invariant**: the main agent operates on L0/L1; the contract is the bridge that rejects L2 bleed-through.
 
+A complementary guard is `ScopeGuard` in `subagent.rs::run`: every `use_tool` action is checked against an allowed-path policy **before** the tool is invoked. A sub-agent dispatched to "fix `auth.rs`" literally cannot write to `/var/log` or `~/.ssh/`. The bounded context is enforced at the **filesystem level**, not just the cognitive level.
+
 ### 5. Local graph repair, never bulk
 
 `LocalRepairer` fixes one `VerifyIssue` at a time. `CascadeBacktracker` walks inbound edges one predecessor at a time. The FSM has no "discard the graph and start over" branch — graph repair is **monotonic within a run**. Every patch bumps `Graph::version` and is checkpointed, so any repair can be inspected or reverted. The cost: the agent can't globally restructure once it's committed. The benefit: the audit trail is real.
@@ -41,9 +43,9 @@ When a run successfully reaches `ready_for_verify`, `skills::capture::capture_sk
 
 A `Task` node marked `[drill_down]` is the anchor of a sub-run (`fork_sub_graph_for`), capped at `max_drilldown_depth=2` (L0→L1→L2). The sub-run produces a sub-graph, which is folded back into the parent via the cascade-expansion step. This is how the agent keeps L0 tractable: each level only has to think about *this level's* abstraction, with the deep details farmed out to recursive sub-runs.
 
-### 8. The verifier, reviewer, and self-check are advisory, never the gate
+### 8. The verifier, reviewer, self-check, and validator are advisory, never the gate
 
-The deterministic structural checks (`Graph::find_inconsistencies`, sub-agent success, verify-phase final status) are the hard gate. The LLM-as-judge layers (verifier's L1 sampling, graph self-check, reviewer's judge verdict) are advisory — they surface concerns but cannot unilaterally fail a run unless the structural layer agrees. This is the **deterministic reviewer backstops** design principle: a flaky model can't take down a structurally sound graph.
+The deterministic structural checks (`Graph::find_inconsistencies`, sub-agent success, verify-phase final status) are the hard gate. The LLM-as-judge layers (verifier's L1 sampling, graph self-check, reviewer's judge verdict) are advisory — they surface concerns but cannot unilaterally fail a run unless the structural layer agrees. `PostExecutionValidator` (in `validator.rs`) is the same pattern applied *between* Task and Review phases: it runs a configured command (e.g. `cargo check`) and **classifies** the failure rather than just detecting it. If the non-zero exit + stderr contains a "graph signature" like `"cannot find function"` / `"unresolved import"`, the verdict is `FailedAsGraphIssue` (sub-agent wrote code that the graph didn't say was valid); otherwise it's `FailedAsTaskIssue` (the sub-agent's work is wrong, but the graph was right). LLM-free failure attribution, pattern-matched against language-specific error templates. This is the **deterministic reviewer backstops** design principle: a flaky model can't take down a structurally sound graph.
 
 ### 9. Three-stream UI feedback: text, tool_call, end
 
@@ -52,6 +54,42 @@ The deterministic structural checks (`Graph::find_inconsistencies`, sub-agent su
 ### 10. HeartBeat is autonomous improvement, not user-facing
 
 `POST /api/heartbeat/default` starts a 10-round self-optimization loop. Each round runs the full Graph→Task→Review flow; the run that succeeds becomes the new baseline. State persists in `.graph_harness_heartbeat.json` so the loop survives process restarts. Errors count as learning (the next round gets a different prompt, not a panic).
+
+### 11. Three orthogonal memory tiers
+
+The system has three distinct, complementary "memories":
+
+| Tier | Storage | Lifetime | What's in it |
+|---|---|---|---|
+| **Structural** (graph) | `Graph` in memory + checkpointed to disk | The run | L0 nodes/edges + L1 descriptions — the orchestrator's plan |
+| **Prompt** (conversation) | `Conversation` in memory | The run | The LLM's chat history — what the model has seen, including ask_user exchanges, verifier rejections, repair attempts |
+| **Compiled** (skills) | `LocalSkillStorage` (filesystem) | Permanent | Extracted task DAGs that worked, indexed by Jaccard-token similarity |
+
+These three are **orthogonal**: skills don't leak into the graph, the graph doesn't leak into the conversation, the conversation doesn't leak into skills. Each is a separate data structure with its own write path. The integration point is `try_match_and_compile_skill` in the Task phase — a successful skill substitutes for the decomposer output but never modifies the graph or conversation. New "memory" features should pick a tier and a write path; resist the urge to put it everywhere.
+
+### 12. `LoopState` is the entire public API
+
+Despite `graph_loop.rs` being ~6.7K LOC, the entire public API of the run loop is **5 variants** in `LoopState` (`graph_loop.rs:60`): `Running` (continue stepping), `Paused` (waiting for `ask_user` answer), `GraphInvalid` (caller must repair), `Done` (terminal success), `Error` (terminal failure). The web gateway (`api_runs.rs`, `ws.rs`) only ever sees these 5; everything inside the loop is private. This is the discipline that lets the core be refactored freely without breaking the gateway.
+
+### 13. The post-Explore commit gate
+
+After a sub-agent `Explore` step completes, the *next* proposer step is constrained to one of: `ProposePatch` (commit findings to the graph), `Block` (declare a blocker), `AskUser` (clarify), or `ReadyForVerify` (declare the graph is done). Dispatching another `Explore` (or any other non-committing step) is rejected in `proposer.rs:492` with a specific error message. This is the **anti-infinite-explore guard** that killed the 602-round production run 2026-06-09. Without it, the model keeps dispatching sub-agents and never updates the graph; with it, every Explore must pay off into graph mutation or be declared a failure.
+
+### 14. The sub-agent uses a simpler protocol than the main agent
+
+The main agent speaks OpenAI `tool_calls` (structured, with full tool schemas). The sub-agent (`subagent.rs`) speaks a custom **JSON-action protocol** parsed from `resp.content`:
+
+```json
+{"action": "use_tool", "tool": "<name>", "args": {...}, "thinking": "<why>"}
+{"action": "final_answer", "answer": "<result>", "thinking": "<why complete>"}
+{"action": "report_graph_error", "errors": [...]}  // bubbles a GraphError to the parent
+```
+
+This isn't a missing tool_calls migration — it's a **deliberate split**. Sub-agents are constrained environments (max `max_steps=8`, no direct graph access, only `final_answer` is exposed to the dispatcher), so the simpler text-protocol is appropriate. The main agent's tool_calls is the "rich" interface; the sub-agent's JSON-action is the "narrow, audited" interface. Don't unify them — the narrow contract is what makes sub-agents cheap to constrain.
+
+### 15. Reachability is enforced at `ready_for_verify`, not trusted
+
+When the proposer emits `ready_for_verify`, the loop runs `replay_from_anchor` (a BFS from `start` over `LeadsTo`/`DependsOn`) and bounces the graph back to `Filling` if any node is unreachable. This is the **graph reachability gate**: a model can claim "I'm done" but cannot ship a graph where some node isn't actually on the path from start to deliverable. `GraphInvalid` from the verifier gets the same treatment at a different level. Trust the structure, not the model.
 
 ## Build & run
 
