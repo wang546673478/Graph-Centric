@@ -9,6 +9,50 @@ A universal LLM agent orchestrator in Rust (~15K LOC). Core thesis: **every agen
 - **Three-layer graph**: L0 (nodes+edges) / L1 (semantic descriptions) / L2 (raw source, on-demand)
 - **Web gateway**: axum HTTP/WS server + Vue 3 + Vite frontend
 
+## Core ideas
+
+The system is built on a small number of load-bearing ideas. When changing code, check whether your change preserves them.
+
+### 1. The relationship graph IS the plan, not a representation of one
+
+The LLM doesn't write prose plans or call tools ad-hoc — it edits a `Graph` (nodes + edges + L1 descriptions) that's the orchestrator's working memory. `proposer.rs` accepts only step types that modify this graph (`propose_patch`, `explore`, `ask_user`, `ready_for_verify`, `block`, `consult_advisor`). Every other component (verifier, repairer, decomposer, dispatcher, reviewer) reads the same graph. There is no scratchpad, no hidden state, no "I thought about it for a while and decided..." outside the graph.
+
+### 2. The FSM is code, not prompt
+
+`Phase::{Graph, Task, Review, Done, Poisoned}` and `GraphPhase::{Clarifying, Seeding, Filling, Expanding, Verifying}` are Rust enums in `graph_loop.rs`. Transitions happen in `step()` based on the model's step + the verifier's verdict, not on whatever the model thinks comes next. The model's job is to emit one of the allowed step kinds; the loop's job is to enforce what each step kind actually does. This is the hard guarantee that "the agent doesn't wander off into infinite `ls` loops" — the FSM won't let it.
+
+### 3. Two intake modes, gated by code
+
+Round 0 has a gate (`intake.rs`): vague tasks must emit `ask_user` first, clear tasks may emit `propose_patch`. The classifier is heuristic (vague starter phrases EN+ZH, short + no verb, single word) and **errs on the side of letting through** (false positives annoy; false negatives waste the run). The gate is the second line of defense — the system prompt teaches Mode A/B too, but prompt-only is not load-bearing.
+
+### 4. Sub-agent contracts are deterministic, not LLM-graded
+
+Every sub-agent dispatch in `contract.rs::CheckContract` is one of: `KnowHow` (must mention expected phrases, min length), `Exploratory` (must stay within `region` + `max_items`), `MustEdit` (must make ≥1 write tool call), or `None`. The check runs inside the sub-agent (self-check before `final_answer`) AND in the dispatcher (second-line defense). LLM-as-judge is reserved for the final Review phase, never for per-sub-task verification. This is the **bounded-context invariant**: the main agent operates on L0/L1; the contract is the bridge that rejects L2 bleed-through.
+
+### 5. Local graph repair, never bulk
+
+`LocalRepairer` fixes one `VerifyIssue` at a time. `CascadeBacktracker` walks inbound edges one predecessor at a time. The FSM has no "discard the graph and start over" branch — graph repair is **monotonic within a run**. Every patch bumps `Graph::version` and is checkpointed, so any repair can be inspected or reverted. The cost: the agent can't globally restructure once it's committed. The benefit: the audit trail is real.
+
+### 6. Skill capture closes the loop
+
+When a run successfully reaches `ready_for_verify`, `skills::capture::capture_skill()` extracts the `propose_patch` sequence as a compiled task DAG and stores it locally (`LocalSkillStorage`). The next run with a token-Jaccard ≥ 0.25 task (`skills::matcher`) skips the decomposer entirely and uses the compiled skill graph directly. This is **structural memory** — the skill is a graph topology, not a prompt. Successful runs compound; the agent gets faster at things it's already done.
+
+### 7. Drill-down expands complex nodes into sub-graphs
+
+A `Task` node marked `[drill_down]` is the anchor of a sub-run (`fork_sub_graph_for`), capped at `max_drilldown_depth=2` (L0→L1→L2). The sub-run produces a sub-graph, which is folded back into the parent via the cascade-expansion step. This is how the agent keeps L0 tractable: each level only has to think about *this level's* abstraction, with the deep details farmed out to recursive sub-runs.
+
+### 8. The verifier, reviewer, and self-check are advisory, never the gate
+
+The deterministic structural checks (`Graph::find_inconsistencies`, sub-agent success, verify-phase final status) are the hard gate. The LLM-as-judge layers (verifier's L1 sampling, graph self-check, reviewer's judge verdict) are advisory — they surface concerns but cannot unilaterally fail a run unless the structural layer agrees. This is the **deterministic reviewer backstops** design principle: a flaky model can't take down a structurally sound graph.
+
+### 9. Three-stream UI feedback: text, tool_call, end
+
+`StreamChunk` (incremental text + reasoning), `StreamToolCall` (assembled or per-fragment tool_call args), `StreamEnd` (terminal). Frontend renders thinking blocks + tool-call timeline + final result. `RunEvent::StreamToolCall` with `type: "stream_tool_call"` is the wire shape — even the non-streaming `complete()` path emits it so the frontend can show "agent is calling X with..." in the timeline.
+
+### 10. HeartBeat is autonomous improvement, not user-facing
+
+`POST /api/heartbeat/default` starts a 10-round self-optimization loop. Each round runs the full Graph→Task→Review flow; the run that succeeds becomes the new baseline. State persists in `.graph_harness_heartbeat.json` so the loop survives process restarts. Errors count as learning (the next round gets a different prompt, not a panic).
+
 ## Build & run
 
 ```bash
