@@ -90,6 +90,22 @@ impl Model for ModelWithEvents {
                 });
             }
         }
+        // Forward tool_call args as a single StreamToolCall event so the
+        // frontend can render the structured call in the timeline. For
+        // non-streaming calls we don't have fragments; we send the
+        // assembled arguments. The streaming path (SSE) will fire the
+        // fragmentary events instead — but the current serve.rs only
+        // uses the non-streaming `complete()` path, so this is the
+        // wire-shape the frontend sees in production today.
+        for (i, tc) in resp.tool_calls.iter().enumerate() {
+            let _ = event_tx.send(RunEvent::StreamToolCall {
+                component: component.clone(),
+                index: i,
+                id: Some(tc.id.clone()),
+                name: Some(tc.name.clone()),
+                arguments_fragment: tc.arguments.to_string(),
+            });
+        }
         let _ = event_tx.send(RunEvent::StreamEnd {
             component,
             finish_reason: format!("{:?}", resp.finish_reason).to_lowercase(),

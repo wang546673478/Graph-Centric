@@ -53,6 +53,16 @@ pub enum RunEvent {
         reasoning_content: Option<String>,
         finish_reason: Option<String>,
     },
+    /// A streaming tool_call argument fragment. Mirrors the OpenAI
+    /// `delta.tool_calls[i].function.arguments` shape; the frontend
+    /// assembles fragments by `index` into a complete tool call.
+    StreamToolCall {
+        component: String,
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_fragment: String,
+    },
     /// A streaming model call has finished.
     StreamEnd {
         component: String,
@@ -114,6 +124,7 @@ impl RunEvent {
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
             Self::StreamChunk { .. } => "stream_chunk",
+            Self::StreamToolCall { .. } => "stream_tool_call",
             Self::StreamEnd { .. } => "stream_end",
             Self::ToolUse { .. } => "tool_use",
             Self::ModelCall { .. } => "model_call",

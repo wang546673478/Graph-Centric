@@ -530,25 +530,51 @@ impl Model for OpenAICompatModel {
                 if let Some(choices) = chunk["choices"].as_array() {
                     for choice in choices {
                         if let Some(delta) = choice.get("delta") {
-                            // Accumulate streaming tool_calls.
+                            // Accumulate streaming tool_calls and forward
+                            // each argument fragment to the WS layer so the
+                            // frontend can show live tool-call progress.
                             if let Some(tc_array) = delta["tool_calls"].as_array() {
                                 for tc in tc_array {
                                     let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                                     let entry = tool_call_buf
                                         .entry(idx)
                                         .or_insert_with(|| (String::new(), String::new(), String::new()));
-                                    if let Some(id) = tc["id"].as_str() {
-                                        entry.0 = id.to_string();
+                                    let id_str = tc["id"].as_str().map(str::to_string);
+                                    let mut name_str: Option<String> = None;
+                                    let mut args_fragment = String::new();
+                                    if let Some(id) = &id_str {
+                                        entry.0 = id.clone();
                                     }
                                     if let Some(func) = tc.get("function") {
                                         if let Some(name) = func["name"].as_str() {
                                             if !name.is_empty() {
                                                 entry.1 = name.to_string();
+                                                name_str = Some(entry.1.clone());
                                             }
                                         }
                                         if let Some(args) = func["arguments"].as_str() {
                                             entry.2.push_str(args);
+                                            args_fragment.push_str(args);
                                         }
+                                    }
+                                    if !args_fragment.is_empty()
+                                        || id_str.is_some()
+                                        || name_str.is_some()
+                                    {
+                                        let _ = tx.send(
+                                            crate::model::StreamDelta::ToolCallArgument {
+                                                index: idx,
+                                                id: id_str.or_else(|| {
+                                                    if entry.0.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(entry.0.clone())
+                                                    }
+                                                }),
+                                                name: name_str,
+                                                arguments_fragment: args_fragment,
+                                            },
+                                        );
                                     }
                                 }
                             }

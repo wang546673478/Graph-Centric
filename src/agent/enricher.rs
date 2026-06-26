@@ -210,7 +210,7 @@ impl L1Enricher {
                 Message::system(system_prompt),
                 Message::user(user_prompt),
             ],
-            tools: vec![],
+            tools: vec![enricher_tool_schema()],
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             stop: vec![],
@@ -221,13 +221,20 @@ impl L1Enricher {
             has_l2,
             content_len = resp.content.len(),
             reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
+            tool_calls = resp.tool_calls.len(),
             tokens = resp.usage.total_tokens,
             "enricher model response"
         );
 
-        // Reasoning-model fallback (DeepSeek / M3). See
-        // ModelResponse::text_or_reasoning; db2d993d regression.
-        let mut desc = parse_l1_description(resp.text_or_reasoning())?;
+        // Strategy A: prefer native tool_calls; fall back to text.
+        let parse_text = if let Some(args) = parse_enricher_from_tool_calls(&resp.tool_calls) {
+            args
+        } else {
+            // Reasoning-model fallback (DeepSeek / M3). See
+            // ModelResponse::text_or_reasoning; db2d993d regression.
+            resp.text_or_reasoning().to_string()
+        };
+        let mut desc = parse_l1_description(&parse_text)?;
         if !has_l2 {
             // Hard-cap confidence on the L0-only path regardless of what
             // the model claimed. The model promised to stay ≤ 0.6 but we
@@ -339,6 +346,40 @@ fn parse_l1_description(text: &str) -> Result<L1Description> {
         constraints,
     )
     .with_confidence(confidence))
+}
+
+/// Tool schema for L1 enrichment. The model emits a structured
+/// `write_l1_description` call with the four field values; falls back
+/// to text when absent (db2d993d-class reasoning-only responses).
+fn enricher_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "write_l1_description",
+            "description": "Write a structured L1 description (responsibility / implementation / design_intent / constraints + confidence) for one graph node.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "responsibility": {"type": "string", "description": "What this node is responsible for."},
+                    "implementation": {"type": "string", "description": "How it carries out that responsibility."},
+                    "design_intent": {"type": "string", "description": "Why it's shaped this way."},
+                    "constraints": {"type": "string", "description": "Hard constraints / non-negotiables."},
+                    "confidence": {"type": "number", "description": "0..1. 0.6+ only when L2 was available; cap to 0.6 on the L0-only path."}
+                },
+                "required": ["responsibility"]
+            }
+        }
+    })
+}
+
+/// Convert a tool_call's structured args back to the JSON text the
+/// legacy parser consumes, so the surrounding code path stays
+/// unchanged. Returns None when no matching tool_call is present.
+fn parse_enricher_from_tool_calls(
+    tool_calls: &[crate::model::ToolCall],
+) -> Option<String> {
+    let tc = tool_calls.iter().find(|tc| tc.name == "write_l1_description")?;
+    Some(tc.arguments.to_string())
 }
 
 // ---------------------------------------------------------------------------

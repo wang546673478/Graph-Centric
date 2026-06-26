@@ -103,14 +103,35 @@ pub struct Usage {
     pub prompt_cache_miss_tokens: usize,
 }
 
-/// A chunk of streaming output — either a content delta or a terminal done signal.
+/// A chunk of streaming output — either a content delta, a tool_call
+/// argument fragment, or a terminal done signal. The
+/// `ToolCallArgument` variant carries one `function.arguments` fragment
+/// for a specific tool call (indexed by `index`) so the WS layer can
+/// surface live tool-call progress to the frontend, mirroring how
+/// `Delta.content` surfaces live text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data")]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StreamDelta {
     Delta {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+    },
+    /// Partial arguments for one tool_call. OpenAI streams these as
+    /// `delta.tool_calls[i].function.arguments` fragments; we forward
+    /// them so the frontend can show "agent is calling X with…" in real
+    /// time instead of waiting for the final `Done`.
+    ToolCallArgument {
+        /// OpenAI-assigned index into the `tool_calls` array.
+        index: usize,
+        /// Tool call id (set on the first fragment for this index).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        /// Tool name (set once the model emits the first `function.name`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// Raw arguments fragment (not yet valid JSON until assembled).
+        arguments_fragment: String,
     },
     Done { finish_reason: FinishReason, usage: Usage },
 }
@@ -132,6 +153,19 @@ pub trait Model: Send + Sync {
             content: resp.content.clone(),
             reasoning_content: resp.reasoning_content.clone(),
         });
+        // Forward any tool_calls as assembled-arguments fragments (one
+        // per tool_call) so the streaming path mirrors the non-streaming
+        // path's behavior. The SSE-aware `complete_stream` override in
+        // openai_compat fires per-fragment events that the downstream
+        // forwarder (in `model::streaming`) coalesces into this shape.
+        for (i, tc) in resp.tool_calls.iter().enumerate() {
+            let _ = tx.send(StreamDelta::ToolCallArgument {
+                index: i,
+                id: Some(tc.id.clone()),
+                name: Some(tc.name.clone()),
+                arguments_fragment: tc.arguments.to_string(),
+            });
+        }
         let _ = tx.send(StreamDelta::Done {
             finish_reason: resp.finish_reason,
             usage: resp.usage.clone(),
@@ -183,5 +217,22 @@ mod tests {
     fn text_or_reasoning_empty_when_both_blank() {
         let r = resp_with("", None);
         assert_eq!(r.text_or_reasoning(), "");
+    }
+
+    /// StreamDelta::ToolCallArgument must serialize to a tagged enum
+    /// shape the frontend can distinguish from `Delta`. This guards
+    /// against accidentally losing the `type` tag in a refactor.
+    #[test]
+    fn stream_delta_tool_call_argument_serialization() {
+        let d = StreamDelta::ToolCallArgument {
+            index: 0,
+            id: Some("call_1".into()),
+            name: Some("propose_patch".into()),
+            arguments_fragment: r#"{"patch":"#.into(),
+        };
+        let s = serde_json::to_string(&d).unwrap();
+        assert!(s.contains(r#""type":"tool_call_argument""#), "got: {s}");
+        assert!(s.contains(r#""index":0"#));
+        assert!(s.contains(r#""name":"propose_patch""#));
     }
 }

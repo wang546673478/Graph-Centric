@@ -131,9 +131,14 @@ impl LocalRepairer {
         );
 
         let system = load_prompt_file("skills/prompts/l0-repairer.md", SYSTEM_PROMPT_L0_REPAIRER);
-        let resp = self.call_model(&system, &user_prompt).await?;
-        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
-        let value = parse_json(resp.text_or_reasoning())?;
+        let resp = self.call_model_with_tools(&system, &user_prompt, repairer_tool_schema()).await?;
+        // Strategy A: prefer native tool_calls; fall back to text.
+        let value = if let Some(args) = parse_repairer_tool_call(&resp.tool_calls) {
+            serde_json::Value::Object(args)
+        } else {
+            // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
+            parse_json(resp.text_or_reasoning())?
+        };
         let patch_v = value.get("patch").ok_or_else(|| {
             HarnessError::model("repairer: L0 response missing 'patch' field".to_string())
         })?;
@@ -246,9 +251,12 @@ impl LocalRepairer {
         );
 
         let system = load_prompt_file("skills/prompts/scope-repairer.md", SYSTEM_PROMPT_SCOPE_REPAIRER);
-        let resp = self.call_model(&system, &user_prompt).await?;
-        // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
-        let value = parse_json(resp.text_or_reasoning())?;
+        let resp = self.call_model_with_tools(&system, &user_prompt, repairer_tool_schema()).await?;
+        let value = if let Some(args) = parse_repairer_tool_call(&resp.tool_calls) {
+            serde_json::Value::Object(args)
+        } else {
+            parse_json(resp.text_or_reasoning())?
+        };
         let patch_v = value.get("patch").ok_or_else(|| {
             HarnessError::model("repairer: ScopeGap response missing 'patch' field".to_string())
         })?;
@@ -296,6 +304,97 @@ impl LocalRepairer {
         );
         Ok(resp)
     }
+
+    async fn call_model_with_tools(
+        &self,
+        system: &str,
+        user: &str,
+        tool: serde_json::Value,
+    ) -> Result<crate::model::ModelResponse> {
+        let req = ModelRequest {
+            messages: vec![Message::system(system), Message::user(user)],
+            tools: vec![tool],
+            temperature: self.temperature,
+            max_tokens: self.max_tokens,
+            stop: vec![],
+        };
+        let resp = self.model.complete(req).await?;
+        debug!(
+            content_len = resp.content.len(),
+            reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
+            tool_calls = resp.tool_calls.len(),
+            tokens = resp.usage.total_tokens,
+            "repairer model response"
+        );
+        Ok(resp)
+    }
+}
+
+/// Tool schema for repair patches. Mirrors the propose_patch schema the
+/// proposer already uses; shared by L0 and ScopeGap repair paths.
+fn repairer_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "propose_repair_patch",
+            "description": "Propose a GraphPatch that fixes the issue. Touch only nodes that are listed in the issue's scope or that you are adding. Keep the patch minimal — one to three nodes/edges is normal, more is suspicious.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "object",
+                        "properties": {
+                            "add_nodes": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "kind": {"type": "string", "enum": ["File", "Function", "Class", "Module", "Config", "Task", "Other"]},
+                                        "path": {"type": "string"},
+                                        "summary": {"type": "string"},
+                                        "immutable": {"type": "boolean"},
+                                        "expanded": {"type": "boolean"}
+                                    },
+                                    "required": ["id", "kind", "summary"]
+                                }
+                            },
+                            "add_edges": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "source": {"type": "string"},
+                                        "target": {"type": "string"},
+                                        "relation": {"type": "string", "enum": ["Contains", "BelongsTo", "Imports", "Exports", "DependsOn", "Calls", "Triggers", "Reads", "Writes", "RevealedBy", "InvalidatedBy", "Other"]},
+                                        "confidence": {"type": "number"},
+                                        "evidence": {"type": "string"}
+                                    },
+                                    "required": ["source", "target", "relation"]
+                                }
+                            },
+                            "remove_node_ids": {"type": "array", "items": {"type": "string"}},
+                            "remove_edge_indices": {"type": "array", "items": {"type": "integer"}},
+                            "reason": {"type": "string"}
+                        },
+                        "required": ["reason"]
+                    },
+                    "rationale": {"type": "string"}
+                },
+                "required": ["patch", "rationale"]
+            }
+        }
+    })
+}
+
+/// Pull the structured repair args out of a tool_call, or None if no
+/// matching tool_call was emitted.
+fn parse_repairer_tool_call(
+    tool_calls: &[crate::model::ToolCall],
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let tc = tool_calls.iter().find(|tc| tc.name == "propose_repair_patch")?;
+    let obj = tc.arguments.as_object()?.clone();
+    Some(obj)
 }
 
 // ---------------------------------------------------------------------------
