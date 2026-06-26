@@ -217,6 +217,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         is_heartbeat: false,
         graph_schema: None,
         sub_run_timeout_ms: None,
+        skill_match_threshold: Some(advanced.skill_match_threshold),
     };
 
     let mut gl = GraphLoop::new(task.clone(), proposer, verifier, Some(repairer), tools, loop_cfg)

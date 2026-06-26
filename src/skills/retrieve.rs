@@ -38,9 +38,9 @@ pub fn list_for_prompt(storage: &dyn SkillStorage) -> String {
 
 /// Find matching skills and load their full `Skill` objects.
 ///
-/// Calls `find_matching_skills` and then `storage.load()` for each match
-/// up to `max`. Load failures are traced and skipped (not surfaced as
-/// errors — matching is best-effort).
+/// Calls `find_matching_skills` (default config) and then `storage.load()`
+/// for each match up to `max`. Load failures are traced and skipped
+/// (not surfaced as errors — matching is best-effort).
 pub fn find_and_load_matching_skills(
     task: &str,
     storage: &dyn SkillStorage,
@@ -48,6 +48,32 @@ pub fn find_and_load_matching_skills(
     max: usize,
 ) -> std::result::Result<Vec<Skill>, HarnessError> {
     let matches = find_matching_skills(task, storage, threshold)
+        .map_err(|e| HarnessError::model(format!("skill matching failed: {e}")))?;
+    let mut loaded = Vec::new();
+    for (ref_, _score) in matches.iter().take(max) {
+        match storage.load(&ref_.slug) {
+            Ok(skill) => loaded.push(skill),
+            Err(e) => {
+                tracing::warn!(
+                    slug = %ref_.slug,
+                    error = %e,
+                    "failed to load matched skill, skipping"
+                );
+            }
+        }
+    }
+    Ok(loaded)
+}
+
+/// Config-aware variant of [`find_and_load_matching_skills`].
+pub fn find_and_load_matching_skills_with(
+    task: &str,
+    storage: &dyn SkillStorage,
+    matcher_cfg: &super::matcher::SkillMatchConfig,
+    max: usize,
+) -> std::result::Result<Vec<Skill>, HarnessError> {
+    use super::matcher::find_matching_skills_with;
+    let matches = find_matching_skills_with(task, storage, matcher_cfg, matcher_cfg.threshold)
         .map_err(|e| HarnessError::model(format!("skill matching failed: {e}")))?;
     let mut loaded = Vec::new();
     for (ref_, _score) in matches.iter().take(max) {

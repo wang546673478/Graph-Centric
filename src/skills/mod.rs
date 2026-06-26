@@ -14,7 +14,7 @@ pub mod storage_composite;
 pub mod storage_repo;
 pub mod types;
 
-pub use matcher::{find_matching_skills, score_skill_match};
+pub use matcher::{find_matching_skills, find_matching_skills_with, score_skill_match, score_skill_match_with, SkillMatchConfig};
 pub use types::{Skill, SkillError, SkillMeta, SkillRef};
 // Re-exports expanded in Tasks 4 (RepoSkillStorage) and 5 (CompositeSkillStorage).
 pub use storage::{LocalSkillStorage, SkillStorage};

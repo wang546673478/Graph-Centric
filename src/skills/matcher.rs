@@ -10,6 +10,27 @@ use super::types::SkillRef;
 use crate::error::HarnessError;
 use std::collections::HashSet;
 
+/// Default match-score threshold + weights. Used when the caller doesn't
+/// pass a config (e.g. unit tests). Mirrors the pre-config behavior.
+pub const DEFAULT_SKILL_MATCH_CONFIG: SkillMatchConfig = SkillMatchConfig {
+    trigger_weight: 0.7,
+    slug_weight: 0.3,
+    threshold: 0.25,
+};
+
+/// v2.7: tunables for the skill matcher. The default reproduces the
+/// pre-config hardcoded values exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct SkillMatchConfig {
+    /// Weight of trigger-text Jaccard in the final score.
+    pub trigger_weight: f64,
+    /// Weight of slug-token Jaccard in the final score.
+    pub slug_weight: f64,
+    /// Minimum score to auto-apply a skill. Below this, the skill is
+    /// not considered a match.
+    pub threshold: f64,
+}
+
 /// Tokenize a string into lowercase words, splitting on whitespace and
 /// common punctuation: `,.;:!?()-[]{}'"`.  Consecutive non-word characters
 /// are treated as delimiters; empty tokens are dropped.
@@ -45,15 +66,21 @@ const SIGNAL_WORDS: &[&str] = &[
     "generate", "parse", "validate", "transform", "migrate",
 ];
 
-/// Score how well a skill matches a task [0.0, 1.0].
+/// Score how well a skill matches a task [0.0, 1.0] using the default config.
+pub fn score_skill_match(task: &str, skill: &SkillRef) -> f64 {
+    score_skill_match_with(task, skill, &DEFAULT_SKILL_MATCH_CONFIG)
+}
+
+/// Score how well a skill matches a task [0.0, 1.0] using a caller-supplied
+/// config.
 ///
 /// Algorithm:
 /// 1. Tokenize task text, skill trigger, and skill slug.
-/// 2. Jaccard(task, trigger) × 0.7 + Jaccard(task, slug_tokens) × 0.3
+/// 2. Jaccard(task, trigger) × `trigger_weight` + Jaccard(task, slug_tokens) × `slug_weight`
 /// 3. Signal-word boost: +0.03 per signal word appearing in both task and trigger
 ///    (capped at +0.15).
 /// 4. Clamp to [0.0, 1.0].
-pub fn score_skill_match(task: &str, skill: &SkillRef) -> f64 {
+pub fn score_skill_match_with(task: &str, skill: &SkillRef, cfg: &SkillMatchConfig) -> f64 {
     let task_tokens: Vec<String> = tokenize(task);
     let trigger_tokens: Vec<String> = tokenize(&skill.trigger);
     let slug_tokens: Vec<String> = tokenize(&skill.slug.replace('-', " "));
@@ -65,7 +92,7 @@ pub fn score_skill_match(task: &str, skill: &SkillRef) -> f64 {
     let trigger_overlap = jaccard(&task_set, &trigger_set);
     let slug_overlap = jaccard(&task_set, &slug_set);
 
-    let mut score = trigger_overlap * 0.7 + slug_overlap * 0.3;
+    let mut score = trigger_overlap * cfg.trigger_weight + slug_overlap * cfg.slug_weight;
 
     // Signal-word boost: count how many signal words appear in both task and trigger.
     let signal_hits: usize = SIGNAL_WORDS
@@ -78,9 +105,21 @@ pub fn score_skill_match(task: &str, skill: &SkillRef) -> f64 {
 }
 
 /// Find skills whose match score exceeds `threshold`, sorted descending.
+/// Uses `DEFAULT_SKILL_MATCH_CONFIG` for the score weights; use
+/// `find_matching_skills_with` to pass a custom config.
 pub fn find_matching_skills(
     task: &str,
     storage: &dyn SkillStorage,
+    threshold: f64,
+) -> std::result::Result<Vec<(SkillRef, f64)>, HarnessError> {
+    find_matching_skills_with(task, storage, &DEFAULT_SKILL_MATCH_CONFIG, threshold)
+}
+
+/// Config-aware variant of [`find_matching_skills`].
+pub fn find_matching_skills_with(
+    task: &str,
+    storage: &dyn SkillStorage,
+    cfg: &SkillMatchConfig,
     threshold: f64,
 ) -> std::result::Result<Vec<(SkillRef, f64)>, HarnessError> {
     let all = storage
@@ -89,7 +128,7 @@ pub fn find_matching_skills(
     let mut scored: Vec<(SkillRef, f64)> = all
         .into_iter()
         .map(|r| {
-            let s = score_skill_match(task, &r);
+            let s = score_skill_match_with(task, &r, cfg);
             (r, s)
         })
         .filter(|(_, s)| *s >= threshold)

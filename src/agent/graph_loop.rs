@@ -522,6 +522,16 @@ pub struct GraphLoopConfig {
     /// don't need to be updated; the web gateway passes a concrete
     /// value derived from `EngineConfig::sub_run_timeout_ms`.
     pub sub_run_timeout_ms: Option<u64>,
+
+    /// v2.7: skill match threshold (Jaccard-score cut-off). Default 0.25.
+    /// `None` falls back to the value from `EngineConfig::advanced`.
+    pub skill_match_threshold: Option<f64>,
+
+    /// v2.7: weight of trigger-text Jaccard in skill match score. Default 0.7.
+    pub skill_match_trigger_weight: Option<f64>,
+
+    /// v2.7: weight of slug-token Jaccard in skill match score. Default 0.3.
+    pub skill_match_slug_weight: Option<f64>,
 }
 
 /// Default sub-run timeout: 30 minutes. Used when
@@ -552,6 +562,9 @@ impl GraphLoopConfig {
             convergence_stable_rounds: 3,
             max_drilldown_depth: 0, // disabled by default until Task 9 wires it up
             sub_run_timeout_ms: None,
+            skill_match_threshold: None,
+            skill_match_trigger_weight: None,
+            skill_match_slug_weight: None,
         }
     }
 }
@@ -1875,10 +1888,14 @@ impl GraphLoop {
             return None;
         }
 
-        let matched = match crate::skills::retrieve::find_and_load_matching_skills(
+        let matched = match crate::skills::retrieve::find_and_load_matching_skills_with(
             &self.task,
             storage.as_ref(),
-            0.25, // threshold
+            &crate::skills::matcher::SkillMatchConfig {
+                trigger_weight: self.config.skill_match_trigger_weight.unwrap_or(0.7),
+                slug_weight: self.config.skill_match_slug_weight.unwrap_or(0.3),
+                threshold: self.config.skill_match_threshold.unwrap_or(0.25),
+            },
             1,    // top 1 for Phase A
         ) {
             Ok(v) => v,

@@ -602,6 +602,9 @@ pub async fn drive_run(
         convergence_stable_rounds: state.config.engine.loop_tuning.convergence_stable_rounds,
         max_drilldown_depth: state.config.engine.max_drilldown_depth as u32,
         sub_run_timeout_ms: Some(state.config.engine.sub_run_timeout_ms),
+        skill_match_threshold: Some(state.config.engine.advanced.skill_match_threshold),
+        skill_match_trigger_weight: Some(state.config.engine.advanced.skill_match_trigger_weight),
+        skill_match_slug_weight: Some(state.config.engine.advanced.skill_match_slug_weight),
         is_heartbeat: is_heartbeat_active,
         graph_schema: if is_heartbeat_active {
             Some(crate::agent::graph_loop::GraphSchema {
