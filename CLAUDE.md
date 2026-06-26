@@ -91,6 +91,48 @@ This isn't a missing tool_calls migration — it's a **deliberate split**. Sub-a
 
 When the proposer emits `ready_for_verify`, the loop runs `replay_from_anchor` (a BFS from `start` over `LeadsTo`/`DependsOn`) and bounces the graph back to `Filling` if any node is unreachable. This is the **graph reachability gate**: a model can claim "I'm done" but cannot ship a graph where some node isn't actually on the path from start to deliverable. `GraphInvalid` from the verifier gets the same treatment at a different level. Trust the structure, not the model.
 
+### 16. The graph IS the schedule — wave-aligned batch dispatch
+
+`scheduler::DagScheduler::plan` runs a variant of Kahn's algorithm over `DependsOn` edges and produces a `Schedule { batches: Vec<Vec<NodeId>> }`. `Dispatcher::run` iterates the batches **in order** (`for batch in schedule.batches.iter().enumerate()`), but **within** each batch all sub-agents are spawned concurrently, throttled by a `Semaphore::new(max_concurrent)`. The graph's structure determines the concurrency — two independent tasks automatically land in the same wave; a dependent task waits for its prerequisites' wave to complete. Cycles are reported as errors, not silently truncated. **The dispatcher is dumb on purpose**: it doesn't invent scheduling, it just executes what the graph already encodes. When you read the graph's edge structure, you can predict exactly which waves will run in parallel and which will be serial.
+
+### 17. Fail-soft within a batch, fail-collect across waves
+
+A sub-agent that fails (model error, contract violation, `max_steps` exceeded) does **not** abort its siblings in the same batch — `dispatcher.rs:23` explicitly says "we collect all results, success or not. The caller decides what to do with failures." Across waves, the dispatcher awaits each batch sequentially before starting the next, so a failure in wave 0 is visible to the run loop before wave 1 starts. **tokio join errors** (panic in a spawned task) DO abort the batch — those are bugs, not sub-agent problems. The result is `DispatchOutcome { all_succeeded: bool, graph_errors: Vec<GraphError>, results: Vec<SubAgentResult> }` — a structured failure report, not an exception. The graph loop inspects it and routes to `GraphInvalid` (graph errors), `FailedAsGraphIssue` (validator), or continues to Review based on the failure shape.
+
+### 18. Contracts are verified at two layers (defense in depth)
+
+Every `SubTask` carries a `CheckContract`. The contract is checked **twice**:
+
+1. **Sub-agent self-check** (`subagent.rs:run`) — the model gets a user-message rejection if its `final_answer` fails the contract, and is told to either retry or emit `report_graph_error`. This is the "inner loop" of contract enforcement.
+2. **Dispatcher re-check** (`dispatcher.rs::run`, with `verify_contract: true` by default) — the dispatcher independently re-evaluates the contract after the sub-agent returns. This catches the (rare) case where the sub-agent's self-check disagrees with the dispatcher's view (e.g. the sub-agent exhausted `max_steps` without ever satisfying the contract, and returned `success: true` with a fallback answer).
+
+Each layer assumes the other is buggy. `DispatcherConfig::with_verify_contract(false)` is **opt-in for tests only** — production runs leave it on. The pattern generalizes: any "trust the model" decision in this codebase is checked at least twice (sub-agent + dispatcher; verifier + reviewer; graph self-check + post-execution validator).
+
+### 19. Skill compilation is a pure transformation
+
+`skills::compiler::compile_skill_to_task_graph` is a pure function: same `Skill` in → same task graph out. No I/O, no model calls, no randomness. The mapping rules are explicit and minimal:
+
+- L0 nodes → `NodeKind::Task` with id prefixed `skill:<slug>:<node_id>`
+- L0 edges → `RelationType::DependsOn` (skill edges are always prerequisite)
+- L1 descriptions → task summaries (fallback to L0 summary)
+- `skill_slug` / `skill_trigger` / `skill_node_id` written into each task node's metadata for provenance
+
+The output graph is fed **directly** into `DagScheduler` — the test `dag_is_schedulable` asserts this contract holds. **Skills are reproducible**: re-compiling the same skill always gives the same task DAG. The id prefix prevents collision with the host run's task graph, and the metadata makes "where did this task come from" a queryable property, not a comment. If you add a new kind of skill, the compile output must be a `Graph` of `NodeKind::Task` + `DependsOn` edges — that's the boundary the rest of the system relies on.
+
+### 20. `CheckpointStore` is git-for-runs
+
+`web::checkpoint::CheckpointStore` maintains an append-only log of `(round, phase, graph_snapshot, transcript)` triples, plus a `branches: HashMap<usize, Vec<String>>` map from checkpoint index → child run ids:
+
+- `push(round, phase, graph, transcript)` — append a snapshot. If `persistence` is set, flushes to disk via `RunPersistence::save_checkpoint`.
+- `create_branch(from_index, child_run_id)` — fork a new run from any historical checkpoint. The branches map is also persisted.
+- The `transcript: Vec<Message>` is snapshotted too — replay includes the LLM's exact view, not just the graph.
+
+This is **graph-versioned execution history**. The frontend (`api_runs.rs::GET /api/runs/:id/checkpoints`) can list checkpoints and let the user rewind, compare two paths, or fork an exploratory variant from an interesting mid-run state. The combination of `Graph::version` (bumped on every patch) + checkpoint snapshots + branching is the auditability foundation that idea #5 (local repair) and idea #12 (LoopState API) both rely on.
+
+### 21. Git safety checkpoint is opt-in, never default
+
+`SubAgentPool::auto_git_checkpoint` defaults to `false` (dispatcher.rs:64). The design intent is documented in the field's docstring: *"task execution should not mutate git history as a hidden side effect. Failed work is reported through the graph/result flow rather than being reverted with reset/checkout."* When the caller opts in, the pool does the minimum: on sub-agent success it runs `git add -A` + `git commit -m "🤖 subagent: <description>"` (truncated to 80 chars). On failure it does **not** auto-revert — the working tree is left as-is so a human can inspect what went wrong. This is the principle: **the run annotates itself in git history when it makes progress; it never silently erases work**. The default keeps the agent from being a black box that quietly rewrites your repo.
+
 ## Build & run
 
 ```bash
