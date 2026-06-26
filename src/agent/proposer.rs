@@ -865,7 +865,10 @@ pub fn extract_json_block(text: &str) -> Result<String> {
     }
 
     if candidates.is_empty() {
-        return Err(HarnessError::model("proposer: no '{' in response"));
+        return Err(HarnessError::model(format!(
+            "proposer: no '{{' in response; raw={:?}",
+            text.chars().take(500).collect::<String>()
+        )));
     }
 
     // Try right-to-left: the last outermost block is usually the real response.

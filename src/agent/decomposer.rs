@@ -52,7 +52,7 @@ use crate::graph::{Edge, Graph, NodeId, RelationType};
 use crate::model::{Message, Model, ModelRequest, Role};
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Clone)]
 pub struct Decomposer {
@@ -124,7 +124,7 @@ impl Decomposer {
         let req = ModelRequest {
             messages: vec![
                 Message::system(load_prompt_file("skills/prompts/decomposer.md", SYSTEM_PROMPT_DECOMPOSER)),
-                Message::user(user_prompt),
+                Message::user(user_prompt.clone()),
             ],
             tools: vec![decomposer_tool_schema()],
             temperature: self.temperature,
@@ -165,7 +165,56 @@ impl Decomposer {
             ));
         }
 
-        let parsed = parse_decomposer_response(parse_text)?;
+        let parsed = parse_decomposer_response(parse_text);
+        let parsed = match parsed {
+            Ok(t) => t,
+            Err(parse_err) => {
+                // Text path failed (e.g., model returned prose with no
+                // JSON braces — common with reasoning models that decide
+                // to "think out loud" instead of calling the tool). Retry
+                // once with a stronger prompt demanding the tool call.
+                // This is the same fix-it pattern proposer.rs uses.
+                warn!(
+                    error = %parse_err,
+                    "decomposer first response was malformed; retrying once with a fix-it prompt"
+                );
+                let retry_prompt = format!(
+                    "Your previous response was malformed (parser said: {parse_err}). \
+                     You MUST call the `emit_task_decomposition` tool with a valid JSON `tasks` array. \
+                     Do NOT reply with prose or explanations. Reply with the tool call only."
+                );
+                let mut retry_messages = vec![
+                    Message::system(load_prompt_file(
+                        "skills/prompts/decomposer.md",
+                        SYSTEM_PROMPT_DECOMPOSER,
+                    )),
+                    Message::user(user_prompt),
+                    Message::assistant(parse_text.clone()),
+                    Message::user(retry_prompt),
+                ];
+                // If a conversation was passed, inject the recent turns
+                // (without the latest user_prompt) to preserve context.
+                if let Some(c) = conv {
+                    // Truncate to last 6 turns to preserve context.
+                    let conv_msgs: Vec<_> = c.messages.iter().rev().take(6).rev().cloned().collect();
+                    // Splice in after the system message (index 0).
+                    retry_messages.splice(1..1, conv_msgs);
+                }
+                let retry_req = ModelRequest {
+                    messages: retry_messages,
+                    tools: vec![decomposer_tool_schema()],
+                    temperature: self.temperature,
+                    max_tokens: self.max_tokens,
+                    stop: Vec::new(),
+                };
+                let retry_resp = self.model.complete(retry_req).await?;
+                let retry_text = retry_resp.text_or_reasoning();
+                if retry_text.trim().is_empty() {
+                    return Err(parse_err);
+                }
+                parse_decomposer_response(&retry_text)?
+            }
+        };
         let task_graph = build_task_graph(parsed, world_graph)?;
         info!(
             tasks = task_graph.node_count(),
