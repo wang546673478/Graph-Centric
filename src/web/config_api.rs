@@ -213,7 +213,10 @@ pub async fn post_config(
     State(state): State<Arc<WebState>>,
     Json(update): Json<serde_json::Value>,
 ) -> Result<Json<EngineConfig>, ApiError> {
-    let mut config = state.config.engine.clone();
+    // Read from disk so the baseline reflects any prior save in this
+    // session. (WebState.config is frozen at startup; we re-read here
+    // and in api_runs to pick up runtime changes from the Settings UI.)
+    let mut config = EngineConfig::load();
 
     if let Some(model) = update.get("model") {
         if let Some(v) = model.get("base_url").and_then(|v| v.as_str()) {
@@ -401,6 +404,10 @@ pub async fn post_config(
 
     // Persist to disk so config survives restarts.
     let _ = config.save();
+    // Note: `state.config.engine` is a frozen snapshot from startup.
+    // It's NOT updated here (would require interior mutability on
+    // WebState). api_runs.rs works around this by re-reading from disk
+    // at the start of each new run — see `live_engine_config()`.
 
     // Set env vars so ModelConfig::load() picks them up for subsequent runs.
     // Safety: single-threaded web server, no concurrent access.

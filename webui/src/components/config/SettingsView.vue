@@ -6,6 +6,7 @@ const { t } = useI18n()
 
 const config = ref<any>({ model: {}, policy: {}, loop_tuning: {}, advanced: {} })
 const saved = ref(false)
+const saveError = ref('')
 const showKey = ref(false)
 const showAdvanced = ref(false)
 const showAdvisor = ref(false)
@@ -169,7 +170,10 @@ async function save() {
   if (!advisorKeyDirty.value) {
     config.value.model.advisor_api_key_masked = origAdvisorKey.value
   }
-  // Convert textarea string → Vec<String> for the API.
+  // Convert textarea string → Vec<String> for the API. The textareas
+  // are the source of truth for these two fields; the underlying
+  // Vec<String> is rebuilt on every save (so an empty textarea
+  // correctly clears the list).
   if (config.value.policy.deny_patterns_text !== undefined) {
     config.value.policy.deny_patterns = config.value.policy.deny_patterns_text
       .split('\n').map((s: string) => s.trim()).filter((s: string) => s.length > 0)
@@ -185,15 +189,24 @@ async function save() {
     config.value.profiles = { ...profiles.value }
   }
   isLoading.value = true
+  saveError.value = ''
   try {
     const resp = await api.post('/api/config', config.value)
     Object.assign(config.value, resp)
     origKey.value = resp.model?.api_key_masked || ''
+    origAdvisorKey.value = resp.model?.advisor_api_key_masked || ''
     profiles.value = resp.profiles || {}
     keyDirty.value = false
-    saved.value = true; setTimeout(() => saved.value = false, 2000)
-  } catch (e) { alert(String(e)) }
-  isLoading.value = false
+    advisorKeyDirty.value = false
+    saved.value = true
+    setTimeout(() => { saved.value = false }, 2000)
+  } catch (e: any) {
+    console.error('[Settings] save failed:', e)
+    saveError.value = String(e?.message ?? e)
+    alert('Save failed: ' + (e?.message ?? e))
+  } finally {
+    isLoading.value = false
+  }
 }
 </script>
 
@@ -396,6 +409,7 @@ async function save() {
     </section>
 
     <button class="primary" @click="save">{{ saved ? t('settings.saved') : t('settings.save') }}</button>
+    <p v-if="saveError" class="save-error">{{ saveError }}</p>
   </div>
 </template>
 
@@ -420,6 +434,7 @@ button.primary { margin-top: 8px; padding: 10px 24px; }
 .profile-input { width: 120px; flex: none; }
 .profile-bar button { font-size: 0.72rem; padding: 5px 8px; white-space: nowrap; }
 .heartbeat-section { border-color: #a78bda; }
+.save-error { color: #d33; font-size: 0.8rem; margin-top: 8px; }
 .hb-active { display: flex; flex-direction: column; gap: 8px; }
 .hb-prompt { font-size: 0.7rem; color: var(--text-muted); max-height: 60px; overflow: hidden; cursor: pointer; }
 .hb-textarea { width: 100%; font-size: 0.72rem; font-family: var(--font-mono); margin: 4px 0; }

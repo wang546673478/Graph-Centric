@@ -11,6 +11,7 @@ use super::errors::ApiError;
 use super::events::{InitialGraphDto, RunEvent};
 use super::run_session::{RunMetadata, RunSession, RunStatus};
 use super::{RunId, WebState};
+use super::state::EngineConfig;
 use crate::agent::decomposer::Decomposer;
 use crate::agent::dispatcher::Dispatcher;
 use crate::agent::enricher::L1Enricher;
@@ -93,10 +94,14 @@ pub async fn create_run(
     Json(body): Json<CreateRunBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = uuid::Uuid::new_v4().to_string();
+    // Read event_channel_capacity from disk so Settings changes take
+    // effect on the next new run (state.config.engine is frozen at
+    // startup; see drive_run for the longer comment).
+    let capacity = EngineConfig::load().loop_tuning.event_channel_capacity;
     let session = Arc::new(RunSession::new(
         id.clone(),
         body.task.clone(),
-        state.config.engine.loop_tuning.event_channel_capacity,
+        capacity,
     ));
     state.runs.write().await.insert(id.clone(), session.clone());
 
@@ -311,10 +316,11 @@ pub async fn create_branch(
     };
 
     let new_id = uuid::Uuid::new_v4().to_string();
+    let capacity = EngineConfig::load().loop_tuning.event_channel_capacity;
     let new_session = Arc::new(RunSession::new(
         new_id.clone(),
         parent_task,
-        state.config.engine.loop_tuning.event_channel_capacity,
+        capacity,
     ));
     state.runs.write().await.insert(new_id.clone(), new_session.clone());
 
@@ -450,13 +456,21 @@ pub async fn drive_run(
     // Save run.json immediately so the run survives process kill.
     let _ = state.persistence.save_run_meta(&session.metadata().await);
 
+    // Re-read the engine config from disk on every new run. The in-memory
+    // `state.config.engine` is frozen at startup and is NOT updated by
+    // POST /api/config (that handler only persists to disk and returns
+    // the new value to the caller). This re-read is what makes the
+    // "save drill-down" type changes actually take effect on the next
+    // run. The disk read is ~one stat + small JSON parse; cheap.
+    let engine = EngineConfig::load();
+
     // Build the GraphLoop. This mirrors what bin/agent_a does.
-    let cfg = ModelConfig::from_engine_config(&state.config.engine.model).with_thinking(
-        state.config.engine.loop_tuning.thinking_enabled,
-        if state.config.engine.loop_tuning.reasoning_effort.is_empty() {
+    let cfg = ModelConfig::from_engine_config(&engine.model).with_thinking(
+        engine.loop_tuning.thinking_enabled,
+        if engine.loop_tuning.reasoning_effort.is_empty() {
             None
         } else {
-            Some(state.config.engine.loop_tuning.reasoning_effort.clone())
+            Some(engine.loop_tuning.reasoning_effort.clone())
         },
     );
     let fast_model =
@@ -490,13 +504,13 @@ pub async fn drive_run(
     // is the root fix.
     // v2.7: read advanced tuning knobs from config so the UI Settings page
     // can override them without code changes.
-    let advanced = state.config.engine.advanced.clone();
+    let advanced = engine.advanced.clone();
     let main_tool_registry = Arc::new(ToolRegistry::new());
     let subagent_tool_registry = Arc::new({
         let mut reg = ToolRegistry::new();
         reg.register(Arc::new(
             BashTool::new().with_default_timeout(std::time::Duration::from_millis(
-                state.config.engine.advanced.bash_default_timeout_ms,
+                engine.advanced.bash_default_timeout_ms,
             )),
         ));
         reg.register(Arc::new(ReadFileTool::default()));
@@ -551,7 +565,7 @@ pub async fn drive_run(
     // the FULL tool registry — it actually executes the
     // sub-tasks. The main agent gets the empty one (see
     // `main_tool_registry` above).
-    let advanced = state.config.engine.advanced.clone();
+    let advanced = engine.advanced.clone();
     let decomposer = Decomposer::new(deep_model.clone())
         .with_max_tokens(advanced.decomposer_default_max_tokens);
     let subagent = Arc::new(
@@ -568,14 +582,14 @@ pub async fn drive_run(
     // (per [[project-concurrency-limits]]). Main runs single-threaded
     // as the orchestrator; the pool below caps subagent fan-out.
     let dispatcher = Dispatcher::new(subagent)
-        .with_max_concurrent(state.config.engine.policy.max_concurrent_subagents);
+        .with_max_concurrent(engine.policy.max_concurrent_subagents);
 
     // Phase 4 — Reviewer + PostExecutionValidator.
     let reviewer = Reviewer::with_model(deep_model.clone());
     let validator: Arc<dyn PostExecutionValidator> =
         Arc::new(
             BashCheckValidator::cargo_check_for(&state.config.project_root)
-                .with_timeout_ms(state.config.engine.advanced.validator_default_timeout_ms),
+                .with_timeout_ms(engine.advanced.validator_default_timeout_ms),
         );
 
     // v2: channel for cascade step events from the backtracker → WS clients.
@@ -591,28 +605,28 @@ pub async fn drive_run(
         .map(|hb| hb.active).unwrap_or(false);
 
     let loop_cfg = GraphLoopConfig {
-        max_rounds: state.config.engine.loop_tuning.max_rounds,
+        max_rounds: engine.loop_tuning.max_rounds,
         max_repair_rounds: 3,
         tool_cwd: state.config.project_root.clone(),
         tool_output_cap: 8_000,
         tool_policy: Arc::new(DangerousCommandDeny::new()),
-        auto_apply_skills: state.config.engine.loop_tuning.auto_apply_skills,
-        stagnation_soft_hint: state.config.engine.loop_tuning.stagnation_soft_hint,
-        stagnation_hard_hint: state.config.engine.loop_tuning.stagnation_hard_hint,
-        stagnation_terminate: state.config.engine.loop_tuning.stagnation_terminate,
-        stuck_soft_hint: state.config.engine.loop_tuning.stuck_soft_hint,
-        stuck_hard_hint: state.config.engine.loop_tuning.stuck_hard_hint,
-        stuck_terminate: state.config.engine.loop_tuning.stuck_terminate,
-        tool_failure_warn_after: state.config.engine.loop_tuning.tool_failure_warn_after,
-        tool_failure_halt_after: state.config.engine.loop_tuning.tool_failure_halt_after,
-        force_search_after_filling_stall: state.config.engine.loop_tuning.force_search_after_filling_stall,
-        convergence_stable_rounds: state.config.engine.loop_tuning.convergence_stable_rounds,
-        max_drilldown_depth: state.config.engine.max_drilldown_depth as u32,
-        sub_run_timeout_ms: Some(state.config.engine.sub_run_timeout_ms),
-        skill_match_threshold: Some(state.config.engine.advanced.skill_match_threshold),
-        skill_match_trigger_weight: Some(state.config.engine.advanced.skill_match_trigger_weight),
-        skill_match_slug_weight: Some(state.config.engine.advanced.skill_match_slug_weight),
-        cascade_max_expand_depth: Some(state.config.engine.advanced.cascade_max_expand_depth as u32),
+        auto_apply_skills: engine.loop_tuning.auto_apply_skills,
+        stagnation_soft_hint: engine.loop_tuning.stagnation_soft_hint,
+        stagnation_hard_hint: engine.loop_tuning.stagnation_hard_hint,
+        stagnation_terminate: engine.loop_tuning.stagnation_terminate,
+        stuck_soft_hint: engine.loop_tuning.stuck_soft_hint,
+        stuck_hard_hint: engine.loop_tuning.stuck_hard_hint,
+        stuck_terminate: engine.loop_tuning.stuck_terminate,
+        tool_failure_warn_after: engine.loop_tuning.tool_failure_warn_after,
+        tool_failure_halt_after: engine.loop_tuning.tool_failure_halt_after,
+        force_search_after_filling_stall: engine.loop_tuning.force_search_after_filling_stall,
+        convergence_stable_rounds: engine.loop_tuning.convergence_stable_rounds,
+        max_drilldown_depth: engine.max_drilldown_depth as u32,
+        sub_run_timeout_ms: Some(engine.sub_run_timeout_ms),
+        skill_match_threshold: Some(engine.advanced.skill_match_threshold),
+        skill_match_trigger_weight: Some(engine.advanced.skill_match_trigger_weight),
+        skill_match_slug_weight: Some(engine.advanced.skill_match_slug_weight),
+        cascade_max_expand_depth: Some(engine.advanced.cascade_max_expand_depth as u32),
         is_heartbeat: is_heartbeat_active,
         graph_schema: if is_heartbeat_active {
             Some(crate::agent::graph_loop::GraphSchema {
@@ -1206,9 +1220,10 @@ pub async fn get_usage(
             duration_ms: meta.duration_ms,
         });
         // Collect model usage from config (what's currently configured).
+        let engine_cfg = EngineConfig::load();
         let model_key = format!("fast:{} deep:{}",
-            state.config.engine.model.fast_model,
-            state.config.engine.model.deep_model,
+            engine_cfg.model.fast_model,
+            engine_cfg.model.deep_model,
         );
         model_breakdown.entry(model_key).or_insert(ModelUsage { calls: 0, tokens: 0 }).tokens += tokens;
     }

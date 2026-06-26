@@ -87,11 +87,37 @@ export function useRunSocket(runId: string, onEvent: (e: WSEvent) => void) {
 }
 
 // ---- API helpers ----
+//
+// `fetch` doesn't reject on 4xx/5xx — it resolves with a Response
+// whose `.ok` is false. Wrap the helpers so callers can `try/catch`
+// the way the standard fetch API behaves.
 export const api = {
-  get: (path: string) => fetch(path).then(r => r.json()),
-  post: (path: string, body?: any) =>
-    fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }).then(r => r.json()),
-  del: (path: string) => fetch(path, { method: 'DELETE' }).then(r => r.json()),
+  get: async (path: string) => {
+    const r = await fetch(path)
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`)
+    return r.json()
+  },
+  post: async (path: string, body?: any) => {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    if (!r.ok) {
+      // Try to surface a useful error message — backend wraps
+      // errors in `{"error": "..."}` (see ApiError's Serialize impl).
+      const text = await r.text()
+      let detail = text
+      try { detail = (JSON.parse(text) as any).error ?? text } catch { /* keep raw */ }
+      throw new Error(`${r.status} ${r.statusText}: ${detail}`)
+    }
+    return r.json()
+  },
+  del: async (path: string) => {
+    const r = await fetch(path, { method: 'DELETE' })
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`)
+    return r.json()
+  },
 }
 
 // ---- run management ----
