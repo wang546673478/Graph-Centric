@@ -301,7 +301,7 @@ impl Verifier {
                     Message::system(load_prompt_file("skills/prompts/l1-check.md", SYSTEM_PROMPT_L1_CHECK)),
                     Message::user(user_prompt),
                 ],
-                tools: vec![],
+                tools: vec![l1_check_tool_schema()],
                 temperature: self.temperature,
                 max_tokens: Some(512),
                 stop: vec![],
@@ -314,9 +314,14 @@ impl Verifier {
                 }
             };
             // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
-            let cleaned = match extract_json_block(resp.text_or_reasoning()) {
-                Ok(c) => c,
-                Err(_) => continue,
+            // Strategy A: prefer native tool_calls; fall back to text.
+            let cleaned = if let Some(c) = parse_l1_check_from_tool_calls(&resp.tool_calls) {
+                c
+            } else {
+                match extract_json_block(resp.text_or_reasoning()) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                }
             };
             let value: serde_json::Value = match serde_json::from_str(&cleaned) {
                 Ok(v) => v,
@@ -383,7 +388,7 @@ impl Verifier {
                 Message::system(load_prompt_file("skills/prompts/verifier.md", SYSTEM_PROMPT_VERIFIER)),
                 Message::user(user_prompt),
             ],
-            tools: vec![],
+            tools: vec![graph_self_check_tool_schema()],
             temperature: self.temperature,
             max_tokens: Some(2048),
             stop: vec![],
@@ -391,6 +396,8 @@ impl Verifier {
         let resp = model.complete(req).await?;
         debug!(
             content_len = resp.content.len(),
+            reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
+            tool_calls = resp.tool_calls.len(),
             tokens = resp.usage.total_tokens,
             "verifier model self-check returned"
         );
@@ -406,16 +413,22 @@ impl Verifier {
         //
         // Reasoning-model fallback (DeepSeek / M3): parse reasoning_content
         // when content is empty. db2d993d regression.
-        let parse_text = resp.text_or_reasoning();
-        let cleaned = match extract_json_block(parse_text) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    raw = %resp.content,
-                    "verifier self-check returned no parseable JSON; skipping model opinion this round"
-                );
-                return Ok((Vec::new(), 0.5));
+        //
+        // Strategy A: prefer native tool_calls; fall back to text.
+        let cleaned = if let Some(c) = parse_graph_self_check_from_tool_calls(&resp.tool_calls) {
+            c
+        } else {
+            let parse_text = resp.text_or_reasoning();
+            match extract_json_block(parse_text) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        raw = %resp.content,
+                        "verifier self-check returned no parseable JSON; skipping model opinion this round"
+                    );
+                    return Ok((Vec::new(), 0.5));
+                }
             }
         };
         let value: serde_json::Value = match serde_json::from_str(&cleaned) {
@@ -478,6 +491,92 @@ fn parse_severity(s: &str) -> Severity {
         "low" | "minor" | "nit" => Severity::Low,
         _ => Severity::Medium,
     }
+}
+
+/// Tool schema for the L1 sample check. Returns a JSON-encoded string
+/// the L1 sample loop can deserialize via the same path it uses for the
+/// text-fallback cleaned JSON. Tool_call path mirrors the legacy shape
+/// exactly so the surrounding loop logic stays unchanged.
+fn l1_check_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "l1_check_verdict",
+            "description": "Decide whether the L1 description matches what the L2 says.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["match", "drift"],
+                        "description": "drift only when you can point at a specific contradiction."
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": "high = would mislead a downstream sub-agent; medium = stylistic / partial / outdated; low = nitpick."
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "What's wrong if drift, else why you think it matches."
+                    }
+                },
+                "required": ["verdict"]
+            }
+        }
+    })
+}
+
+/// Tool schema for the graph self-check (model-advisory layer).
+fn graph_self_check_tool_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "graph_self_check_verdict",
+            "description": "Decide whether the current graph is sufficient to dispatch downstream work on this task.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "verdict": {"type": "string", "enum": ["pass", "fail"]},
+                    "confidence": {"type": "number", "description": "0..1"},
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                                "description": {"type": "string"},
+                                "scope": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["severity", "description"]
+                        }
+                    },
+                    "rationale": {"type": "string"}
+                },
+                "required": ["verdict"]
+            }
+        }
+    })
+}
+
+/// Convert a tool_call L1-check response into the same JSON string the
+/// text-fallback path produces, so downstream code can be reused. Returns
+/// None when no matching tool_call is present.
+fn parse_l1_check_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Option<String> {
+    let tc = tool_calls
+        .iter()
+        .find(|tc| tc.name == "l1_check_verdict")?;
+    Some(tc.arguments.to_string())
+}
+
+/// Parse a graph self-check from native tool_calls. Same strategy as
+/// L1: serialize the structured args back to JSON so the existing
+/// `from_value` path picks them up unchanged.
+fn parse_graph_self_check_from_tool_calls(tool_calls: &[crate::model::ToolCall]) -> Option<String> {
+    let tc = tool_calls
+        .iter()
+        .find(|tc| tc.name == "graph_self_check_verdict")?;
+    Some(tc.arguments.to_string())
 }
 
 // ---------------------------------------------------------------------------
