@@ -261,6 +261,25 @@ impl Reviewer {
             tool_calls = resp.tool_calls.len(),
             "reviewer judge response"
         );
+        // Dump the raw response at warn level when the text path
+        // fails to parse (db2d993d-class debugging). Mirrors the
+        // same pattern added to decomposer.
+        let text_for_log = resp.text_or_reasoning();
+        if !text_for_log.trim().is_empty() && parse_verdict(&text_for_log).is_err() {
+            warn!(
+                content_preview = format!("{:?}", resp.content.chars().take(800).collect::<String>()),
+                reasoning_preview = format!(
+                    "{:?}",
+                    resp.reasoning_content
+                        .as_deref()
+                        .map(|s| s.chars().take(800).collect::<String>())
+                        .unwrap_or_default()
+                ),
+                tool_calls_count = resp.tool_calls.len(),
+                "reviewer model returned a response that didn't parse as JSON. \
+                 See content_preview + reasoning_preview above for what the model said."
+            );
+        }
         // Strategy A: prefer native tool_calls; fall back to text.
         if let Some(v) = parse_verdict_from_tool_calls(&resp.tool_calls) {
             return Ok(v);

@@ -132,6 +132,9 @@ impl Decomposer {
             stop: Vec::new(),
         };
         let resp = self.model.complete(req).await?;
+        // Log the full response at debug level. When a parse failure
+        // follows, this is the only place the raw model output is
+        // recorded — make sure it's visible.
         debug!(
             content_len = resp.content.len(),
             reasoning_len = resp.reasoning_content.as_deref().map(str::len).unwrap_or(0),
@@ -139,6 +142,29 @@ impl Decomposer {
             tokens = resp.usage.total_tokens,
             "decomposer model response"
         );
+        // If the response is malformed, dump the raw content + reasoning
+        // to the warn log so the operator can see what the model
+        // actually returned (db2d993d-class debugging). The
+        // extract_json_block error message also embeds `raw=...` but
+        // only the first 500 chars; this dump is the full picture.
+        let text_for_log = resp.text_or_reasoning();
+        if !text_for_log.trim().is_empty()
+            && parse_decomposer_response(&text_for_log).is_err()
+        {
+            warn!(
+                content_preview = format!("{:?}", resp.content.chars().take(800).collect::<String>()),
+                reasoning_preview = format!(
+                    "{:?}",
+                    resp.reasoning_content
+                        .as_deref()
+                        .map(|s| s.chars().take(800).collect::<String>())
+                        .unwrap_or_default()
+                ),
+                tool_calls_count = resp.tool_calls.len(),
+                "decomposer model returned a response that didn't parse as JSON. \
+                 See content_preview + reasoning_preview above for what the model said."
+            );
+        }
 
         // Strategy A: prefer native tool_calls (db2d993d-class fix); fall
         // back to text parsing when the model emitted none. If both are
