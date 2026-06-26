@@ -321,10 +321,18 @@ impl EngineConfig {
             }
         } else {
             // Fallback: read from env vars like ModelConfig does.
+            // Default the model names to `MODEL_NAME_DEFAULT` (or empty
+            // if not set) so an empty model name fails fast at the
+            // first model call with a clear "model name is empty"
+            // error — instead of silently failing with a 400 "unknown
+            // model" when the user is on a non-DeepSeek backend.
             let base_url = std::env::var("MODEL_BASE_URL").unwrap_or_default();
             let api_key = std::env::var("MODEL_API_KEY").unwrap_or_default();
-            let fast_model = std::env::var("MODEL_NAME_FAST").unwrap_or_else(|_| "deepseek-v4-flash".into());
-            let deep_model = std::env::var("MODEL_NAME_DEEP").unwrap_or_else(|_| "deepseek-v4-pro".into());
+            let default_model = std::env::var("MODEL_NAME_DEFAULT").unwrap_or_default();
+            let fast_model = std::env::var("MODEL_NAME_FAST")
+                .unwrap_or_else(|_| default_model.clone());
+            let deep_model = std::env::var("MODEL_NAME_DEEP")
+                .unwrap_or_else(|_| default_model.clone());
             EngineConfig {
                 model: ModelTierConfig {
                     base_url,
@@ -399,8 +407,8 @@ impl Default for EngineConfig {
                 base_url: String::new(),
                 api_key: String::new(),
                 api_key_masked: String::new(),
-                fast_model: "deepseek-v4-flash".into(),
-                deep_model: "deepseek-v4-pro".into(),
+                fast_model: String::new(),
+                deep_model: String::new(),
                 default_model: None,
                 advisor_base_url: String::new(),
                 advisor_api_key: String::new(),
