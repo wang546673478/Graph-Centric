@@ -494,7 +494,11 @@ pub async fn drive_run(
     let main_tool_registry = Arc::new(ToolRegistry::new());
     let subagent_tool_registry = Arc::new({
         let mut reg = ToolRegistry::new();
-        reg.register(Arc::new(BashTool::new()));
+        reg.register(Arc::new(
+            BashTool::new().with_default_timeout(std::time::Duration::from_millis(
+                state.config.engine.advanced.bash_default_timeout_ms,
+            )),
+        ));
         reg.register(Arc::new(ReadFileTool::default()));
         reg.register(Arc::new(WriteFileTool::default()));
         reg.register(Arc::new(EditFileTool::default()));
@@ -569,7 +573,10 @@ pub async fn drive_run(
     // Phase 4 — Reviewer + PostExecutionValidator.
     let reviewer = Reviewer::with_model(deep_model.clone());
     let validator: Arc<dyn PostExecutionValidator> =
-        Arc::new(BashCheckValidator::cargo_check_for(&state.config.project_root));
+        Arc::new(
+            BashCheckValidator::cargo_check_for(&state.config.project_root)
+                .with_timeout_ms(state.config.engine.advanced.validator_default_timeout_ms),
+        );
 
     // v2: channel for cascade step events from the backtracker → WS clients.
     let (cascade_tx, mut cascade_rx) = tokio::sync::mpsc::unbounded_channel::<
@@ -605,6 +612,7 @@ pub async fn drive_run(
         skill_match_threshold: Some(state.config.engine.advanced.skill_match_threshold),
         skill_match_trigger_weight: Some(state.config.engine.advanced.skill_match_trigger_weight),
         skill_match_slug_weight: Some(state.config.engine.advanced.skill_match_slug_weight),
+        cascade_max_expand_depth: Some(state.config.engine.advanced.cascade_max_expand_depth as u32),
         is_heartbeat: is_heartbeat_active,
         graph_schema: if is_heartbeat_active {
             Some(crate::agent::graph_loop::GraphSchema {

@@ -89,7 +89,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // to involve them. Most domain-agnostic tasks won't call it; code-ish
     // tasks can use it to read source/configs.
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(BashTool::new()));
+    registry.register(Arc::new(
+        BashTool::new().with_default_timeout(std::time::Duration::from_millis(
+            advanced.bash_default_timeout_ms,
+        )),
+    ));
     let tools = Arc::new(registry);
 
     // ---- Models (tiered) ----
@@ -183,7 +187,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // verdict in the Done branch. For demos that allow writes, the same
     // validator catches sub-agent regressions in real time.
     let validator: Arc<dyn PostExecutionValidator> =
-        Arc::new(BashCheckValidator::cargo_check_for(&cwd));
+        Arc::new(
+            BashCheckValidator::cargo_check_for(&cwd)
+                .with_timeout_ms(advanced.validator_default_timeout_ms),
+        );
 
     // Keep a separate handle on the repairer for the auto-repair loop
     // below. Both copies share Arcs to the model + enricher under the hood,
@@ -218,6 +225,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         graph_schema: None,
         sub_run_timeout_ms: None,
         skill_match_threshold: Some(advanced.skill_match_threshold),
+        skill_match_trigger_weight: Some(advanced.skill_match_trigger_weight),
+        skill_match_slug_weight: Some(advanced.skill_match_slug_weight),
+        cascade_max_expand_depth: Some(advanced.cascade_max_expand_depth as u32),
     };
 
     let mut gl = GraphLoop::new(task.clone(), proposer, verifier, Some(repairer), tools, loop_cfg)
@@ -236,8 +246,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Auto-repair budget. Each `LoopState::GraphInvalid` consumes one
     // attempt: we call `LocalRepairer::repair_from_error` for each error,
     // apply the patches, and `resume_with_repaired_graph`. Beyond this
-    // many cycles we surface to the user and exit.
-    const MAX_AUTO_REPAIR_CYCLES: usize = 3;
+    // many cycles we surface to the user and exit. v2.7: tunable via
+    // `engine.advanced.max_auto_repair_cycles`.
+    let max_auto_repair_cycles: usize = advanced.max_auto_repair_cycles;
     let mut auto_repair_cycles: usize = 0;
 
     // ---- Drive the loop ----
@@ -288,14 +299,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!(
                     "│ auto-repair cycle {}/{}",
-                    auto_repair_cycles, MAX_AUTO_REPAIR_CYCLES
+                    auto_repair_cycles, max_auto_repair_cycles
                 );
                 println!("└─────────────────────────────────────────────────────");
 
-                if auto_repair_cycles > MAX_AUTO_REPAIR_CYCLES {
+                if auto_repair_cycles > max_auto_repair_cycles {
                     warn!(
                         "auto-repair budget exhausted after {} cycles; exiting",
-                        MAX_AUTO_REPAIR_CYCLES
+                        max_auto_repair_cycles
                     );
                     dump_outputs(&gl, &task)?;
                     std::process::exit(2);

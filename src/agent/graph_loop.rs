@@ -532,6 +532,9 @@ pub struct GraphLoopConfig {
 
     /// v2.7: weight of slug-token Jaccard in skill match score. Default 0.3.
     pub skill_match_slug_weight: Option<f64>,
+
+    /// v2.7: max L0→L1→L2 expansion depth. Default 2.
+    pub cascade_max_expand_depth: Option<u32>,
 }
 
 /// Default sub-run timeout: 30 minutes. Used when
@@ -565,6 +568,7 @@ impl GraphLoopConfig {
             skill_match_threshold: None,
             skill_match_trigger_weight: None,
             skill_match_slug_weight: None,
+            cascade_max_expand_depth: None,
         }
     }
 }
@@ -3112,7 +3116,7 @@ impl GraphLoop {
             &*self.proposer.model,
             task_graph.clone(),
             &self.task,
-            2, // max depth: L0 → L1 → L2
+            self.config.cascade_max_expand_depth.unwrap_or(2) as usize, // L0→L1→L2 (capped at 3 in cascade_expand)
         ).await;
         let task_graph = match expanded_graph {
             Ok(expanded) => {
