@@ -599,11 +599,17 @@ fn build_system_prompt(
     let defs = tools.defs();
 
     // Use registry with PromptContext for dynamic composition.
+    // Role strings are namespaced ("subagent-edit" / "subagent-explore")
+    // so they can't collide with the main proposer's role ("edit"),
+    // which is also "edit" in proposer.rs. The main proposer doesn't
+    // have file tools; if a "role-edit" prompt block were keyed to
+    // the proposer's "edit" role, the main model would be told about
+    // tools it doesn't have (see 9ca8470e failure).
     let role_section = if let Some(reg) = registry {
         let role = if role_prompt.contains("edit") || role_prompt.contains("code") || role_prompt.contains("修改") {
-            "edit"
+            "subagent-edit"
         } else if role_prompt.contains("explore") || role_prompt.contains("探索") || role_prompt.contains("调研") {
-            "explore"
+            "subagent-explore"
         } else {
             "auto"
         };

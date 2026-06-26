@@ -148,21 +148,18 @@ This is an UNATTENDED automation loop. There is NO human watching.
         }));
 
         // Code editor role — only triggers for actual code-editor sub-agents,
-        // NOT for the main proposer. The main proposer's tool list is the
-        // 6 step kinds (propose_patch / explore / ask_user / ready_for_verify
-        // / block / consult_advisor) — it has NO read_file / edit_file /
-        // write_file. Telling it to use those tools makes the model call
-        // them, the parse step rejects them as "unknown tool_call", and
-        // the run salvages into ask_user. This block used to fire on
-        // any role containing "edit" or "code", which incorrectly hit
-        // the main proposer (whose role is set to "edit" in proposer.rs).
-        // Restrict to a literal "edit" role so only the SubAgent's
-        // sub-edit role gets the file-tools hint.
-        reg.add_dynamic("builtin/role-edit", false, Arc::new(|ctx: &PromptContext| {
-            if ctx.role == "edit" {
+        // NOT for the main proposer. The main proposer's role is
+        // "edit" too (proposer.rs:317), but the prompt block fires on
+        // a distinct role "subagent-edit" so there's no collision. The
+        // main proposer has no file tools; the sub-agent code-edit
+        // path actually has read_file / edit_file / write_file via
+        // api_runs.rs:516-518.
+        reg.add_dynamic("builtin/subagent-edit", false, Arc::new(|ctx: &PromptContext| {
+            if ctx.role == "subagent-edit" {
                 Some(format!(
-                    "## Role: Code Editor\n\
-You are a code modification specialist.\n\
+                    "## Role: Code Editor (sub-agent)\n\
+You are a code modification specialist. You will edit files directly \
+using your dedicated file tools (read_file, edit_file, write_file).\n\
 Task: {}\n\
 **RULES:**\n\
 - Use `read_file` to read, `edit_file` to replace, `write_file` to create.\n\
@@ -175,8 +172,8 @@ Task: {}\n\
         }));
 
         // Explorer role
-        reg.add_dynamic("builtin/role-explore", false, Arc::new(|ctx: &PromptContext| {
-            if ctx.role == "explore" || ctx.role.contains("explore") {
+        reg.add_dynamic("builtin/subagent-explore", false, Arc::new(|ctx: &PromptContext| {
+            if ctx.role == "subagent-explore" {
                 Some(format!(
                     "## Role: Explorer\n\
 Task: {}\n\
@@ -262,11 +259,13 @@ if needed.",
             if let Some(text) = b.compute(ctx) { parts.push(text); }
         }
 
-        // Role block: match "edit", "explore", or generic.
-        let role_block = if ctx.role.contains("edit") || ctx.role.contains("code") {
-            "builtin/role-edit"
-        } else if ctx.role.contains("explore") {
-            "builtin/role-explore"
+        // Role block: match "subagent-edit", "subagent-explore", or generic.
+        // The main proposer's role is "edit" (proposer.rs:317) but it
+        // does NOT match these namespaced keys — only sub-agents do.
+        let role_block = if ctx.role == "subagent-edit" {
+            "builtin/subagent-edit"
+        } else if ctx.role == "subagent-explore" {
+            "builtin/subagent-explore"
         } else {
             ""
         };
