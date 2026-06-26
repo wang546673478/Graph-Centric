@@ -219,8 +219,8 @@ impl L1Enricher {
 
         let req = ModelRequest {
             messages: vec![
-                Message::system(system_prompt),
-                Message::user(user_prompt),
+                Message::system(system_prompt.clone()),
+                Message::user(user_prompt.clone()),
             ],
             tools: vec![enricher_tool_schema()],
             temperature: self.temperature,
@@ -246,7 +246,47 @@ impl L1Enricher {
             // ModelResponse::text_or_reasoning; db2d993d regression.
             resp.text_or_reasoning().to_string()
         };
-        let mut desc = parse_l1_description(&parse_text)?;
+        let parse_result = parse_l1_description(&parse_text);
+        let mut desc = match parse_result {
+            Ok(d) => d,
+            Err(parse_err) => {
+                // Text path failed (e.g., model returned prose
+                // without JSON). One fix-it retry: explicit
+                // "you MUST call the tool" prompt.
+                warn!(
+                    node = %node_id,
+                    error = %parse_err,
+                    "enricher first response was malformed; retrying once with a fix-it prompt"
+                );
+                let retry_prompt = format!(
+                    "Your previous response was malformed (parser said: {parse_err}). \
+                     You MUST call the `write_l1_description` tool with a valid JSON \
+                     `responsibility` field. Do NOT reply with prose or explanations. \
+                     Reply with the tool call only."
+                );
+                let retry_req = ModelRequest {
+                    messages: vec![
+                        Message::system(system_prompt),
+                        Message::user(user_prompt),
+                        Message::assistant(parse_text.clone()),
+                        Message::user(retry_prompt),
+                    ],
+                    tools: vec![enricher_tool_schema()],
+                    temperature: self.temperature,
+                    max_tokens: self.max_tokens,
+                    stop: vec![],
+                };
+                let retry_resp = self.model.complete(retry_req).await?;
+                let retry_text = if let Some(args) =
+                    parse_enricher_from_tool_calls(&retry_resp.tool_calls)
+                {
+                    args
+                } else {
+                    retry_resp.text_or_reasoning().to_string()
+                };
+                parse_l1_description(&retry_text)?
+            }
+        };
         if !has_l2 {
             // Hard-cap confidence on the L0-only path regardless of what
             // the model claimed. The model promised to stay ≤ 0.6 but we

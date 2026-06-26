@@ -38,7 +38,7 @@ use crate::graph::{Graph, NodeId};
 use crate::model::{Message, Model, ModelRequest};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Verdict types
@@ -247,7 +247,7 @@ impl Reviewer {
         let req = ModelRequest {
             messages: vec![
                 Message::system(load_prompt_file("skills/prompts/reviewer.md", SYSTEM_PROMPT_REVIEWER)),
-                Message::user(user_prompt),
+                Message::user(user_prompt.clone()),
             ],
             tools: vec![reviewer_verdict_tool_schema()],
             temperature: self.temperature,
@@ -266,7 +266,45 @@ impl Reviewer {
             return Ok(v);
         }
         // Reasoning-model fallback (DeepSeek / M3). db2d993d regression.
-        parse_verdict(resp.text_or_reasoning())
+        let text = resp.text_or_reasoning();
+        match parse_verdict(&text) {
+            Ok(v) => Ok(v),
+            Err(parse_err) => {
+                // Text path failed (model returned prose without JSON,
+                // or used reasoning instead of the tool). One fix-it
+                // retry: explicit "you MUST call the tool" prompt.
+                warn!(
+                    error = %parse_err,
+                    "reviewer first response was malformed; retrying once with a fix-it prompt"
+                );
+                let retry_prompt = format!(
+                    "Your previous response was malformed (parser said: {parse_err}). \
+                     You MUST call the `judge_verdict` tool with a valid JSON `verdict` field. \
+                     Do NOT reply with prose or explanations. Reply with the tool call only."
+                );
+                let retry_req = ModelRequest {
+                    messages: vec![
+                        Message::system(load_prompt_file(
+                            "skills/prompts/reviewer.md",
+                            SYSTEM_PROMPT_REVIEWER,
+                        )),
+                        Message::user(user_prompt),
+                        Message::assistant(text.clone()),
+                        Message::user(retry_prompt),
+                    ],
+                    tools: vec![reviewer_verdict_tool_schema()],
+                    temperature: self.temperature,
+                    max_tokens: self.max_tokens,
+                    stop: Vec::new(),
+                };
+                let retry_resp = model.complete(retry_req).await?;
+                if let Some(v) = parse_verdict_from_tool_calls(&retry_resp.tool_calls) {
+                    return Ok(v);
+                }
+                let retry_text = retry_resp.text_or_reasoning();
+                parse_verdict(&retry_text)
+            }
+        }
     }
 
     /// Translate a [`ReviewResult`] (when failed with Graph/Scope root_cause)
