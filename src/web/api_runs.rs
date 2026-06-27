@@ -858,6 +858,13 @@ pub async fn drive_run(
         match state_clone {
             LoopState::Paused { question, .. } => {
                 *session.status.write().await = RunStatus::Paused;
+                // Persist immediately so the list-runs endpoint (which
+                // reads state.runs) and the disk (run.json) don't
+                // desync — the user saw the sidebar say "Running" but
+                // the details panel say "Paused" because the previous
+                // save (at run start) still had Running and the pause
+                // never hit disk. (See task 01525e4c for the bug report.)
+                let _ = state.persistence.save_run_meta(&session.metadata().await);
                 session.emit(RunEvent::Transcript {
                     role: "ask_user".into(),
                     content: question.clone(),
@@ -871,6 +878,10 @@ pub async fn drive_run(
                 let answer = if is_heartbeat {
                     info!("heartbeat: self-decompose via virtual user model call");
                     *session.status.write().await = RunStatus::Running;
+                    // Persist the resume too — the user could refresh
+                    // the page mid-self-decompose and we'd want the
+                    // sidebar to show "Running" again immediately.
+                    let _ = state.persistence.save_run_meta(&session.metadata().await);
                     let answer = self_decompose_answer(
                         &*fast_model,
                         &session.task,
@@ -890,6 +901,11 @@ pub async fn drive_run(
             }
             LoopState::GraphInvalid { source, errors, snapshot } => {
                 *session.status.write().await = RunStatus::GraphInvalid;
+                // Persist the GraphInvalid status so reload / refresh
+                // shows the right indicator. Without this, the disk
+                // would still say "Running" while in-memory says
+                // "GraphInvalid" (same desync as Paused).
+                let _ = state.persistence.save_run_meta(&session.metadata().await);
                 let payload = serde_json::json!({
                     "source": format!("{source:?}"),
                     "error_count": errors.len(),
