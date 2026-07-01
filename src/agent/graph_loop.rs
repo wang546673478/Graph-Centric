@@ -2840,11 +2840,19 @@ impl GraphLoop {
                                         .collect::<Vec<_>>()
                                         .join(", ");
                                     self.conversation.add_user(format!(
-                                        "⚠️ These nodes are NOT yet connected into the main chain \
-                                         (start cannot reach them): {ids}. They are floating \
-                                         orphans. Add `LeadsTo` edges to wire each one into the \
-                                         flow so the path runs start → … → deliverable. Every \
-                                         step node must sit on the path from start to deliverable."
+                                        "⚠️ ORPHAN NODES — these are NOT yet connected into the main \
+                                         chain (start cannot reach them): {ids}. They are floating. \
+                                         \n\n\
+                                         FIX: emit `propose_patch` with `add_edges` only — for each \
+                                         orphan, add a `LeadsTo` edge to put it on the path from \
+                                         start toward deliverable. Example: add_edges: [{{ \
+                                         source: \"start\", target: \"orphan-id\", relation: \"LeadsTo\" \
+                                         }}, ...]. \n\n\
+                                         DO NOT use `drill_down` to fix orphans — drill_down starts a \
+                                         sub-run for a complex step, it does NOT add edges. \
+                                         `drill_down` without `add_edges` will leave the orphans \
+                                         floating. Wire them in FIRST, drill_down SECOND if the \
+                                         step really is complex."
                                     ));
                                 }
                             }
@@ -4075,7 +4083,7 @@ const GRAPH_STAGNATION_HARD_HINT: u32 = 6;
 
 /// Graph stagnation tier 3: escalate to GraphInvalid for repair/re-planning.
 #[allow(dead_code)]
-const GRAPH_STAGNATION_TERMINATE: u32 = 8;
+const GRAPH_STAGNATION_TERMINATE: u32 = 12;
 
 /// Compute a lightweight fingerprint of the current graph.
 fn graph_fingerprint(g: &Graph) -> u64 {

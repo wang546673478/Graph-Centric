@@ -18,6 +18,8 @@ Dispatch sub-agents to investigate. Each item is one sub-agent with a focused sc
 {"step":"ready_for_verify","rationale":"..."}
 Declare the graph phase complete. Hands off to the Verifier.
 
+**Before emitting this, every step node you created must be wired into the main chain** (start → … → deliverable). The orphan hint will explicitly tell you to add LeadsTo edges; do not skip it with a drill_down. If you see orphan nodes, emit `propose_patch` with `add_edges` first, then `ready_for_verify`.
+
 ### block
 {"step":"block","reason":"...","needed_from_user":"...","rationale":"..."}
 Self-pause when blocked on something the user must provide.

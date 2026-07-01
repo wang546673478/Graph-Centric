@@ -248,7 +248,7 @@ fn default_true() -> bool {
 
 fn default_stagnation_soft_hint() -> u32 { 4 }
 fn default_stagnation_hard_hint() -> u32 { 6 }
-fn default_stagnation_terminate() -> u32 { 8 }
+fn default_stagnation_terminate() -> u32 { 12 }
 fn default_stuck_soft_hint() -> u32 { 3 }
 fn default_stuck_hard_hint() -> u32 { 5 }
 fn default_stuck_terminate() -> u32 { 6 }
