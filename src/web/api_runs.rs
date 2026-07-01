@@ -1288,7 +1288,185 @@ pub async fn get_sub_runs(
     Ok(Json(all_links))
 }
 
-/// GET /api/runs/:id/parent — return this run's parent run id, if any.
+/// GET /api/runs/:id/full-graph — return the parent's last checkpoint
+/// graph merged with every completed sub-run's graph. Sub-graph nodes
+/// are flattened in (with `Contains` edges from the complex node to
+/// each sub-step) so the 3D panel can render the full hierarchy
+/// without a separate fetch per sub-run.
+///
+/// The merge:
+/// - Start with the parent's last checkpoint's `graph_snapshot`.
+/// - For each `sub_run_link` whose `sub_status` is "done":
+///   - Load the sub-run's last checkpoint from
+///     `data/runs/<id>/sub_runs/<sub_run_id>/checkpoints/000N.json`.
+///   - Take its `graph_snapshot.nodes` (skipping the auto-generated
+///     `start`/`deliverable` placeholders).
+///   - Take its `graph_snapshot.edges` (also skipping edges to the
+///     placeholders).
+///   - Add a `Contains` edge from the parent's complex node to each
+///     sub-node so the hierarchy is explicit in the rendered graph.
+/// - Sub-run graph status "running" or "error" is recorded but
+///   the sub-graph is NOT merged in (avoid showing a half-built
+///   hierarchy as if it were complete).
+///
+/// Returns 404 if the run has no checkpoint directory.
+pub async fn get_full_graph(
+    State(state): AppState,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use crate::graph::{Edge, Node, NodeId, RelationType};
+    use std::collections::HashMap;
+
+    // Load the parent's latest checkpoint.
+    let ckpt_dir = state.persistence.data_dir.join(&id).join("checkpoints");
+    let entries = match std::fs::read_dir(&ckpt_dir) {
+        Ok(e) => e,
+        Err(_) => return Err(StatusCode::NOT_FOUND),
+    };
+    let mut latest_ckpt: Option<crate::web::checkpoint::Checkpoint> = None;
+    for entry in entries.filter_map(|e| e.ok()) {
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+            if let Ok(c) = serde_json::from_str::<crate::web::checkpoint::Checkpoint>(&s) {
+                if latest_ckpt.as_ref().map(|x| c.index > x.index).unwrap_or(true) {
+                    latest_ckpt = Some(c);
+                }
+            }
+        }
+    }
+    let mut ckpt = match latest_ckpt {
+        Some(c) => c,
+        None => return Err(StatusCode::NOT_FOUND),
+    };
+
+    // Sub-run links: read them from this same checkpoint (they accumulate
+    // across the run's lifetime).
+    let sub_links = std::mem::take(&mut ckpt.sub_run_links);
+
+    // Load each completed sub-run's last checkpoint and merge its
+    // sub-graph into the parent's nodes/edges.
+    let mut merged_nodes: HashMap<NodeId, Node> = ckpt
+        .graph_snapshot
+        .nodes
+        .iter()
+        .map(|(id, n)| (id.clone(), n.clone()))
+        .collect();
+    let mut merged_edges: Vec<Edge> = ckpt.graph_snapshot.edges.clone();
+    let mut merged_l1 = ckpt.graph_snapshot.l1.clone();
+
+    for link in sub_links.iter().filter(|l| l.sub_status == "done") {
+        let sub_ckpt_dir = state
+            .persistence
+            .data_dir
+            .join(&id)
+            .join("sub_runs")
+            .join(&link.sub_run_id)
+            .join("checkpoints");
+        let sub_entries = match std::fs::read_dir(&sub_ckpt_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        // Find the latest sub-checkpoint.
+        let mut sub_latest: Option<crate::web::checkpoint::Checkpoint> = None;
+        for entry in sub_entries.filter_map(|e| e.ok()) {
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(s) = std::fs::read_to_string(entry.path()) {
+                if let Ok(c) = serde_json::from_str::<crate::web::checkpoint::Checkpoint>(&s) {
+                    if sub_latest.as_ref().map(|x| c.index > x.index).unwrap_or(true) {
+                        sub_latest = Some(c);
+                    }
+                }
+            }
+        }
+        let sub = match sub_latest {
+            Some(s) => s,
+            None => continue,
+        };
+        // The sub-run graph has auto-injected start/deliverable
+        // placeholders that match the parent's complex node semantically.
+        // Skip them — we only want the sub-step nodes.
+        for (sub_id, sub_node) in sub.graph_snapshot.nodes.iter() {
+            // Skip sub-run's own start/deliverable (they're internal
+            // scaffolding, not part of the L0 merge).
+            if matches!(
+                sub_node.metadata.get("auto_marker").and_then(|v| v.as_str()),
+                Some("sub_start") | Some("sub_deliverable")
+            ) {
+                continue;
+            }
+            merged_nodes.insert(sub_id.clone(), sub_node.clone());
+        }
+        for e in sub.graph_snapshot.edges.iter() {
+            // Skip edges incident on the sub-run's start/deliverable.
+            let src_is_scaffold = sub
+                .graph_snapshot
+                .nodes
+                .get(&e.source)
+                .and_then(|n| n.metadata.get("auto_marker"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == "sub_start" || s == "sub_deliverable")
+                .unwrap_or(false);
+            let tgt_is_scaffold = sub
+                .graph_snapshot
+                .nodes
+                .get(&e.target)
+                .and_then(|n| n.metadata.get("auto_marker"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == "sub_start" || s == "sub_deliverable")
+                .unwrap_or(false);
+            if src_is_scaffold || tgt_is_scaffold {
+                continue;
+            }
+            merged_edges.push(e.clone());
+        }
+        // Add a Contains edge from the parent's complex node to
+        // each sub-step so the hierarchy is explicit.
+        let complex = NodeId::from(link.node_id.as_str());
+        for (sub_id, _) in sub.graph_snapshot.nodes.iter() {
+            if merged_nodes.contains_key(sub_id)
+                && !merged_edges.iter().any(|e| {
+                    e.source == complex
+                        && e.target == *sub_id
+                        && e.relation == RelationType::Contains
+                })
+            {
+                merged_edges.push(Edge::new(
+                    complex.as_str(),
+                    sub_id.as_str(),
+                    RelationType::Contains,
+                    1.0,
+                    &format!("drill_down from sub_run {}", link.sub_run_id),
+                ));
+            }
+        }
+        // Merge L1 descriptions for sub-nodes. L1Store::set is the
+        // public mutation API; entries is private.
+        for (sub_id, desc) in sub.graph_snapshot.l1.iter() {
+            merged_l1.set(sub_id.clone(), desc.clone());
+        }
+    }
+
+    // Reassemble a Graph-shaped payload. We return the JSON values
+    // directly to keep the response flat (the frontend only needs
+    // the maps/vectors, not a full Graph struct reconstruction).
+    let payload = serde_json::json!({
+        "parent_run_id": id,
+        "nodes": merged_nodes
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect::<HashMap<_, _>>(),
+        "edges": merged_edges,
+        "l1": merged_l1,
+        "sub_run_count": sub_links.len(),
+    });
+    Ok(Json(payload))
+}
+
+
 /// For top-level runs the field is missing/null. 404 if `run.json` does
 /// not exist (i.e. the run was never persisted — typical for unknown ids).
 pub async fn get_parent(

@@ -122,8 +122,40 @@ watch(activeRunId, (id) => {
   clarifyOptions.value = []
   if (id && getRunStore(id)) {
     connectToRun(id)
+    // Fetch the merged full graph (parent L0 + all completed
+    // sub-graphs with Contains edges from complex_node). Runs
+    // periodically to pick up drill-down completions.
+    if (fullGraphTimer) clearInterval(fullGraphTimer)
+    fullGraphTimer = setInterval(() => refreshFullGraph(id), 5000)
+    refreshFullGraph(id)
+  } else {
+    if (fullGraphTimer) { clearInterval(fullGraphTimer); fullGraphTimer = null }
   }
 })
+
+let fullGraphTimer: any = null
+
+async function refreshFullGraph(id: string) {
+  try {
+    const r = await fetch(`/api/runs/${id}/full-graph`)
+    if (!r.ok) return
+    const data = await r.json()
+    const s = getRunStore(id)
+    if (!s) return
+    // Backend returns object-mapped nodes. Convert to array of {id, ...}.
+    const nodes = Object.entries(data.nodes || {}).map(([id, n]) => ({ id, ...(n as any) }))
+    // Use a Map keyed by id to dedup — websocket graph_patch events
+    // may have already added some nodes/edges.
+    const map = new Map(s.nodes.map((n: any) => [n.id, n]))
+    for (const n of nodes) map.set(n.id, n)
+    s.nodes = Array.from(map.values())
+    // Edges: dedup by (source, target, relation).
+    const ek = (e: any) => `${e.source}|${e.target}|${e.relation}`
+    const emap = new Map(s.edges.map((e: any) => [ek(e), e]))
+    for (const e of (data.edges || [])) emap.set(ek(e), e)
+    s.edges = Array.from(emap.values())
+  } catch { /* ignore transient errors */ }
+}
 
 function newChat() {
   if (socket) { socket.disconnect(); socket = null }
