@@ -1117,19 +1117,29 @@ impl GraphLoop {
     /// clone of the parent's proposer/model/tools/decomposer/etc. so the
     /// child can actually expand the complex node into a sub-graph.
     pub fn new_with_depth(
+        parent_proposer: crate::agent::proposer::GraphProposer,
+        parent_verifier: crate::agent::verifier::Verifier,
+        parent_repairer: Option<crate::agent::repairer::LocalRepairer>,
+        parent_tools: std::sync::Arc<crate::tools::ToolRegistry>,
         cfg: GraphLoopConfig,
         parent_run_id: String,
         current_depth: u32,
         sub_task: Option<String>,
     ) -> Self {
-        use crate::agent::proposer::GraphProposer;
-        use crate::agent::verifier::Verifier;
-        let model: Arc<dyn crate::model::Model> = Arc::new(NoopModel);
-        let tools = Arc::new(crate::tools::ToolRegistry::new());
-        let proposer = GraphProposer::new(model.clone(), tools.clone(), None);
-        let verifier = Verifier::structural_only();
+        // Use the parent's actual proposer/verifier/tools so the sub-loop
+        // can call the model and emit real propose_patch. The previous
+        // implementation used a NoopModel that immediately returned
+        // ready_for_verify — sub-runs produced 0 nodes, defeating the
+        // drill-down feature entirely. (See task 5b565105 bug report.)
         let task_str = sub_task.unwrap_or_else(|| "sub-graph task".to_string());
-        let mut sub = Self::new(task_str, proposer, verifier, None, tools, cfg);
+        let mut sub = Self::new(
+            task_str,
+            parent_proposer,
+            parent_verifier,
+            parent_repairer,
+            parent_tools,
+            cfg,
+        );
         sub.parent_run_id = Some(parent_run_id);
         sub.current_depth = current_depth;
         sub
@@ -1242,6 +1252,7 @@ impl GraphLoop {
     /// drill_down marks was applied), or falls back to the node's summary
     /// if no reason was provided.
     pub fn build_sub_task_for(&self, complex_node: &NodeId) -> String {
+        use crate::agent::proposer::render_graph_for_prompt;
         let node = match self.graph.nodes.get(complex_node) {
             Some(n) => n,
             None => return format!("Drill-down: {}", complex_node.as_str()),
@@ -1251,13 +1262,38 @@ impl GraphLoop {
             .get(complex_node)
             .cloned()
             .unwrap_or_else(|| node.summary.clone());
+        // Render the parent's current graph so the sub-loop model has
+        // context for the surrounding structure when it expands this
+        // node. Without this, the model would be expanding in a vacuum.
+        let parent_graph_snapshot = render_graph_for_prompt(&self.graph);
         format!(
-            "[Drill-down of {}] {}\n\n\
-             Goal: produce a sub-graph explaining how to implement this step. \
-             Expand it into concrete sub-steps connected by LeadsTo / DependsOn / \
-             Contains. Use semantic ids and emit a complete sub-graph.",
-            complex_node.as_str(),
-            reason
+            "[Drill-down of {id}] {reason}\n\n\
+             ## Parent graph state (so you know what's around you)\n\
+             {parent_graph_snapshot}\n\n\
+             ## What you MUST do\n\
+             You are a sub-graph that EXPANDS the single complex node above into \
+             concrete sub-steps. The parent run will merge your `propose_patch` \
+             into the L0 graph under this node.\n\
+             \n\
+             ### Required output\n\
+             Emit a `propose_patch` tool_call. Your patch must:\n\
+             - `add_nodes`: 3-8 sub-steps, each with `kind: Task` and a semantic id\n\
+             - `add_edges`: at least one `LeadsTo` chain + at least one `DependsOn`\n\
+               between your sub-steps (so the sub-graph is more than a linear line)\n\
+             - `reason`: 1-2 sentences why this expansion\n\
+             - `rationale`: 1-2 sentences how the sub-steps help implement the parent\n\
+             \n\
+             ### Use semantic ids\n\
+             Short kebab-case nouns (`extract-amount`, `define-event-schema`,\n\
+             `setup-rbac`), NOT `step1` / `B1` / `T1`.\n\n\
+             ### DO NOT\n\
+             - DO NOT add a `start` or `deliverable` node — the parent already has them\n\
+             - DO NOT propose graph changes outside this sub-graph (no top-level edits)\n\
+             - DO NOT call `consult_advisor` or other meta-steps; just `propose_patch`\n\
+             - DO NOT reply with prose explaining; the tool_call IS your response",
+            id = complex_node.as_str(),
+            reason = reason,
+            parent_graph_snapshot = parent_graph_snapshot,
         )
     }
 
@@ -1315,7 +1351,14 @@ impl GraphLoop {
 
         let sub_run_id_for_loop = sub_run_id.clone();
         let parent_run_id = self.run_id.clone();
+        // Pass the parent's actual proposer/verifier/tools so the sub-loop
+        // can drive the real model. Without this the sub-run used a
+        // NoopModel and produced 0 nodes.
         let sub_loop = GraphLoop::new_with_depth(
+            self.proposer.clone(),
+            self.verifier.clone(),
+            self.repairer.clone(),
+            self.tools.clone(),
             sub_config,
             parent_run_id,
             new_depth,
