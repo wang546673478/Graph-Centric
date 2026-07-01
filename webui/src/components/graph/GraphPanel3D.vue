@@ -21,16 +21,40 @@ const NODE_R = 0.25, SCOPE_R = 0.35
 
 function labelDiv(text: string, size = '10px', color = C.text): CSS2DObject {
   const div = document.createElement('div')
-  div.textContent = text.length > 22 ? text.slice(0, 22) + '…' : text
+  div.textContent = text.length > 24 ? text.slice(0, 24) + '…' : text
   div.style.fontSize = size; div.style.color = color
-  div.style.fontWeight = '500'; div.style.textShadow = `0 0 4px ${C.bg}`
+  div.style.fontWeight = '500'; div.style.textShadow = `0 0 4px ${C.bg}, 0 0 4px ${C.bg}, 0 0 4px ${C.bg}`
   div.style.whiteSpace = 'nowrap'; div.style.fontFamily = 'system-ui, sans-serif'
+  // Prevent the label from intercepting any mouse events (so OrbitControls drag still works)
+  div.style.pointerEvents = 'none'
+  div.style.userSelect = 'none'
+  // Inline background pad so the text reads against the bg.
+  div.style.background = C.bg + 'cc'
+  div.style.padding = '1px 5px'
+  div.style.borderRadius = '3px'
   return new CSS2DObject(div)
 }
 
 function posForNode(idx: number): THREE.Vector3 {
-  const a = (idx / Math.max(props.nodes.length || 1, 1)) * Math.PI * 2
-  return new THREE.Vector3(Math.cos(a) * 4.5, (Math.random() - 0.5) * 2.5, Math.sin(a) * 4.5)
+  // Helix / spiral layout: nodes wrap around the Y axis as they go
+  // down a vertical slope. This breaks the single-ring collision
+  // problem (8+ nodes on one circle always overlap their labels) and
+  // uses the Y axis to add a third dimension for label separation.
+  const n = Math.max(props.nodes.length, 1)
+  const t = n <= 1 ? 0 : idx / (n - 1) // 0..1
+  const turns = Math.max(1.5, n / 4) // more nodes → more spiral turns
+  const angle = t * Math.PI * 2 * turns
+  // Radius grows with node count so labels don't pile up.
+  const r = 3.5 + Math.sqrt(n) * 1.1
+  // Y descends from +n/2 to -n/2 with a small per-index jitter so
+  // labels at the same Y don't perfectly overlap.
+  const yBase = n / 2 - t * n
+  const yJitter = ((idx * 7919) % 7) / 7 - 0.5 // deterministic [-0.5, 0.5]
+  return new THREE.Vector3(
+    Math.cos(angle) * r,
+    yBase + yJitter * 0.6,
+    Math.sin(angle) * r,
+  )
 }
 
 function initScene() {
@@ -68,7 +92,10 @@ function makeNodeGroup(id: string, label: string, inScope: boolean, hasKids: boo
   g.add(new THREE.Mesh(new THREE.SphereGeometry(r, 32, 16), new THREE.MeshStandardMaterial({ color: c, roughness: 0.3, metalness: 0.1, emissive: c, emissiveIntensity: 0.2 })))
   if (hasKids) g.add(new THREE.Mesh(new THREE.TorusGeometry(r + 0.08, 0.04, 16, 32), new THREE.MeshStandardMaterial({ color: C.complex, emissive: C.complex, emissiveIntensity: 0.4 })))
   if (inScope) g.add(new THREE.Mesh(new THREE.SphereGeometry(r + 0.2, 32, 16), new THREE.MeshBasicMaterial({ color: C.scope, transparent: true, opacity: 0.15 })))
-  const lbl = labelDiv(label || id); lbl.position.y = r + 0.4; g.add(lbl)
+  // Stagger label height based on userData hash so neighbors don't
+  // sit at the same Y (helper's simple ID-hash keeps it deterministic).
+  const stagger = (id.charCodeAt(0) % 5) * 0.18
+  const lbl = labelDiv(label || id); lbl.position.y = r + 0.5 + stagger; g.add(lbl)
   return g
 }
 

@@ -1,0 +1,10 @@
+{
+  "id": "ec6d0f24-efa3-4749-bde0-13660972f6c7",
+  "task": "为博客系统设计后端:用什么 ORM? Express + Prisma 还是 Fastify + Drizzle?",
+  "status": {
+    "Paused": null
+  },
+  "duration_ms": 19727433,
+  "captured_skill": null,
+  "tokens_used": 20354
+}

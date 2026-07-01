@@ -1043,7 +1043,7 @@ fn proposer_tools(has_advisor: bool) -> Vec<serde_json::Value> {
             "type": "function",
             "function": {
                 "name": "consult_advisor",
-                "description": "Ask the independent advisor model a design or knowledge question and get a second opinion. The advisor only answers — it does NOT modify the graph. Use when you're genuinely unsure how to proceed and a second perspective would help. The answer is added to the conversation; you then decide the next step.",
+                "description": "Get a second opinion from the advisor model (independent backend, e.g. DeepSeek). The advisor only ANSWERS — it does not modify the graph. USE THIS PROACTIVELY for: (a) any task involving library/framework choice or API design pattern; (b) any task where you'd otherwise guess at a best practice; (c) any task marked as a system or architecture design. Put the question in `question`; put relevant context (constraints, what you already tried) in `context`; the `rationale` says why a second opinion matters here. The answer comes back as a 'user' message so you can decide the next step with the new info.",
                 "parameters": {
                     "type": "object",
                     "properties": {

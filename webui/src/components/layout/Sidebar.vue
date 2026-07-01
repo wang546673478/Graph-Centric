@@ -67,15 +67,10 @@ function statusClass(s: string) {
     </div>
     <div class="section-header">
       <span>{{ t('sidebar.runs') }}</span>
-      <span class="count">{{ filtered.length }}/{{ runs.length }}</span>
+      <span class="count">{{ filtered.length }} / {{ runs.length }}</span>
     </div>
-    <div class="run-list">
-      <div v-if="!runs.length" class="empty">
-        <div class="empty-icon">📭</div>
-        <div class="empty-msg">还没有 run</div>
-        <button class="empty-cta" @click="quickStart">开始第一个任务 →</button>
-      </div>
-      <div v-else-if="!filtered.length" class="empty">
+    <div class="run-list" v-if="runs.length">
+      <div v-if="!filtered.length" class="empty small">
         <div class="empty-icon">🔍</div>
         <div class="empty-msg">没有匹配的 run</div>
         <button class="empty-cta-secondary" @click="search = ''; statusFilter = 'all'">清除过滤</button>
@@ -105,6 +100,7 @@ function statusClass(s: string) {
 .section-header { padding: 8px 14px 4px; font-size: 0.6rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.08em; font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; }
 .count { font-size: 0.65rem; color: var(--text-muted); font-weight: 400; text-transform: none; letter-spacing: 0; }
 .empty { padding: 20px 14px; color: var(--text-muted); text-align: center; }
+.empty.small { padding: 12px 8px; }
 .empty-icon { font-size: 1.5rem; margin-bottom: 6px; opacity: 0.6; }
 .empty-msg { font-size: 0.75rem; margin-bottom: 10px; }
 .empty-cta, .empty-cta-secondary { padding: 6px 12px; border-radius: 4px; font-size: 0.72rem; cursor: pointer; border: none; transition: filter 0.1s; }

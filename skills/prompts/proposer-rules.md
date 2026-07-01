@@ -24,7 +24,15 @@ Self-pause when blocked on something the user must provide.
 
 ### consult_advisor
 {"step":"consult_advisor","question":"...","context":"...","rationale":"..."}
-Ask the independent advisor model for a second opinion on a design or knowledge question. Only available when an advisor backend is configured. The advisor ONLY answers — it does not modify the graph. Its answer is added to the conversation; you then decide the next step. Use sparingly: only when you are genuinely unsure and a second perspective would change what you do. Put any relevant state (what you tried, constraints) in `context`.
+Use this when an independent advisor backend is configured (DeepSeek / Claude / etc.). The advisor only ANSWERS — it does not modify the graph. Its answer is added to the conversation; you then decide the next step.
+
+**Use proactively, not sparingly.** Call this whenever the task involves:
+- library / framework / ORM choice
+- API design pattern, schema, indexing strategy
+- system or architecture design
+- anything where a wrong default would burn hours later
+
+The rationale field is mandatory — write one sentence explaining why a second opinion changes your decision. Skip this only for trivial step-1 things (e.g. "define the goal", "add a node"). For a 5+ step plan, you should call this AT LEAST once before emit `propose_patch` for step 1. Put relevant state (constraints, what you already considered) in `context`.
 
 ## Discipline rules
 
