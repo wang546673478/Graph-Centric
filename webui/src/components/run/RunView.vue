@@ -128,10 +128,28 @@ watch(activeRunId, (id) => {
     if (fullGraphTimer) clearInterval(fullGraphTimer)
     fullGraphTimer = setInterval(() => refreshFullGraph(id), 5000)
     refreshFullGraph(id)
+    // Refresh sub-runs list (for drill-down status display).
+    refreshSubRuns(id)
+    if (subRunsTimer) clearInterval(subRunsTimer)
+    subRunsTimer = setInterval(() => refreshSubRuns(id), 5000)
   } else {
     if (fullGraphTimer) { clearInterval(fullGraphTimer); fullGraphTimer = null }
+    if (subRunsTimer) { clearInterval(subRunsTimer); subRunsTimer = null }
+    subRuns.value = []
   }
 })
+
+let subRunsTimer: any = null
+const subRuns = ref<{ node_id: string; sub_run_id: string; sub_status: string }[]>([])
+
+async function refreshSubRuns(id: string) {
+  try {
+    const r = await fetch(`/api/runs/${id}/sub-runs`)
+    if (!r.ok) return
+    const data = await r.json()
+    subRuns.value = data || []
+  } catch { /* ignore */ }
+}
 
 let fullGraphTimer: any = null
 
@@ -275,6 +293,9 @@ async function submitTask(task: string) {
         <button v-if="status === 'Running' || status === 'graph'" class="danger" @click="stopRun">{{ t('run.stop') }}</button>
         <button v-if="activeRunId && (status === 'Done' || status === 'Error' || status === 'Cancelled' || status === 'paused')" class="secondary" @click="branchRerun">⑂ 分支重跑</button>
         <span class="run-label" v-if="activeRunId">{{ activeRunId.slice(0,8) }}… · {{ status }}</span>
+        <span v-if="subRuns.length" class="sub-runs-badge" :title="subRuns.map(s => `${s.node_id} → ${s.sub_run_id.slice(0,8)} (${s.sub_status})`).join('\n')">
+          🔍 {{ subRuns.length }} sub-run{{ subRuns.length === 1 ? '' : 's' }}
+        </span>
       </div>
       <div v-if="clarifyOptions.length" class="clarify-options">
         <button v-for="(opt, i) in clarifyOptions" :key="i" class="clarify-opt" @click="submitTask(opt)">
@@ -301,6 +322,7 @@ async function submitTask(task: string) {
 .toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-top: 1px solid var(--border); background: var(--bg); }
 .toolbar button { font-size: 0.75rem; padding: 4px 10px; }
 .run-label { font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono); }
+.sub-runs-badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); margin-left: auto; cursor: help; }
 .clarify-options { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px 0; }
 .clarify-opt {
   background: var(--bg-hover); border: 1px solid var(--border); color: var(--text);

@@ -3249,7 +3249,50 @@ impl GraphLoop {
         }
 
         if !all_ok {
-            // Surface failures to the caller — Phase 3 v1 doesn't auto-retry.
+            // v2.7: when sub-agent just failed (success=false, no
+            // graph_error report), treat it as a generic L0Structural
+            // error and route through the same auto-replan path used
+            // for graph errors. This makes "if the step can't execute,
+            // replan it" automatic for any failure mode, not just
+            // graph-shape errors. Anchor failures (start/deliverable)
+            // still surface to the caller because the anchor must
+            // never be auto-redesigned.
+            if !failures.is_empty() {
+                let synthetic_errors: Vec<GraphError> = failures
+                    .iter()
+                    .filter_map(|f| {
+                        // Don't try to replan the anchor — the L0
+                        // gate explicitly rejects it (handle_task_phase_
+                        // graph_errors also bails). The anchor's failure
+                        // means the entire plan is broken; surface it.
+                        let node = self.graph.nodes.get(
+                            &crate::graph::NodeId::from(f.task_id.as_str()),
+                        )?;
+                        if node.immutable {
+                            return None;
+                        }
+                        Some(GraphError::L0Structural {
+                            error_type: L0ErrorType::MissingRelation,
+                            detail: format!(
+                                "Sub-agent for {} failed: {}. Re-planning.",
+                                f.task_id, f.error
+                            ),
+                            related_nodes: vec![crate::graph::NodeId::from(
+                                f.task_id.as_str(),
+                            )],
+                            discovered_by: Some("subagent_failure".into()),
+                        })
+                    })
+                    .collect();
+                if !synthetic_errors.is_empty() {
+                    warn!(
+                        count = synthetic_errors.len(),
+                        "graph_loop: sub-agent(s) failed; auto-replanning affected steps"
+                    );
+                    return self.handle_task_phase_graph_errors(synthetic_errors).await;
+                }
+            }
+            // Anchor failures (or empty synthetic list) — surface to caller.
             warn!(
                 count = failures.len(),
                 "graph_loop: surfacing TaskFailed to caller"
