@@ -2,6 +2,8 @@
 import { onMounted, provide, ref, watch } from 'vue'
 import Sidebar from './components/layout/Sidebar.vue'
 import TopBar from './components/shared/TopBar.vue'
+import ShortcutsHelp from './components/shared/ShortcutsHelp.vue'
+import { useShortcuts } from './composables/useShortcuts'
 import { activeRunId, detailMode, runs, loadRuns } from './composables/useRunSocket'
 
 provide('activeRunId', activeRunId)
@@ -14,6 +16,9 @@ const sidebarCollapsed = ref(localStorage.getItem(SIDEBAR_KEY) === '1')
 const rightCollapsed = ref(localStorage.getItem(RIGHT_KEY) === '1')
 watch(sidebarCollapsed, (v) => localStorage.setItem(SIDEBAR_KEY, v ? '1' : '0'))
 watch(rightCollapsed, (v) => localStorage.setItem(RIGHT_KEY, v ? '1' : '0'))
+
+// Global keyboard shortcuts. "/" focuses search/composer; "?" toggles help.
+const { showHelp, isMac } = useShortcuts()
 
 onMounted(() => { loadRuns() })
 </script>
@@ -43,6 +48,8 @@ onMounted(() => { loadRuns() })
         <span>P3 在此填充</span>
       </div>
     </aside>
+
+    <ShortcutsHelp v-if="showHelp" :isMac="isMac" @close="showHelp = false" />
   </div>
 </template>
 

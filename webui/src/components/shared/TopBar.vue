@@ -31,6 +31,7 @@ function toggleLang() {
     </nav>
     <div class="right">
       <button class="primary new-chat-btn" @click="newChat">{{ t('run.newChat') }}</button>
+      <button class="shortcut-hint" @click="$root?.$el?.dispatchEvent?.(new KeyboardEvent('keydown', { key: '?' }))" title="按 ? 打开快捷键帮助">⌨ ?</button>
       <button class="lang-btn" @click="toggleLang" :title="locale === 'en' ? '切换到中文' : 'Switch to English'">
         {{ locale === 'en' ? '中文' : 'EN' }}
       </button>
@@ -70,4 +71,6 @@ nav a:hover, nav a.router-link-active {
   line-height: 1;
 }
 .theme-btn:hover { border-color: var(--accent); }
+.shortcut-hint { background: var(--bg-hover); border: 1px solid var(--border); padding: 2px 8px; border-radius: 4px; font-size: 0.72rem; cursor: pointer; color: var(--text-muted); }
+.shortcut-hint:hover { color: var(--accent); border-color: var(--accent); }
 </style>
