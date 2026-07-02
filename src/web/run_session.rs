@@ -30,6 +30,11 @@ pub struct RunSession {
     /// Resolved by `POST /api/runs/{id}/repair` when the run is `GraphInvalid`.
     pub pending_repair: Notify,
     pub pending_repair_value: tokio::sync::Mutex<Option<Graph>>,
+    /// v2 spec §4.7: per-run monotonic event counter. The WS
+    /// forwarder stamps every event with the current value, then
+    /// increments. The frontend uses this to detect missed
+    /// events on reconnect.
+    event_id_counter: std::sync::atomic::AtomicU64,
     /// Last known graph (kept in sync with broadcast events).
     pub last_graph: tokio::sync::RwLock<Arc<Graph>>,
     /// Last known review result (if any).
@@ -81,7 +86,15 @@ impl RunSession {
             checkpoints: tokio::sync::Mutex::new(CheckpointStore::new()),
             tokens_used: tokio::sync::Mutex::new(0),
             persisted_duration_ms: tokio::sync::Mutex::new(0),
+            event_id_counter: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// v2 spec §4.7: allocate the next event id for this run.
+    /// Monotonically increasing; never reused.
+    pub fn next_event_id(&self) -> u64 {
+        self.event_id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Broadcast an event to all SSE subscribers. No-op if there are no

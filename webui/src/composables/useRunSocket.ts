@@ -68,20 +68,73 @@ export function getRunStore(id: string) {
 // ---- WS connection ----
 export function useRunSocket(runId: string, onEvent: (e: WSEvent) => void) {
   const connected = ref(false)
+  // v2 spec §4.7: monotonic event counter tracked by the
+  // frontend. Used to detect "missed events" on reconnect.
+  let lastEventId = 0
   let ws: WebSocket | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let backoff = 1000
+  const MAX_BACKOFF_MS = 30000
+  const MAX_RECONNECTS = 20
+  let reconnectAttempts = 0
 
   function connect() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
     ws = new WebSocket(`${protocol}//${location.host}/ws/runs/${runId}`)
-    ws.onopen = () => { connected.value = true; backoff = 1000 }
+    ws.onopen = () => {
+      connected.value = true
+      backoff = 1000
+      reconnectAttempts = 0
+    }
     ws.onmessage = (msg) => {
-      try { onEvent(JSON.parse(msg.data)) } catch { /* skip */ }
+      try {
+        const parsed = JSON.parse(msg.data)
+        // Backend stamps every event with an `id` field for the
+        // Last-Event-ID protocol. If the gap between the last
+        // seen id and the new id is > 1, we missed events; the
+        // UI can show a "reconnect — events may have been
+        // missed" hint.
+        if (typeof parsed.id === 'number') {
+          if (lastEventId > 0 && parsed.id > lastEventId + 1) {
+            // Surface a synthetic "missed_events" notice so the
+            // UI can show a banner. The actual missed events
+            // are not replayed (no event log on the server yet);
+            // the user can re-checkpoint to recover.
+            onEvent({
+              type: 'missed_events',
+              data: {
+                from_id: lastEventId,
+                to_id: parsed.id,
+                count: parsed.id - lastEventId - 1,
+              },
+            })
+          }
+          lastEventId = parsed.id
+        }
+        onEvent(parsed)
+      } catch {
+        /* skip */
+      }
     }
     ws.onclose = () => {
       connected.value = false
-      reconnectTimer = setTimeout(() => { backoff = Math.min(backoff * 2, 30000); connect() }, backoff)
+      reconnectAttempts += 1
+      if (reconnectAttempts > MAX_RECONNECTS) {
+        // v2 spec §4.7: surface a "connection lost" UI
+        // state. Caller can show a banner with a "retry
+        // now" button.
+        onEvent({
+          type: 'connection_lost',
+          data: { attempts: reconnectAttempts, run_id: runId },
+        })
+        return
+      }
+      // Exponential backoff with full jitter (50%-100% of the
+      // computed delay) to avoid thundering herd when many
+      // clients reconnect at once.
+      const delay = Math.floor(backoff * (0.5 + Math.random() * 0.5))
+      backoff = Math.min(backoff * 2, MAX_BACKOFF_MS)
+      reconnectTimer = setTimeout(() => connect(), delay)
     }
     ws.onerror = () => ws?.close()
   }

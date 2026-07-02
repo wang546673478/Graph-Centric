@@ -14,6 +14,7 @@ import PhaseProgress from './PhaseProgress.vue'
 import BlockModal from './BlockModal.vue'
 import ExplorerBar from './ExplorerBar.vue'
 import CheckpointTimeline from './CheckpointTimeline.vue'
+import SubRunTree from './SubRunTree.vue'
 
 const { t } = useI18n()
 const tab = ref('graph')
@@ -359,6 +360,7 @@ async function submitTask(task: string) {
         :checkpoints="checkpoints"
         :selected="selectedCheckpoint"
         @select="loadCheckpoint" />
+      <SubRunTree v-if="subRuns.length" :entries="subRuns" />
       <DebugTimeline v-else-if="tab === 'debug'" />
     </div>
 

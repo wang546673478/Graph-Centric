@@ -52,7 +52,11 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>, id: RunId) {
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
-                    let ws_msg = run_event_to_ws_msg(&event, detail_mode);
+                    // v2 spec §4.7: stamp with a per-run monotonic
+                    // id so the frontend can detect missed
+                    // events on reconnect.
+                    let event_id = forward_session.next_event_id();
+                    let ws_msg = run_event_to_ws_msg(&event, detail_mode, event_id);
                     if let Some(msg) = ws_msg {
                         if ws_sender.send(msg).await.is_err() {
                             break;
@@ -66,6 +70,7 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>, id: RunId) {
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+        drop(forward_session);
     });
 
     // Process incoming client messages.
@@ -78,14 +83,14 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>, id: RunId) {
                     match msg_type {
                         "resume" => {
                             if let Some(answer) = json["answer"].as_str() {
-                                forward_session
+                                session
                                     .provide_answer(answer.to_string())
                                     .await;
                             }
                         }
                         "repair" => {
                             if let Ok(graph) = serde_json::from_value(json["graph"].clone()) {
-                                forward_session.provide_repair(graph).await;
+                                session.provide_repair(graph).await;
                             }
                         }
                         "set_detail_mode" => {
@@ -109,13 +114,22 @@ async fn handle_ws(socket: WebSocket, state: Arc<WebState>, id: RunId) {
 
 /// Convert a RunEvent to a WebSocket text message. Returns None for
 /// events that should be filtered when detail_mode is off.
-fn run_event_to_ws_msg(event: &RunEvent, detail_mode: bool) -> Option<Message> {
+///
+/// v2 spec §4.7: stamps every message with a monotonic `id` so
+/// the frontend can detect missed events on reconnect. The
+/// counter is per-run and lives on the session.
+fn run_event_to_ws_msg(event: &RunEvent, detail_mode: bool, event_id: u64) -> Option<Message> {
     // Filter verbose events when detail mode is off.
     if !detail_mode {
         if let RunEvent::ModelCall { .. } | RunEvent::CascadeStep { .. } = event {
             return None;
         }
     }
-    let json = serde_json::to_string(event).ok()?;
+    // Wrap the event JSON in a {"id": N, "data": {...}} envelope.
+    let mut obj = serde_json::to_value(event).ok()?;
+    if let serde_json::Value::Object(ref mut map) = obj {
+        map.insert("id".to_string(), serde_json::json!(event_id));
+    }
+    let json = serde_json::to_string(&obj).ok()?;
     Some(Message::Text(json.into()))
 }

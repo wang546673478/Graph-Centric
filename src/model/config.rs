@@ -33,6 +33,28 @@ use super::{Model, OpenAICompatModel};
 use crate::error::{HarnessError, Result};
 use std::sync::Arc;
 
+/// v2 spec §5.2: which model layer a call belongs to. Used by
+/// `model_for_layer` to route the call to the right tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLayer {
+    /// Proposer — the main agent. Cheap / fast tier by default.
+    Proposer,
+    /// Subagent — dispatched by the proposer. Cheap / fast.
+    Subagent,
+    /// Verifier L1 sampling — quick drift check. Fast.
+    VerifierL1,
+    /// Verifier graph self-check — structural pass. Deep.
+    VerifierGraph,
+    /// Reviewer — final judgment. Deep.
+    Reviewer,
+    /// Decomposer — turns the world graph into a task DAG. Deep.
+    Decomposer,
+    /// Cascade backtracker — runs a structured rollback. Deep.
+    Cascade,
+    /// Unknown / not classified. Defaults to fast.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub base_url: String,
@@ -187,6 +209,24 @@ impl ModelConfig {
     /// Build the **deep-tier** model client.
     pub fn deep_model(&self) -> Arc<dyn Model> {
         Arc::new(self.build(&self.deep))
+    }
+
+    /// v2 spec §5.2: pick the right model for a given layer.
+    /// Proposer / SubAgent / VerifierL1 → fast (cheap, high throughput).
+    /// Reviewer / Decomposer / Cascade / VerifierGraph → deep (slow,
+    /// high quality). When the layer is unknown, falls back to
+    /// the fast tier to keep the run moving.
+    pub fn model_for_layer(&self, layer: ModelLayer) -> Arc<dyn Model> {
+        match layer {
+            ModelLayer::Proposer => self.fast_model(),
+            ModelLayer::Subagent => self.fast_model(),
+            ModelLayer::VerifierL1 => self.fast_model(),
+            ModelLayer::VerifierGraph => self.deep_model(),
+            ModelLayer::Reviewer => self.deep_model(),
+            ModelLayer::Decomposer => self.deep_model(),
+            ModelLayer::Cascade => self.deep_model(),
+            ModelLayer::Unknown => self.fast_model(),
+        }
     }
 
     /// Build the optional **advisor** model client. Returns None when no

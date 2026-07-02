@@ -191,6 +191,12 @@ struct BashInput {
     timeout_ms: Option<u64>,
     #[serde(default)]
     description: Option<String>,
+    /// v2 spec §5.1: when true, the tool returns the command it
+    /// WOULD have run plus a brief read-only / policy analysis
+    /// without actually executing it. Use this to preview
+    /// destructive commands before committing.
+    #[serde(default)]
+    dry_run: Option<bool>,
 }
 
 #[async_trait]
@@ -254,8 +260,41 @@ impl Tool for BashTool {
             command = %parsed.command,
             description = parsed.description.as_deref().unwrap_or(""),
             timeout_ms = timeout.as_millis() as u64,
+            dry_run = parsed.dry_run.unwrap_or(false),
             "bash tool invocation"
         );
+
+        // v2 spec §5.1: dry-run mode. When set, the tool returns
+        // the command it WOULD have run plus a brief analysis
+        // (read-only heuristic + policy check result) without
+        // actually executing it. Lets the agent preview a
+        // destructive command before committing.
+        if parsed.dry_run.unwrap_or(false) {
+            let is_read_only = Self::classify_read_only(&parsed.command);
+            let policy_decision = ctx.policy.decide("bash", &serde_json::json!({"command": parsed.command}), Self::classify_read_only(&parsed.command));
+            let policy_msg = match policy_decision {
+                crate::tools::PolicyDecision::Allow => "policy: ALLOWED",
+                _ => "policy: BLOCKED",
+            };
+            return Ok(ToolOutput::ok(
+                format!(
+                    "[DRY RUN — no execution]\n\
+                     command: {}\n\
+                     would_run_as: {}\n\
+                     read_only: {}\n\
+                     {}\n\
+                     timeout: {}ms\n\
+                     \n\
+                     Pass dry_run=false to actually execute.",
+                    parsed.command,
+                    if cfg!(target_os = "windows") { "cmd /c" } else { "bash -c" },
+                    is_read_only,
+                    policy_msg,
+                    timeout.as_millis(),
+                ),
+                None,
+            ));
+        }
 
         let start = Instant::now();
 

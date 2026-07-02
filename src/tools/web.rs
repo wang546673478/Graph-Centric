@@ -66,11 +66,62 @@ fn default_max_results() -> usize {
     5
 }
 
-pub struct WebSearchTool;
+/// v2 spec §5.1: in-memory cache for web search results.
+/// `HashMap<query, (timestamp, result)>` with TTL eviction.
+#[derive(Debug, Default)]
+pub struct WebSearchCache {
+    entries: std::collections::HashMap<String, (std::time::Instant, String)>,
+    ttl: Option<std::time::Duration>,
+}
+
+impl WebSearchCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            ttl: Some(ttl),
+        }
+    }
+
+    /// Returns Some(cached) on hit and not expired; None on miss.
+    pub fn get(&self, query: &str) -> Option<String> {
+        let entry = self.entries.get(query)?;
+        if let Some(ttl) = self.ttl {
+            if entry.0.elapsed() > ttl {
+                return None;
+            }
+        }
+        Some(entry.1.clone())
+    }
+
+    pub fn put(&mut self, query: String, result: String) {
+        self.entries
+            .insert(query, (std::time::Instant::now(), result));
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+pub struct WebSearchTool {
+    cache: std::sync::Mutex<WebSearchCache>,
+}
 
 impl WebSearchTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            cache: std::sync::Mutex::new(WebSearchCache::with_ttl(
+                std::time::Duration::from_secs(3600), // spec default 1h
+            )),
+        }
     }
 }
 
@@ -122,6 +173,20 @@ impl Tool for WebSearchTool {
         if parsed.query.trim().is_empty() {
             return Ok(ToolOutput::ok("(empty query — no results)", None));
         }
+        // v2 spec §5.1: in-memory cache. Same query within TTL
+        // (default 1h) returns the cached result without
+        // hitting the network.
+        if let Some(cached) = self.cache.lock().unwrap().get(&parsed.query) {
+            debug!(query = %parsed.query, "web_search: cache hit");
+            return Ok(ToolOutput {
+                content: format!("[cached]\n{cached}"),
+                structured: None,
+                truncated: false,
+                exit_code: Some(0),
+                interrupted: false,
+                duration_ms: 0,
+            });
+        }
         let url = format!(
             "https://html.duckduckgo.com/html/?q={}",
             urlencoding_minimal(&parsed.query)
@@ -152,6 +217,8 @@ impl Tool for WebSearchTool {
             }
             s
         };
+        // Store in cache for next time.
+        self.cache.lock().unwrap().put(parsed.query.clone(), formatted.clone());
         let structured = serde_json::to_value(&results).ok();
         Ok(ToolOutput {
             content: formatted,
