@@ -2366,6 +2366,7 @@ impl GraphLoop {
                 );
                 self.graph_phase = GraphPhase::Filling;
                 self.seeding_rounds_without_patch = 0;
+                self.emit_graph_phase();
                 return Ok(LoopState::Running);
             }
             if self.seeding_rounds_without_patch == 1 {
@@ -2807,6 +2808,7 @@ impl GraphLoop {
                 if self.graph_phase == GraphPhase::Clarifying {
                     info!("clarifying: model started building — advancing to Seeding");
                     self.graph_phase = GraphPhase::Seeding;
+                    self.emit_graph_phase();
                 }
                 // ──────────────────────────────────────────────
                 // Orchestration layer: enforce the "Start→Goal first,
@@ -2977,6 +2979,7 @@ impl GraphLoop {
                                     self.filling_rounds_without_nodes = 0;
                                     info!("orchestration: Seeding → Filling ({}n/{}e)",
                                         self.graph.node_count(), self.graph.edge_count());
+                                    self.emit_graph_phase();
                                     self.conversation.add_user(
                                         "✅ start→deliverable established. Now work out the \
                                          intermediate steps needed BETWEEN start and deliverable. \
@@ -2995,6 +2998,7 @@ impl GraphLoop {
                                         self.graph_phase = GraphPhase::Expanding;
                                         info!("orchestration: Filling → Expanding ({}n/{}e)",
                                             self.graph.node_count(), self.graph.edge_count());
+                                        self.emit_graph_phase();
                                     }
                                 }
                                 _ => {}
@@ -4653,6 +4657,29 @@ impl GraphLoop {
 
     pub fn mark_explore_hard_hint_sent(&mut self) {
         self.explore_hard_hint_sent = true;
+    }
+
+    /// v2 agent-harness spec §4.2: emit a `GraphPhase` event so the
+    /// WebUI can update its phase progress bar. Called at every
+    /// transition between `Clarifying` / `Seeding` / `Filling` /
+    /// `Expanding` / `Verifying`. Saturated broadcasts (no listeners)
+    /// are silently dropped.
+    pub fn emit_graph_phase(&self) {
+        use crate::web::events::RunEvent;
+        let phase_str = match self.graph_phase {
+            GraphPhase::Clarifying => "clarifying",
+            GraphPhase::Seeding => "seeding",
+            GraphPhase::Filling => "filling",
+            GraphPhase::Expanding => "expanding",
+            GraphPhase::Verifying => "verifying",
+        };
+        let _ = self.event_tx.send(RunEvent::GraphPhase {
+            graph_phase: phase_str.to_string(),
+            round: self.round,
+            clarification_count: self.clarification_count,
+            explorer_iter: self.explorer_iter,
+            graph_version: self.graph.version,
+        });
     }
 
     /// Directed reachability: is `to` reachable from `from` following

@@ -42,6 +42,21 @@ pub enum RunEvent {
         message: String,
         tokens_used: u64,
     },
+    /// v2 agent-harness spec §4.2: graph-phase change. Fires when
+    /// the loop transitions between `Clarifying` / `Seeding` /
+    /// `Filling` / `Expanding` / `Verifying`. Drives the WebUI
+    /// phase-progress bar.
+    GraphPhase {
+        graph_phase: String,
+        round: usize,
+        /// Cumulative ask_user rounds in the current Clarifying streak.
+        /// 0 when not in Clarifying.
+        clarification_count: u32,
+        /// Cumulative explore rounds in the current streak. 0 when
+        /// not in Explore-heavy phase.
+        explorer_iter: u32,
+        graph_version: usize,
+    },
     /// Terminal Done state.
     Done { final_result: serde_json::Value },
     /// An error occurred.
@@ -121,6 +136,7 @@ impl RunEvent {
             Self::Review { .. } => "review",
             Self::SkillCaptured { .. } => "skill_captured",
             Self::Status { .. } => "status",
+            Self::GraphPhase { .. } => "graph_phase",
             Self::Done { .. } => "done",
             Self::Error { .. } => "error",
             Self::StreamChunk { .. } => "stream_chunk",

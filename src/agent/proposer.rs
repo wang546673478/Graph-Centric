@@ -454,7 +454,19 @@ regular Task nodes.");
         graph: &Graph,
         prev_step: Option<&ProposerStep>,
     ) -> Result<(ProposerStep, u64)> {
-        let snapshot = render_graph_for_prompt(graph);
+        // v2 agent-harness spec §3: L0 always, L1 scope-filtered,
+        // L2 references only. The model uses the `read_graph_node`
+        // tool to pull L2 on demand. This keeps the prompt compact
+        // and the model's view of the graph structured.
+        let scope = derive_proposer_scope(graph);
+        let notes = derive_proposer_notes(graph);
+        let ctx_v2 =
+            crate::context::L0L1L2ContextBuilder::new(crate::context::ModelLayer::Proposer)
+                .build(graph, &scope, notes);
+        let snapshot = format!(
+            "## Current Graph State (L0/L1/L2 v2)\n\n{ctx_v2}\n\n## Graph snapshot (legacy fallback)\n\n{}",
+            render_graph_for_prompt(graph)
+        );
         let mut req = conv.to_request(&snapshot, self.temperature, self.max_tokens);
         // Make sure the system prompt is consistent with this proposer's task.
         if let Some(first) = req
@@ -717,6 +729,64 @@ Respond with JSON:
 /// idempotent layout the model is more likely to reason cleanly about.
 ///
 /// Includes L1 summaries inline next to each node so the model always sees
+/// v2 helper: derive the proposer's "scope" of interest for L1
+/// selection. In Filling/Expanding the focus is the most recently
+/// added node (or all nodes if the graph is small). In Seeding
+/// the scope is empty (no L1 yet). In Verifying the scope is the
+/// whole graph (the proposer is checking the full structure).
+pub(crate) fn derive_proposer_scope(graph: &Graph) -> Vec<NodeId> {
+    use crate::graph::NodeKind;
+    if graph.node_count() == 0 {
+        return Vec::new();
+    }
+    // Heuristic: take all task-shaped nodes, since the proposer
+    // reasons about the DAG structure regardless of which phase
+    // it's in. The v2 builder then collapses 1-hop neighbors to
+    // brief L1 and far nodes to oneline — keeping the prompt
+    // compact while preserving structural visibility.
+    graph
+        .iter_nodes()
+        .filter(|n| matches!(n.kind, NodeKind::Task | NodeKind::File | NodeKind::Module))
+        .map(|n| n.id.clone())
+        .collect()
+}
+
+/// v2 helper: build the notes section. Currently surfaces
+/// orphan-style warnings and any other structural observations
+/// the orchestrator wants to inject. Kept simple in v2; a richer
+/// version (e.g. verifier self-check summaries) can be wired in
+/// later.
+pub(crate) fn derive_proposer_notes(graph: &Graph) -> Vec<String> {
+    use crate::graph::RelationType;
+    let mut notes = Vec::new();
+    // Orphan detection: any node with no incoming LeadsTo/DependsOn
+    // edge AND not the anchor is a candidate for orphaning.
+    let anchor: Option<&crate::graph::NodeId> = graph.anchor().map(|n| &n.id);
+    let mut orphans: Vec<&str> = Vec::new();
+    for n in graph.iter_nodes() {
+        if Some(&n.id) == anchor {
+            continue;
+        }
+        let has_inbound = graph.incoming(&n.id).any(|e| {
+            matches!(
+                e.relation,
+                RelationType::LeadsTo | RelationType::DependsOn | RelationType::Contains
+            )
+        });
+        if !has_inbound {
+            orphans.push(n.id.as_str());
+        }
+    }
+    if !orphans.is_empty() {
+        notes.push(format!(
+            "Orphan candidates (no inbound LeadsTo/DependsOn/Contains): {}. \
+             Either connect them or remove them — see graph layout.",
+            orphans.join(", ")
+        ));
+    }
+    notes
+}
+
 /// the current semantic state of the graph alongside the structure.
 pub(crate) fn render_graph_for_prompt(g: &Graph) -> String {
     let mut s = String::new();
