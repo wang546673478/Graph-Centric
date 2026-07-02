@@ -69,11 +69,73 @@ pub async fn get_heartbeat(
     };
     if let Some(ref hb) = *guard {
         let prompt = file_prompt.unwrap_or_else(|| hb.prompt.clone());
-        Json(serde_json::json!({"active": hb.active, "prompt": prompt, "max_rounds": hb.max_rounds, "completed_rounds": hb.completed_rounds, "current_run_id": hb.current_run_id}))
+        let recent: Vec<serde_json::Value> = hb.recent_rounds.iter().rev().take(10).map(|r| {
+            serde_json::json!({
+                "round": r.round,
+                "outcome": r.outcome.as_str(),
+                "run_id": r.run_id,
+                "note": r.note,
+                "duration_ms": r.duration_ms,
+                "at_ms": r.at_ms,
+            })
+        }).collect();
+        Json(serde_json::json!({
+            "active": hb.active,
+            "prompt": prompt,
+            "max_rounds": hb.max_rounds,
+            "completed_rounds": hb.completed_rounds,
+            "current_run_id": hb.current_run_id,
+            "started_at_ms": hb.started_at_ms,
+            "outcome_counts": {
+                "success": hb.outcome_counts.success,
+                "stagnation": hb.outcome_counts.stagnation,
+                "cycle": hb.outcome_counts.cycle,
+                "sub_task_failed": hb.outcome_counts.sub_task_failed,
+                "error": hb.outcome_counts.error,
+                "success_rate": hb.outcome_counts.success_rate(),
+                "total": hb.outcome_counts.total(),
+            },
+            "recent_rounds": recent,
+            "next_round_hint": hb.next_round_hint(),
+        }))
     } else {
         // Inactive: still return the prompt so the settings page can show it.
         let prompt = file_prompt.unwrap_or_default();
-        Json(serde_json::json!({"active": false, "prompt": prompt, "max_rounds": 10, "completed_rounds": 0, "current_run_id": null}))
+        Json(serde_json::json!({
+            "active": false,
+            "prompt": prompt,
+            "max_rounds": 10,
+            "completed_rounds": 0,
+            "current_run_id": null,
+            "started_at_ms": 0,
+            "outcome_counts": {
+                "success": 0, "stagnation": 0, "cycle": 0,
+                "sub_task_failed": 0, "error": 0,
+                "success_rate": 0.0, "total": 0,
+            },
+            "recent_rounds": [],
+            "next_round_hint": null,
+        }))
+    }
+}
+
+/// v2 spec §5.5: human-in-the-loop override — inject a hint
+/// into the current round's prompt without canceling the loop.
+#[derive(Deserialize)]
+pub struct InjectHintBody {
+    pub hint: String,
+}
+
+pub async fn inject_heartbeat_hint(
+    State(state): State<Arc<WebState>>,
+    Json(body): Json<InjectHintBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let mut guard = state.heartbeat.lock().await;
+    if let Some(ref mut hb) = *guard {
+        hb.inject_hint(body.hint);
+        Ok(Json(serde_json::json!({"injected": true})))
+    } else {
+        Err(ApiError::NotFound("no active heartbeat".into()))
     }
 }
 

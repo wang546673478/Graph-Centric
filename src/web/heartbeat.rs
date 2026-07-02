@@ -38,6 +38,41 @@ use tracing::{info, warn};
 const STATE_FILE: &str = ".graph_harness_heartbeat.json";
 const PROMPT_FILE: &str = ".graph_harness_heartbeat_prompt.md";
 
+/// v2 spec §5.5: how a single round ended. Used by the
+/// dashboard to bucket the failure-mode count and to pick
+/// the prompt hint for the next round ("stagnation" gets a
+/// "try a different angle" hint, "cycle" gets a "break the
+/// cycle" hint, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundOutcome {
+    /// Round succeeded; ready for the next.
+    Success,
+    /// Stagnation — graph didn't change for N rounds.
+    Stagnation,
+    /// Cycle detected in the task DAG.
+    Cycle,
+    /// Sub-task failed; recoverable, try the next round.
+    SubTaskFailed,
+    /// Run was canceled or errored for an unknown reason.
+    Error,
+    /// Round is still in progress.
+    InProgress,
+}
+
+impl RoundOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Stagnation => "stagnation",
+            Self::Cycle => "cycle",
+            Self::SubTaskFailed => "sub_task_failed",
+            Self::Error => "error",
+            Self::InProgress => "in_progress",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartBeat {
     /// The driving prompt for the optimization loop.
@@ -50,6 +85,51 @@ pub struct HeartBeat {
     pub active: bool,
     /// The current run ID (set after creating a run).
     pub current_run_id: Option<String>,
+    /// v2 spec §5.5: how many rounds ended in each outcome.
+    /// `success` + (stagnation + cycle + sub_task_failed + error)
+    /// == `completed_rounds`.
+    #[serde(default)]
+    pub outcome_counts: OutcomeCounts,
+    /// v2 spec §5.5: history of the last N rounds. Powers the
+    /// dashboard's "what happened in the last 5 rounds?" panel.
+    #[serde(default)]
+    pub recent_rounds: Vec<RoundRecord>,
+    /// v2 spec §5.5: when this heartbeat was started (unix ms).
+    #[serde(default)]
+    pub started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutcomeCounts {
+    pub success: u32,
+    pub stagnation: u32,
+    pub cycle: u32,
+    pub sub_task_failed: u32,
+    pub error: u32,
+}
+
+impl OutcomeCounts {
+    pub fn total(&self) -> u32 {
+        self.success + self.stagnation + self.cycle + self.sub_task_failed + self.error
+    }
+    pub fn success_rate(&self) -> f64 {
+        let t = self.total();
+        if t == 0 {
+            0.0
+        } else {
+            self.success as f64 / t as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundRecord {
+    pub round: u32,
+    pub outcome: RoundOutcome,
+    pub run_id: Option<String>,
+    pub duration_ms: u64,
+    pub note: String,
+    pub at_ms: u64,
 }
 
 /// Default 10-round self-optimization prompt.
@@ -160,14 +240,43 @@ impl HeartBeat {
             completed_rounds: 0,
             active: true,
             current_run_id: None,
+            outcome_counts: OutcomeCounts::default(),
+            recent_rounds: Vec::new(),
+            started_at_ms: now_ms(),
         };
         hb.save();
         hb
     }
 
-    /// Mark one round complete. Returns true if more rounds remain.
-    pub fn round_complete(&mut self) -> bool {
+    /// Mark one round complete with an explicit outcome. Returns
+    /// true if more rounds remain. v2 spec §5.5: drives the
+    /// dashboard's per-outcome counts + the prompt hint selection
+    /// for the next round.
+    pub fn round_complete(&mut self, outcome: RoundOutcome, run_id: Option<String>, note: String) -> bool {
         self.completed_rounds += 1;
+        let prev_run = self.current_run_id.clone().or(run_id.clone());
+        let record = RoundRecord {
+            round: self.completed_rounds as u32,
+            outcome,
+            run_id: prev_run,
+            duration_ms: 0, // duration is recorded by the caller (api_runs) — heart-beat doesn't time it
+            note,
+            at_ms: now_ms(),
+        };
+        match outcome {
+            RoundOutcome::Success => self.outcome_counts.success += 1,
+            RoundOutcome::Stagnation => self.outcome_counts.stagnation += 1,
+            RoundOutcome::Cycle => self.outcome_counts.cycle += 1,
+            RoundOutcome::SubTaskFailed => self.outcome_counts.sub_task_failed += 1,
+            RoundOutcome::Error => self.outcome_counts.error += 1,
+            RoundOutcome::InProgress => {}
+        }
+        self.recent_rounds.push(record);
+        // Keep at most the last 50 rounds in memory.
+        if self.recent_rounds.len() > 50 {
+            let drop = self.recent_rounds.len() - 50;
+            self.recent_rounds.drain(0..drop);
+        }
         self.current_run_id = None;
         if self.completed_rounds >= self.max_rounds {
             self.active = false;
@@ -177,11 +286,41 @@ impl HeartBeat {
         } else {
             self.save();
             info!(
-                "heartbeat: round {}/{} complete; {} remaining",
-                self.completed_rounds, self.max_rounds,
+                "heartbeat: round {}/{} complete (outcome={:?}); {} remaining",
+                self.completed_rounds, self.max_rounds, outcome,
                 self.max_rounds - self.completed_rounds
             );
             true
+        }
+    }
+
+    /// v2 spec §5.5: select a prompt hint for the next round
+    /// based on the most recent outcome. Returns a short hint
+    /// string the caller can inject into the optimization prompt.
+    /// Returns `None` when no hint is needed.
+    pub fn next_round_hint(&self) -> Option<String> {
+        let last = self.recent_rounds.last()?;
+        let hint = match last.outcome {
+            RoundOutcome::Success => return None,
+            RoundOutcome::Stagnation => {
+                "⚠️ 上轮 stagnation(模型没让图变化)。本轮换个优化点,先 Explore 再 ProposePatch。"
+            }
+            RoundOutcome::Cycle => "🔁 上轮 cycle(检测到依赖环)。本轮必须引入新节点打破 cycle,或换目标文件。",
+            RoundOutcome::SubTaskFailed => "🛠 上轮子任务失败。本轮先查 dispatch 错误日志,再决定继续或重试。",
+            RoundOutcome::Error => "❌ 上轮 Error。本轮调小范围(只改 1 个文件),先验证 cargo build。",
+            RoundOutcome::InProgress => return None,
+        };
+        Some(hint.to_string())
+    }
+
+    /// v2 spec §5.5: human-in-the-loop override. Allows the
+    /// operator to inject a hint into the current round's
+    /// prompt without canceling the loop. Returns true on
+    /// success.
+    pub fn inject_hint(&mut self, hint: String) {
+        if !hint.trim().is_empty() {
+            self.prompt.push_str(&format!("\n\n## 人工注入提示 ({})\n{}\n", now_ms(), hint));
+            self.save();
         }
     }
 
@@ -191,4 +330,11 @@ impl HeartBeat {
         self.current_run_id = None;
         self.save();
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

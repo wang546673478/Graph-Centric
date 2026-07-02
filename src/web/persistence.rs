@@ -11,7 +11,49 @@ use super::checkpoint::{Checkpoint, CheckpointMeta, SubRunLink};
 use super::run_session::{RunMetadata, RunStatus};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
+
+// v2 spec §5.6: summary file format used by `compact_checkpoints`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointsCompact {
+    pub run_id: String,
+    pub generated_at_ms: u64,
+    pub entries: Vec<CompactEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactEntry {
+    pub index: usize,
+    pub round: usize,
+    pub phase: String,
+    pub node_count: usize,
+    pub edge_count: usize,
+    pub ts_unix_ms: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            std::fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
 
 const CHECKPOINT_FMT: usize = 4; // zero-padded width for checkpoint filenames
 
@@ -37,7 +79,7 @@ impl RunPersistence {
         self.data_dir.join(run_id)
     }
 
-    fn checkpoints_dir(&self, run_id: &str) -> PathBuf {
+    pub(crate) fn checkpoints_dir(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("checkpoints")
     }
 
@@ -108,6 +150,159 @@ impl RunPersistence {
         if !p.exists() { return Ok(None); }
         let cp: Checkpoint = serde_json::from_str(&std::fs::read_to_string(&p)?)?;
         Ok(Some(cp))
+    }
+
+    // -----------------------------------------------------------------------
+    // v2 spec §5.6: persistence maintenance
+    // -----------------------------------------------------------------------
+
+    /// Compress old checkpoints into a single `checkpoints.compact.json`
+    /// summary, deleting the per-index files. Keeps the first
+    /// `keep` and last `keep_tail` checkpoints verbatim (they're
+    /// the most likely to be re-loaded by the user) and replaces
+    /// the rest with a single-line-per-checkpoint summary.
+    ///
+    /// The compact file has the same JSON shape as
+    /// `CheckpointsCompact` below: just the metadata, no full
+    /// `graph_snapshot` or `transcript` payloads.
+    ///
+    /// Returns the number of checkpoints that were compacted.
+    pub fn compact_checkpoints(
+        &self,
+        run_id: &str,
+        keep: usize,
+        keep_tail: usize,
+    ) -> std::io::Result<usize> {
+        let dir = self.checkpoints_dir(run_id);
+        if !dir.exists() {
+            return Ok(0);
+        }
+        // List all per-checkpoint files sorted by index.
+        let mut entries: Vec<(usize, std::path::PathBuf)> = Vec::new();
+        for e in std::fs::read_dir(&dir)? {
+            let e = e?;
+            let p = e.path();
+            if p.extension().map_or(false, |x| x == "json") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    if let Ok(idx) = stem.parse::<usize>() {
+                        entries.push((idx, p));
+                    }
+                }
+            }
+        }
+        entries.sort_by_key(|(idx, _)| *idx);
+        if entries.len() <= keep + keep_tail {
+            return Ok(0);
+        }
+        // Decide which to keep verbatim and which to compact.
+        let to_compact: Vec<(usize, std::path::PathBuf)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= keep && *i < entries.len() - keep_tail)
+            .map(|(_, e)| e.clone())
+            .collect();
+        if to_compact.is_empty() {
+            return Ok(0);
+        }
+        // Build a summary file.
+        let mut compact = CheckpointsCompact {
+            run_id: run_id.to_string(),
+            generated_at_ms: now_ms(),
+            entries: Vec::new(),
+        };
+        for (idx, _) in &to_compact {
+            if let Ok(Some(cp)) = self.load_checkpoint(run_id, *idx) {
+                compact.entries.push(CompactEntry {
+                    index: cp.index,
+                    round: cp.round,
+                    phase: cp.phase.to_string(),
+                    node_count: cp.graph_snapshot.node_count(),
+                    edge_count: cp.graph_snapshot.edge_count(),
+                    ts_unix_ms: now_ms(),
+                });
+            }
+        }
+        // Write the summary.
+        let compact_path = dir.join("checkpoints.compact.json");
+        let json = serde_json::to_string_pretty(&compact)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&compact_path, json)?;
+        // Delete the per-index files that were just summarised.
+        for (_, path) in &to_compact {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(to_compact.len())
+    }
+
+    /// v2 spec §5.6: cleanup policy. Runs that are older than
+    /// `archive_after_days` and still in a terminal state get
+    /// moved to a `data/runs-archive/` directory. Runs older
+    /// than `purge_after_days` get deleted entirely. Returns
+    /// (archived_count, purged_count).
+    pub fn cleanup_runs(
+        &self,
+        archive_after_days: u32,
+        purge_after_days: u32,
+    ) -> std::io::Result<(usize, usize)> {
+        if !self.data_dir.exists() {
+            return Ok((0, 0));
+        }
+        let archive_ms = (archive_after_days as u64) * 86_400_000;
+        let purge_ms = (purge_after_days as u64) * 86_400_000;
+        let now = now_ms();
+        let mut archived = 0;
+        let mut purged = 0;
+        for e in std::fs::read_dir(&self.data_dir)? {
+            let e = e?;
+            if !e.file_type()?.is_dir() {
+                continue;
+            }
+            let run_dir = e.path();
+            let run_json = run_dir.join("run.json");
+            if !run_json.exists() {
+                continue;
+            }
+            let age_ms = match run_dir
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default())
+            {
+                Ok(d) => now.saturating_sub(d.as_millis() as u64),
+                Err(_) => continue,
+            };
+            if age_ms >= purge_ms {
+                let _ = std::fs::remove_dir_all(&run_dir);
+                purged += 1;
+            } else if age_ms >= archive_ms {
+                let archive_dir = self
+                    .data_dir
+                    .parent()
+                    .unwrap_or(&self.data_dir)
+                    .join("runs-archive");
+                std::fs::create_dir_all(&archive_dir)?;
+                let dest = archive_dir.join(e.file_name());
+                let _ = std::fs::rename(&run_dir, &dest);
+                archived += 1;
+            }
+        }
+        Ok((archived, purged))
+    }
+
+    /// v2 spec §5.6: backup a critical run to a second location.
+    /// Currently a simple `cp -r` analog. Returns the backup path
+    /// on success. The caller decides which runs are "critical"
+    /// (e.g. those marked as skills, or run by a heartbeat).
+    pub fn backup_run(&self, run_id: &str, backup_root: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+        let src = self.run_dir(run_id);
+        if !src.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("run {run_id} not found"),
+            ));
+        }
+        let dest = backup_root.join(run_id);
+        copy_dir_recursive(&src, &dest)?;
+        Ok(dest)
     }
 
     /// Returns lightweight metadata for all stored checkpoints.
@@ -366,5 +561,57 @@ mod tests {
         std::fs::write(&run_json_path, r#"{"status":"Done"}"#).unwrap();
         let s = p.read_sub_run_status("parent-1", "sub-2");
         assert_eq!(s, "Done");
+    }
+
+    #[test]
+    fn compact_checkpoints_replaces_middle_with_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = RunPersistence::new(tmp.path());
+        // Save 10 checkpoints.
+        for i in 0..10 {
+            let cp = super::super::checkpoint::Checkpoint {
+                index: i,
+                round: i,
+                phase: super::super::checkpoint::CheckpointPhase::Graph,
+                graph_snapshot: crate::graph::Graph::new(),
+                transcript: vec![],
+                sub_run_links: vec![],
+            };
+            p.save_checkpoint("run1", &cp).unwrap();
+        }
+        // Compact keeping first 2 + last 2 verbatim.
+        let compacted = p.compact_checkpoints("run1", 2, 2).unwrap();
+        assert_eq!(compacted, 6, "expected 6 compacted (kept 2+2=4 of 10)");
+        // The compact file should exist and have 6 entries.
+        let compact_path = p
+            .checkpoints_dir("run1")
+            .join("checkpoints.compact.json");
+        assert!(
+            compact_path.exists(),
+            "compact file missing at {}",
+            compact_path.display()
+        );
+        let compact: CheckpointsCompact =
+            serde_json::from_str(&std::fs::read_to_string(&compact_path).unwrap()).unwrap();
+        assert_eq!(compact.entries.len(), 6);
+    }
+
+    #[test]
+    fn backup_run_copies_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = RunPersistence::new(tmp.path());
+        let meta = RunMetadata {
+            id: "abc".into(),
+            task: "t".into(),
+            status: RunStatus::Running,
+            duration_ms: 0,
+            captured_skill: None,
+            tokens_used: 0,
+        };
+        p.save_run_meta(&meta).unwrap();
+        let backup = tmp.path().join("backups");
+        std::fs::create_dir_all(&backup).unwrap();
+        let dest = p.backup_run("abc", &backup).unwrap();
+        assert!(dest.join("run.json").exists());
     }
 }

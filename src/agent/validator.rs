@@ -114,6 +114,15 @@ pub struct BashCheckValidator {
     pub timeout_ms: u64,
     pub max_output_chars: usize,
     pub graph_error_patterns: Vec<String>,
+    /// v2 spec §5.7: how to retry this failure. Default
+    /// `Retryable`; set to `Permanent` when retry without graph
+    /// repair is wasteful.
+    pub retry_policy: FailureRetryPolicy,
+    /// v2 spec §5.7: human-readable fix suggestion surfaced on
+    /// the BlockModal / WebUI dashboard. `None` = no specific
+    /// suggestion (the dashboard falls back to a generic "see
+    /// graph" hint).
+    pub fix_suggestion: Option<String>,
 }
 
 impl BashCheckValidator {
@@ -130,6 +139,8 @@ impl BashCheckValidator {
             policy: Arc::new(AllowAll),
             timeout_ms: 300_000, // 5 min
             max_output_chars: 32_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec![
                 "cannot find function".into(),
                 "cannot find type".into(),
@@ -152,6 +163,8 @@ impl BashCheckValidator {
             policy: Arc::new(AllowAll),
             timeout_ms: 300_000,
             max_output_chars: 32_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec![
                 "cannot find module".into(),
                 "cannot find name".into(),
@@ -173,6 +186,8 @@ impl BashCheckValidator {
             policy: Arc::new(AllowAll),
             timeout_ms: 300_000,
             max_output_chars: 32_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec![
                 "undefined:".into(),
                 "undefined symbol".into(),
@@ -194,6 +209,8 @@ impl BashCheckValidator {
             policy: Arc::new(AllowAll),
             timeout_ms: 300_000,
             max_output_chars: 32_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec![
                 "NameError".into(),
                 "ImportError".into(),
@@ -214,12 +231,82 @@ impl BashCheckValidator {
             policy: Arc::new(AllowAll),
             timeout_ms: 300_000,
             max_output_chars: 32_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec![
                 "cannot find symbol".into(),
                 "package ".into(),       // "package X does not exist"
                 "does not exist".into(),
                 "incompatible types".into(),
                 "method does not override".into(),
+            ],
+        }
+    }
+
+    /// v2 spec §5.7: Ruby builder. Runs `bundle exec ruby -c` per
+    /// .rb file, or `rake test` for the full suite. Treats
+    /// `NameError`, `LoadError`, and `uninitialized constant` as
+    /// graph-rooted (the L1 said the symbol exists; the code says
+    /// otherwise).
+    pub fn ruby_check_for(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command: "ruby -c ./*.rb 2>&1 || true".into(),
+            tool_cwd: cwd.into(),
+            policy: Arc::new(AllowAll),
+            timeout_ms: 60_000,
+            max_output_chars: 16_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
+            graph_error_patterns: vec![
+                "NameError".into(),
+                "LoadError".into(),
+                "uninitialized constant".into(),
+                "undefined method".into(),
+                "no such file".into(),
+            ],
+        }
+    }
+
+    /// v2 spec §5.7: Elixir builder. Runs `mix compile --warnings-as-errors`
+    /// for `.ex` files. Treats `UndefinedFunctionError` and
+    /// `CompileError` as graph-rooted.
+    pub fn elixir_compile_for(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command: "mix compile".into(),
+            tool_cwd: cwd.into(),
+            policy: Arc::new(AllowAll),
+            timeout_ms: 300_000,
+            max_output_chars: 32_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
+            graph_error_patterns: vec![
+                "UndefinedFunctionError".into(),
+                "CompileError".into(),
+                "module ".into(),         // "module X is undefined"
+                "is undefined".into(),
+                "function ".into(),
+            ],
+        }
+    }
+
+    /// v2 spec §5.7: PHP builder. Runs `php -l` on a list of files
+    /// (caller can override with `with_command` to use a project
+    /// test suite). Treats "undefined symbol / class" as graph-rooted.
+    pub fn php_lint_for(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command: "php -l index.php 2>&1 || true".into(),
+            tool_cwd: cwd.into(),
+            policy: Arc::new(AllowAll),
+            timeout_ms: 60_000,
+            max_output_chars: 16_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
+            graph_error_patterns: vec![
+                "Undefined index".into(),
+                "Undefined variable".into(),
+                "Class '".into(),         // "Class 'X' not found"
+                "not found".into(),
+                "Fatal error".into(),
             ],
         }
     }
@@ -242,6 +329,48 @@ impl BashCheckValidator {
     pub fn with_graph_error_patterns(mut self, patterns: Vec<String>) -> Self {
         self.graph_error_patterns = patterns;
         self
+    }
+
+    /// v2 spec §5.7: classify the failure as retryable / not.
+    /// Default: `Retryable` (the orchestrator can simply rerun the
+    /// sub-agent that produced the failure). Override to
+    /// `Permanent` for failures where a retry won't help without
+    /// fixing the graph (e.g. "cannot find module" pointing at a
+    /// missing edge in the L1 description).
+    pub fn with_retry_policy(mut self, policy: FailureRetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// v2 spec §5.7: a human-readable fix suggestion appended to
+    /// the `FailedAsGraphIssue` error. The suggestion is
+    /// surfaced on the BlockModal and the WebUI dashboard so the
+    /// user can decide whether to apply the suggested graph edit.
+    /// Example: "补一条 X → Y 边" for a "cannot find function Y
+    /// in module X" error.
+    pub fn with_fix_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.fix_suggestion = Some(suggestion.into());
+        self
+    }
+}
+
+/// v2 spec §5.7: failure classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureRetryPolicy {
+    /// The same sub-agent can be re-run; the failure may be a flaky
+    /// network or transient state. The dispatcher may retry up to
+    /// `retry_limit` times before escalating.
+    Retryable,
+    /// Retrying without a graph change is wasteful. The validator
+    /// surfaces `FailedAsGraphIssue` and the orchestrator routes
+    /// the failure back to Filling for graph repair before any
+    /// retry.
+    Permanent,
+}
+
+impl Default for FailureRetryPolicy {
+    fn default() -> Self {
+        Self::Retryable
     }
 }
 
@@ -367,6 +496,8 @@ mod tests {
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
             max_output_chars: 1_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: Vec::new(),
         };
         let r = v
@@ -385,6 +516,8 @@ mod tests {
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
             max_output_chars: 1_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec!["cannot find".into()],
         };
         let r = v
@@ -410,6 +543,8 @@ mod tests {
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
             max_output_chars: 4_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec![
                 "cannot find function".into(),
                 "unresolved import".into(),
@@ -448,6 +583,8 @@ mod tests {
             policy: Arc::new(AllowAll),
             timeout_ms: 5_000,
             max_output_chars: 4_000,
+            retry_policy: FailureRetryPolicy::Retryable,
+            fix_suggestion: None,
             graph_error_patterns: vec!["unresolved import".into()],
         };
         let r = v

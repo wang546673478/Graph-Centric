@@ -5,6 +5,7 @@
 
 pub mod capabilities;
 pub mod config;
+pub mod cache;
 pub mod openai_compat;
 pub mod streaming;
 

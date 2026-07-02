@@ -112,6 +112,8 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/heartbeat/default", post(config_api::start_default_heartbeat))
         .route("/heartbeat/prompt", post(config_api::update_heartbeat_prompt))
         .route("/heartbeat/cancel", post(config_api::cancel_heartbeat))
+        // v2 spec §5.5: human-in-the-loop hint injection.
+        .route("/heartbeat/inject", post(config_api::inject_heartbeat_hint))
         .route("/runs", get(api_runs::list_runs).post(api_runs::create_run).delete(api_runs::clear_runs))
         .route("/runs/:id", get(api_runs::get_run).delete(api_runs::cancel_run))
         .route("/runs/:id/delete", post(api_runs::delete_run))

@@ -1124,8 +1124,18 @@ pub async fn drive_run(
                 let do_spawn = {
                     let mut hb_guard = state.heartbeat.lock().await;
                     if let Some(ref mut hb) = *hb_guard {
-                        if hb.active { hb.round_complete() } else { false }
-                    } else { false }
+                        if hb.active {
+                            hb.round_complete(
+                                crate::web::heartbeat::RoundOutcome::Success,
+                                Some(id.clone()),
+                                "done".to_string(),
+                            )
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 };
                 if do_spawn { heartbeat_trigger_shutdown(&state).await; }
                 return;
@@ -1134,13 +1144,24 @@ pub async fn drive_run(
                 *session.status.write().await = RunStatus::Error(msg.clone());
                 session.freeze_duration().await;
                 let _ = state.persistence.save_run_meta(&session.metadata().await);
-                session.emit(RunEvent::Error { message: msg });
+                session.emit(RunEvent::Error { message: msg.clone() });
                 // Heartbeat: error counts as learning — advance to next round.
                 let do_spawn = {
                     let mut hb_guard = state.heartbeat.lock().await;
                     if let Some(ref mut hb) = *hb_guard {
-                        if hb.active { hb.round_complete() } else { false }
-                    } else { false }
+                        if hb.active {
+                            let note = msg.chars().take(200).collect::<String>();
+                            hb.round_complete(
+                                crate::web::heartbeat::RoundOutcome::Error,
+                                Some(id.clone()),
+                                note,
+                            )
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 };
                 if do_spawn { heartbeat_trigger_shutdown(&state).await; }
                 return;
@@ -1156,8 +1177,18 @@ pub async fn drive_run(
                 let do_spawn = {
                     let mut hb_guard = state.heartbeat.lock().await;
                     if let Some(ref mut hb) = *hb_guard {
-                        if hb.active { hb.round_complete() } else { false }
-                    } else { false }
+                        if hb.active {
+                            hb.round_complete(
+                                crate::web::heartbeat::RoundOutcome::SubTaskFailed,
+                                Some(id.clone()),
+                                format!("{} failure(s)", failures.len()),
+                            )
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
                 };
                 if do_spawn { heartbeat_trigger_shutdown(&state).await; }
                 return;
