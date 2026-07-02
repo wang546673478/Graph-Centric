@@ -481,6 +481,33 @@ impl SubAgent {
                     if let Some(t) = self.tools.get(&tool) {
                         if !t.is_read_only(&args) { write_calls_made += 1; }
                     }
+                    // v2 spec §5.1: if this is a write task and
+                    // the sub-agent has used 3+ tool calls
+                    // without ever writing a file, inject a
+                    // forceful reminder. This catches the
+                    // failure mode observed in goal-driven
+                    // testing where the sub-agent explores
+                    // the codebase (`ls`, `find`) instead of
+                    // writing the artifact.
+                    if step >= 3
+                        && write_calls_made == 0
+                        && detect_task_kind(&task.description) == TaskKind::Write
+                    {
+                        warn!(
+                            task_id = %task.id,
+                            step,
+                            write_calls_made,
+                            "write task: sub-agent has not called write_file yet — injecting reminder"
+                        );
+                        messages.push(Message::user(
+                            "⚠️ You are 3+ tool calls into a WRITE task and you have NOT \
+                             called `write_file` or `edit_file` yet. Stop exploring NOW. \
+                             Your next action MUST be `write_file` (or `edit_file`). \
+                             If you have been reading files, you already have enough context — \
+                             start writing. If you have not, you don't need more context; \
+                             write the artifact now.".to_string(),
+                        ));
+                    }
                     debug!(task_id = %task.id, step, tool = %tool, "sub-agent calling tool");
                     // Scope check (only if a guard is attached).
                     if let Some(sg) = &self.scope_guard {
@@ -654,14 +681,103 @@ fn build_initial_user_prompt(task: &SubTask, context_text: &str, scope: Option<&
         }
         _ => String::new(),
     };
+    // v2 agent-harness spec §5.1: detect task kind from the
+    // description and prepend a strong directive. The most
+    // common failure mode observed in goal-driven testing was
+    // sub-agents using `bash ls` for write/create tasks — they
+    // explored the codebase instead of producing artifacts.
+    // Detecting the kind and prepending a "first action =
+    // write_file" directive fixes this for the most common
+    // task shapes without limiting the agent's flexibility
+    // for genuinely exploratory tasks.
+    let task_kind = detect_task_kind(&task.description);
+    let directive = match task_kind {
+        TaskKind::Write => "\n\n🚨 **THIS IS A WRITE/CREATE TASK. DO NOT EXPLORE FIRST.**\n\
+                            Your first action MUST be `write_file` (or `edit_file` if a file already exists). \
+                            Do NOT `ls`, do NOT `find`, do NOT browse. The user wants the artifact, not exploration.\n\
+                            Pattern: 1) `write_file(path=..., content=...)` → 2) `bash` to verify (e.g. `go build` or `cargo check`) → 3) `final_answer`.\n",
+        TaskKind::Modify => "\n\n🔧 **THIS IS A MODIFY TASK.** Read the relevant file(s) first (max 1-2 files), \
+                            then `edit_file` to apply the change, then `bash` to verify, then `final_answer`. \
+                            Do NOT browse the whole repo — focus on the files you actually need to change.\n",
+        TaskKind::Read => "\n\n🔍 **THIS IS A READ/ANALYZE TASK.** Use `read_file` (with `offset`/`limit` for large files) or `bash` \
+                           with `grep`/`head`/`cat`. After 2-3 reads, emit `final_answer`.\n",
+        TaskKind::Unknown => "",
+    };
     format!(
-        "{context}\n\n## Your sub-task ({task_id})\n{desc}{scope_section}\n\n\
+        "{directive}{context}\n\n## Your sub-task ({task_id})\n{desc}{scope_section}\n\n\
          Begin. Emit your first JSON action now.",
+        directive = directive,
         context = context_text,
         task_id = task.id,
         desc = task.description,
         scope_section = scope_section,
     )
+}
+
+/// Heuristic task-kind classifier. Used by `build_initial_user_prompt`
+/// to choose the strongest possible opening directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    /// Create a new file / write a new artifact.
+    Write,
+    /// Modify an existing file.
+    Modify,
+    /// Read or analyze code/data.
+    Read,
+    /// Couldn't classify.
+    Unknown,
+}
+
+fn detect_task_kind(description: &str) -> TaskKind {
+    let d = description.to_lowercase();
+    // Chinese + English keywords for "write/create/implement"
+    let write_kw = [
+        "实现", "写", "创建", "新建", "生成", "产出",
+        "implement", "create", "write", "build", "add", "generate", "produce", "scaffold",
+    ];
+    // "modify/edit/fix/refactor/change"
+    let modify_kw = [
+        "修改", "改", "修复", "重构", "调整", "优化",
+        "modify", "edit", "fix", "refactor", "change", "update", "adjust", "optimize",
+    ];
+    // "read/analyze/search/inspect/look at"
+    let read_kw = [
+        "分析", "读", "查看", "搜索", "研究", "探索", "检查",
+        "analyze", "read", "search", "investigate", "inspect", "look", "find",
+    ];
+    if write_kw.iter().any(|k| d.contains(k)) {
+        TaskKind::Write
+    } else if modify_kw.iter().any(|k| d.contains(k)) {
+        TaskKind::Modify
+    } else if read_kw.iter().any(|k| d.contains(k)) {
+        TaskKind::Read
+    } else {
+        TaskKind::Unknown
+    }
+}
+
+#[cfg(test)]
+mod task_kind_tests {
+    use super::*;
+    #[test]
+    fn detects_chinese_write() {
+        assert_eq!(detect_task_kind("实现: Go 单文件 todo 工具"), TaskKind::Write);
+        assert_eq!(detect_task_kind("写一个 Python 脚本"), TaskKind::Write);
+    }
+    #[test]
+    fn detects_english_modify() {
+        assert_eq!(detect_task_kind("refactor the auth module"), TaskKind::Modify);
+        assert_eq!(detect_task_kind("fix the bug in main.rs"), TaskKind::Modify);
+    }
+    #[test]
+    fn detects_read() {
+        assert_eq!(detect_task_kind("分析 GraphLoop 行为"), TaskKind::Read);
+        assert_eq!(detect_task_kind("analyze the codebase"), TaskKind::Read);
+    }
+    #[test]
+    fn unknown_when_no_keyword() {
+        assert_eq!(detect_task_kind("do the thing"), TaskKind::Unknown);
+    }
 }
 
 // ---------------------------------------------------------------------------
