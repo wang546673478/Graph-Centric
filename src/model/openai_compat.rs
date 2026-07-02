@@ -766,18 +766,28 @@ impl Message {
         Self {
             role: Role::System,
             content: content.into(),
+            extra: Default::default(),
         }
     }
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             content: content.into(),
+            extra: Default::default(),
         }
     }
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            extra: Default::default(),
+        }
+    }
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            extra: Default::default(),
         }
     }
 }
@@ -800,7 +810,7 @@ mod tests {
 
     fn req(temperature: f64, max_tokens: Option<usize>) -> ModelRequest {
         ModelRequest {
-            messages: vec![Message { role: Role::User, content: "hi".into() }],
+            messages: vec![Message { role: Role::User, content: "hi".into(), ..Default::default() }],
             tools: vec![],
             temperature,
             max_tokens,

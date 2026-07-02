@@ -118,6 +118,10 @@ pub fn router(state: WebState, static_dir: &str) -> Router {
         .route("/runs/:id/events", get(api_runs::run_events))
         .route("/runs/:id/checkpoints", get(api_runs::list_checkpoints))
         .route("/runs/:id/checkpoints/:idx", get(api_runs::get_checkpoint))
+        // v2 spec §5.8: per-run token cost breakdown.
+        .route("/runs/:id/token-cost", get(api_runs::token_cost))
+        // v2 spec §5.9: compare two runs side-by-side.
+        .route("/runs/compare", get(api_runs::compare_runs))
         .route("/runs/:id/sub-runs", get(api_runs::get_sub_runs))
         .route("/runs/:id/full-graph", get(api_runs::get_full_graph))
         .route("/runs/:id/parent", get(api_runs::get_parent))

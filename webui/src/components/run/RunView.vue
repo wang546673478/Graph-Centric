@@ -9,6 +9,11 @@ import GraphPanel from '../graph/GraphPanel.vue'
 import { useSplitter } from '../../composables/useSplitter'
 import DebugTimeline from './DebugTimeline.vue'
 import RunDashboard from './RunDashboard.vue'
+// v2 spec §4: PhaseProgress / BlockModal / ExplorerBar / CheckpointTimeline
+import PhaseProgress from './PhaseProgress.vue'
+import BlockModal from './BlockModal.vue'
+import ExplorerBar from './ExplorerBar.vue'
+import CheckpointTimeline from './CheckpointTimeline.vue'
 
 const { t } = useI18n()
 const tab = ref('graph')
@@ -24,6 +29,50 @@ const clarifyOptions = ref<string[]>([])
 const sending = ref(false)
 let socket: ReturnType<typeof useRunSocket> | null = null
 
+// v2 spec §4.3: BlockModal state. When the loop surfaces a Block
+// (question starts with `[block]`), the modal pops up with three
+// options. `blockQuestion` carries the question text for the
+// modal's body; `showBlockModal` is the visibility flag.
+const showBlockModal = ref(false)
+const blockQuestion = ref('')
+function maybeShowBlockModal(question: string) {
+  if (!question) return
+  if (question.startsWith('[block]')) {
+    blockQuestion.value = question
+    showBlockModal.value = true
+  }
+}
+
+// v2 spec §4.4: ExplorerBar — last few Explore questions for the log.
+const explorerRecent = ref<string[]>([])
+// v2 spec §4.6: CheckpointTimeline.
+const checkpoints = ref<{ index: number; round: number; phase: string; node_count: number; edge_count: number }[]>([])
+const selectedCheckpoint = ref(-1)
+async function loadCheckpoint(idx: number) {
+  if (!activeRunId.value) return
+  try {
+    const cp: any = await (await fetch(`/api/runs/${activeRunId.value}/checkpoints/${idx}`)).json()
+    if (cp.graph_snapshot) {
+      // Apply the snapshot's graph to the current run store.
+      const s = getRunStore(activeRunId.value)
+      s.nodes = cp.graph_snapshot.nodes || []
+      s.edges = cp.graph_snapshot.edges || []
+    }
+    selectedCheckpoint.value = idx
+  } catch (e) {
+    console.warn('loadCheckpoint failed', e)
+  }
+}
+
+async function loadCheckpointList() {
+  if (!activeRunId.value) return
+  try {
+    checkpoints.value = await (await fetch(`/api/runs/${activeRunId.value}/checkpoints`)).json()
+  } catch (e) {
+    console.warn('loadCheckpointList failed', e)
+  }
+}
+
 // Use global store or local fallback for active run.
 const store = computed(() => activeRunId.value ? getRunStore(activeRunId.value) : null)
 
@@ -34,6 +83,8 @@ const status = computed(() => store.value?.status || 'idle')
 const errorMsg = computed(() => store.value?.error || '')
 const tokensUsed = computed(() => store.value?.tokensUsed || 0)
 const round = computed(() => store.value?.round || 0)
+// v2 spec §4.2: phase progress data from the `graph_phase` event.
+const phaseProgress = computed(() => store.value?.phaseProgress || null)
 const durationSec = computed(() => {
   const r = activeRunId.value ? findRun(activeRunId.value) : null
   return r?.duration_sec || 0
@@ -69,8 +120,25 @@ function connectToRun(id: string) {
         graphFx.ts = Date.now()
         break
       case 'status': if (d.phase) s.status = d.phase; s.tokensUsed = d.tokens_used || s.tokensUsed; break
+      case 'graph_phase':
+        // v2 spec §4.2: phase change. The PhaseProgress component
+        // reads s.phaseProgress to render the top bar.
+        s.phaseProgress = {
+          graph_phase: d.graph_phase,
+          round: d.round,
+          clarification_count: d.clarification_count,
+          explorer_iter: d.explorer_iter,
+          graph_version: d.graph_version,
+          ts: Date.now(),
+        }
+        break
       case 'loop_state':
-        if (d.kind === 'Paused') { s.status = 'paused'; clarifyOptions.value = (d.payload && d.payload.options) || d.options || [] }
+        if (d.kind === 'Paused') {
+          s.status = 'paused'
+          const q = (d.payload && d.payload.question) || d.question || ''
+          clarifyOptions.value = (d.payload && d.payload.options) || d.options || []
+          maybeShowBlockModal(q)
+        }
         else if (d.kind === 'GraphInvalid') s.status = 'graph_invalid'
         else if (d.kind === 'Done') s.status = 'Done'
         break
@@ -82,6 +150,8 @@ function connectToRun(id: string) {
         s.transcript.push({ role: 'checkpoint', content: `📸 #${d.index} · r${d.round} · ${d.node_count}n/${d.edge_count}e` })
         if (typeof d.round === 'number') s.round = d.round
         if (typeof d.index === 'number') s.lastCheckpoint = d.index
+        // v2 spec §4.6: refresh the checkpoint timeline.
+        loadCheckpointList()
         break
       case 'stream_chunk': {
         const comp = d.component || 'model'
@@ -128,6 +198,8 @@ watch(activeRunId, (id) => {
     if (fullGraphTimer) clearInterval(fullGraphTimer)
     fullGraphTimer = setInterval(() => refreshFullGraph(id), 5000)
     refreshFullGraph(id)
+    // v2 spec §4.6: load the checkpoint list for the timeline.
+    loadCheckpointList()
     // Refresh sub-runs list (for drill-down status display).
     refreshSubRuns(id)
     if (subRunsTimer) clearInterval(subRunsTimer)
@@ -274,12 +346,19 @@ async function submitTask(task: string) {
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
       <RunDashboard v-if="activeRunId" :status="status" :tokensUsed="tokensUsed" :round="round" :durationSec="durationSec" />
+      <PhaseProgress v-if="activeRunId" :progress="phaseProgress" />
+      <ExplorerBar v-if="activeRunId" :iter="phaseProgress?.explorer_iter ?? 0" :recent="explorerRecent" />
       <template v-if="tab === 'graph'">
         <GraphPanel v-if="graphView === '2d'" :key="(activeRunId || 'empty') + '-2d'"
           :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" :fx="graphFx" />
         <GraphPanel3D v-else :key="(activeRunId || 'empty') + '-3d'"
           :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" :fx="graphFx" />
       </template>
+      <CheckpointTimeline
+        v-if="checkpoints.length"
+        :checkpoints="checkpoints"
+        :selected="selectedCheckpoint"
+        @select="loadCheckpoint" />
       <DebugTimeline v-else-if="tab === 'debug'" />
     </div>
 
@@ -304,6 +383,15 @@ async function submitTask(task: string) {
       </div>
       <Composer :disabled="sending" @send="submitTask" />
     </div>
+
+    <!-- v2 spec §4.3: BlockModal pops up when loop_state surfaces a Block -->
+    <BlockModal
+      :open="showBlockModal"
+      :question="blockQuestion"
+      @answer="() => { showBlockModal = false }"
+      @force="async () => { showBlockModal = false; await submitTask('继续') }"
+      @abort="async () => { showBlockModal = false; await stopRun() }"
+      @cancel="() => { showBlockModal = false }" />
   </div>
 </template>
 

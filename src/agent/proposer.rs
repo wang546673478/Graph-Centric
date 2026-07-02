@@ -583,6 +583,7 @@ regular Task nodes.");
                      Reply with EXACTLY one valid JSON object matching one of the step \
                      schemas above. No markdown fences, no prose around it."
                 ),
+                ..Default::default()
             });
             match self.next_step(&patched_conv, graph, prev_step).await {
                 Ok((s, t)) => return Ok((s, total_tokens + t)),

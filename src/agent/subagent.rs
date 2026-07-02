@@ -517,6 +517,7 @@ impl SubAgent {
                         content: format!(
                             "{tool_msg}\n\nContinue. Either call another tool, emit final_answer, or report_graph_error if you discovered a graph/code mismatch."
                         ),
+                        ..Default::default()
                     });
                 }
                 Action::ParseFailed => {

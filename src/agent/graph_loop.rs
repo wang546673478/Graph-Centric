@@ -4142,6 +4142,7 @@ impl GraphLoop {
             .map(|m| Message {
                 role: m.role.clone(),
                 content: m.content.clone(),
+                ..Default::default()
             })
             .collect();
         // Re-inject the system prompt + graph snapshot header
@@ -4221,6 +4222,7 @@ impl GraphLoop {
                         .push(crate::model::Message {
                             role: Role::Assistant,
                             content: trimmed.clone(),
+                            ..Default::default()
                         });
                     Some(trimmed)
                 }
@@ -5117,10 +5119,12 @@ mod tests {
         conv.messages.push(Message {
             role: Role::User,
             content: "first turn said hi".into(),
+            ..Default::default()
         });
         conv.messages.push(Message {
             role: Role::Assistant,
             content: "first turn got: ask_user".into(),
+            ..Default::default()
         });
         // drive_run appends a fresh "Task: ..." line so the loop
         // sees the new task; mirror that here.

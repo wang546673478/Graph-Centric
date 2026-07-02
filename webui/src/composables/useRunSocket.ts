@@ -36,6 +36,16 @@ const runStores = new Map<string, {
   nodes: any[]; edges: any[]
   status: string; tokensUsed: number; error: string
   round: number; lastCheckpoint: number
+  // v2 spec §4.2: phase-progress data fed by the `graph_phase` WS
+  // event. Components read this to render the top status bar.
+  phaseProgress: {
+    graph_phase: string
+    round: number
+    clarification_count: number
+    explorer_iter: number
+    graph_version: number
+    ts: number
+  } | null
 }>()
 
 function getStore(id: string) {
@@ -45,6 +55,7 @@ function getStore(id: string) {
       nodes: [] as any[], edges: [] as any[],
       status: 'idle', tokensUsed: 0, error: '',
       round: 0, lastCheckpoint: -1,
+      phaseProgress: null,
     }))
   }
   return runStores.get(id)!

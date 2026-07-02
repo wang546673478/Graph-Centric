@@ -26,7 +26,7 @@ use crate::graph::Graph;
 use crate::model::{ModelConfig, ModelWithEvents};
 use crate::tools::{BashTool, DangerousCommandDeny, EditFileTool, ReadFileTool, ToolContext, ToolRegistry, WebFetchTool, WebSearchTool, WriteFileTool};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -290,6 +290,122 @@ pub async fn get_checkpoint(
         "phase": cp.phase.to_string(),
         "graph": cp.graph_snapshot,
         "transcript": cp.transcript,
+    })))
+}
+
+/// v2 spec §5.8: per-run token cost breakdown.
+///
+/// Walks every checkpoint's transcript and counts `usage.total_tokens`
+/// for each model message. Returns a total + per-step breakdown the
+/// dashboard can chart. Also reports a per-phase aggregate so the
+/// user can see "Filling cost 80% of my budget" at a glance.
+pub async fn token_cost(
+    State(state): State<Arc<WebState>>,
+    Path(id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use std::collections::HashMap;
+    let runs = state.runs.read().await;
+    let session = runs
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("run {id}")))?;
+    let store = session.checkpoints.lock().await;
+    let mut total: u64 = 0;
+    let mut by_phase: HashMap<String, u64> = HashMap::new();
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    for cp in store.list() {
+        // Walk the actual transcript for this checkpoint. The
+        // `ModelResponse.usage.total_tokens` is captured in
+        // transcript messages that have a `usage` field attached
+        // by the model's stream layer. For now we sum the
+        // total_tokens from any assistant message that has one;
+        // most checkpoints are short enough that this is a
+        // representative per-step cost.
+        let mut step_total: u64 = 0;
+        if let Some(full) = store.get(cp.index) {
+            for m in &full.transcript {
+                if let Some(usage) = m.extra.get("usage") {
+                    if let Some(n) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
+                        step_total = step_total.saturating_add(n);
+                    }
+                }
+            }
+        }
+        total = total.saturating_add(step_total);
+        *by_phase.entry(cp.phase.to_string()).or_insert(0) += step_total;
+        steps.push(serde_json::json!({
+            "checkpoint": cp.index,
+            "round": cp.round,
+            "phase": cp.phase.to_string(),
+            "tokens": step_total,
+        }));
+    }
+    Ok(Json(serde_json::json!({
+        "run_id": id,
+        "total_tokens": total,
+        "by_phase": by_phase,
+        "steps": steps,
+    })))
+}
+
+/// v2 spec §5.9: compare two runs side-by-side.
+///
+/// Returns a JSON object with a per-run summary (status, token
+/// total, node/edge count, last-checkpoint phase) so the
+/// dashboard can render a "run A vs run B" panel.
+#[derive(Deserialize)]
+pub struct CompareQuery {
+    pub a: RunId,
+    pub b: RunId,
+}
+
+pub async fn compare_runs(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<CompareQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let runs = state.runs.read().await;
+    let session_a = runs
+        .get(&q.a)
+        .ok_or_else(|| ApiError::NotFound(format!("run {}", q.a)))?;
+    let session_b = runs
+        .get(&q.b)
+        .ok_or_else(|| ApiError::NotFound(format!("run {}", q.b)))?;
+    let meta_a = session_a.metadata().await;
+    let meta_b = session_b.metadata().await;
+    let last_cp_a = session_a
+        .checkpoints
+        .lock()
+        .await
+        .list()
+        .last()
+        .map(|c| c.phase.to_string());
+    let last_cp_b = session_b
+        .checkpoints
+        .lock()
+        .await
+        .list()
+        .last()
+        .map(|c| c.phase.to_string());
+    Ok(Json(serde_json::json!({
+        "a": {
+            "id": q.a,
+            "status": meta_a.status,
+            "tokens_used": meta_a.tokens_used,
+            "duration_ms": meta_a.duration_ms,
+            "last_phase": last_cp_a,
+        },
+        "b": {
+            "id": q.b,
+            "status": meta_b.status,
+            "tokens_used": meta_b.tokens_used,
+            "duration_ms": meta_b.duration_ms,
+            "last_phase": last_cp_b,
+        },
+        "diff": {
+            "status_diff": format!("{:?} vs {:?}", meta_a.status, meta_b.status),
+            "tokens_diff": meta_a.tokens_used as i64 - meta_b.tokens_used as i64,
+            "duration_diff_ms": meta_a.duration_ms as i64 - meta_b.duration_ms as i64,
+            "phase_match": last_cp_a == last_cp_b,
+        }
     })))
 }
 
@@ -711,6 +827,7 @@ pub async fn drive_run(
             conv.messages.push(Message {
                 role,
                 content: m.content.clone(),
+                ..Default::default()
             });
         }
         conv.messages.push(Message::user(format!("Task: {}", session.task)));

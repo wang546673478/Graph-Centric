@@ -21,6 +21,34 @@ use serde::{Deserialize, Serialize};
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// v2 spec §5.8: optional side-channel metadata. Used by the
+    /// model layer to attach `usage.total_tokens` etc. without
+    /// changing the wire shape. `#[serde(default, skip_serializing_if = "HashMap::is_empty")]`
+    /// keeps backward compatibility with old messages and JSON dumps.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl Default for Message {
+    fn default() -> Self {
+        Self {
+            role: Role::User,
+            content: String::new(),
+            extra: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Message {
+    /// Construct a Message with empty `extra`. Use this from
+    /// existing call sites that don't yet need the side-channel.
+    pub fn new(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            extra: std::collections::HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -55,6 +55,7 @@ impl Conversation {
         self.messages.push(Message {
             role: Role::Tool,
             content: content.into(),
+            ..Default::default()
         });
     }
 
