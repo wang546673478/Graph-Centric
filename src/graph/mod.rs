@@ -444,6 +444,19 @@ impl Node {
         self.metadata.insert(key.into(), value);
         self
     }
+
+    /// v2 spec §5.4: read the node's priority from its `metadata`
+    /// map. Stored as a JSON number under the `"priority"` key
+    /// (default 0). Higher = more important. The DAG scheduler
+    /// sorts each batch by this value descending so critical-path
+    /// tasks fire first within a wave.
+    pub fn priority(&self) -> i32 {
+        self.metadata
+            .get("priority")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -109,13 +109,19 @@ impl DagScheduler {
 
         let mut batches: Vec<Vec<NodeId>> = Vec::new();
         while !dep_count.is_empty() {
-            // Pick all currently-ready tasks. Sort for deterministic output.
+            // Pick all currently-ready tasks. Sort by priority
+            // (descending) so critical-path tasks fire first within
+            // a wave, then by NodeId for determinism. v2 spec §5.4.
             let mut ready: Vec<NodeId> = dep_count
                 .iter()
                 .filter(|&(_, &c)| c == 0)
                 .map(|(k, _)| k.clone())
                 .collect();
-            ready.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            ready.sort_by(|a, b| {
+                let pa = graph.get_node(a).map(|n| -n.priority()).unwrap_or(0);
+                let pb = graph.get_node(b).map(|n| -n.priority()).unwrap_or(0);
+                pa.cmp(&pb).then_with(|| a.as_str().cmp(b.as_str()))
+            });
 
             if ready.is_empty() {
                 return Err(HarnessError::scheduler(format!(

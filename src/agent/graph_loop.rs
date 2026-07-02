@@ -2023,7 +2023,8 @@ impl GraphLoop {
             &crate::skills::matcher::SkillMatchConfig {
                 trigger_weight: self.config.skill_match_trigger_weight.unwrap_or(0.7),
                 slug_weight: self.config.skill_match_slug_weight.unwrap_or(0.3),
-                threshold: self.config.skill_match_threshold.unwrap_or(0.25),
+                threshold: self.config.skill_match_threshold.unwrap_or(0.4),
+                l1_weight: 0.0, // TODO: thread L1 from the current task graph
             },
             1,    // top 1 for Phase A
         ) {

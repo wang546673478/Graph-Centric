@@ -162,6 +162,68 @@ impl BashCheckValidator {
         }
     }
 
+    /// v2 spec §5.7: Go builder. Runs `go build ./...` and treats
+    /// undefined-symbol and unresolved-package errors as
+    /// graph-rooted failures (the L1 description said the symbol
+    /// exists, the L2 says it doesn't).
+    pub fn go_build_for(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command: "go build ./...".into(),
+            tool_cwd: cwd.into(),
+            policy: Arc::new(AllowAll),
+            timeout_ms: 300_000,
+            max_output_chars: 32_000,
+            graph_error_patterns: vec![
+                "undefined:".into(),
+                "undefined symbol".into(),
+                "cannot find package".into(),
+                "import cycle".into(),
+                "undeclared name".into(),
+            ],
+        }
+    }
+
+    /// v2 spec §5.7: Python builder. Runs `python -m py_compile` on
+    /// the listed files (callers set `with_command` for module
+    /// imports). Treats NameError / ImportError / AttributeError
+    /// (when the symbol was supposed to exist) as graph-rooted.
+    pub fn python_compile_for(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command: "python -m compileall -q .".into(),
+            tool_cwd: cwd.into(),
+            policy: Arc::new(AllowAll),
+            timeout_ms: 300_000,
+            max_output_chars: 32_000,
+            graph_error_patterns: vec![
+                "NameError".into(),
+                "ImportError".into(),
+                "ModuleNotFoundError".into(),
+                "AttributeError".into(),
+                "cannot import name".into(),
+            ],
+        }
+    }
+
+    /// v2 spec §5.7: Java builder. Runs `mvn -q compile` (override
+    /// with `with_command` for gradle). Treats "cannot find symbol"
+    /// and "package … does not exist" as graph-rooted failures.
+    pub fn java_compile_for(cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            command: "mvn -q -DskipTests compile".into(),
+            tool_cwd: cwd.into(),
+            policy: Arc::new(AllowAll),
+            timeout_ms: 300_000,
+            max_output_chars: 32_000,
+            graph_error_patterns: vec![
+                "cannot find symbol".into(),
+                "package ".into(),       // "package X does not exist"
+                "does not exist".into(),
+                "incompatible types".into(),
+                "method does not override".into(),
+            ],
+        }
+    }
+
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
         self.command = command.into();
         self

@@ -11,15 +11,23 @@ use crate::error::HarnessError;
 use std::collections::HashSet;
 
 /// Default match-score threshold + weights. Used when the caller doesn't
-/// pass a config (e.g. unit tests). Mirrors the pre-config behavior.
+/// pass a config (e.g. unit tests).
+///
+/// v2 agent-harness spec §5.3: bumped threshold from 0.25 → 0.4 to
+/// reduce false positives. The trigger + slug token Jaccard alone
+/// (0.7 + 0.3) is loose; lifting the floor means we only auto-apply
+/// when the overlap is unambiguous. The L1 semantic boost
+/// (`score_skill_match_with_l1`) is the v2 way to recover matches
+/// the token-based scorer would have missed.
 pub const DEFAULT_SKILL_MATCH_CONFIG: SkillMatchConfig = SkillMatchConfig {
     trigger_weight: 0.7,
     slug_weight: 0.3,
-    threshold: 0.25,
+    threshold: 0.4,
+    l1_weight: 0.0,
 };
 
 /// v2.7: tunables for the skill matcher. The default reproduces the
-/// pre-config hardcoded values exactly.
+/// pre-config hardcoded values exactly (modulo the v2 threshold bump).
 #[derive(Debug, Clone, Copy)]
 pub struct SkillMatchConfig {
     /// Weight of trigger-text Jaccard in the final score.
@@ -27,8 +35,23 @@ pub struct SkillMatchConfig {
     /// Weight of slug-token Jaccard in the final score.
     pub slug_weight: f64,
     /// Minimum score to auto-apply a skill. Below this, the skill is
-    /// not considered a match.
+    /// not considered a match. v2 default 0.4 (was 0.25).
     pub threshold: f64,
+    /// v2: weight of L1 semantic Jaccard in the final score. 0.0
+    /// disables L1 contribution (the v1 default). Set to e.g. 0.25
+    /// to mix in semantic similarity.
+    pub l1_weight: f64,
+}
+
+impl Default for SkillMatchConfig {
+    fn default() -> Self {
+        Self {
+            trigger_weight: 0.7,
+            slug_weight: 0.3,
+            threshold: 0.4,
+            l1_weight: 0.0,
+        }
+    }
 }
 
 /// Tokenize a string into lowercase words, splitting on whitespace and
@@ -101,6 +124,30 @@ pub fn score_skill_match_with(task: &str, skill: &SkillRef, cfg: &SkillMatchConf
         .count();
     score += (signal_hits as f64 * 0.03).min(0.15);
 
+    score.clamp(0.0, 1.0)
+}
+
+/// v2 agent-harness spec §5.3: skill scoring with L1 semantic
+/// similarity supplement. Adds a char-bigram Jaccard between the
+/// task text and a representative L1 string (responsibility +
+/// implementation + design_intent oneline).
+///
+/// The L1 boost is `cfg.l1_weight * jaccard_l1` added on top of the
+/// v1 token-based score. Default `l1_weight = 0.0` keeps the v1
+/// behavior; bumping it to e.g. 0.25 means a 0.5 L1 similarity
+/// contributes 0.125 to the final score — enough to push a
+/// borderline (0.35) match over the new 0.4 threshold.
+pub fn score_skill_match_with_l1(
+    task: &str,
+    skill: &SkillRef,
+    l1_text: &str,
+    cfg: &SkillMatchConfig,
+) -> f64 {
+    let mut score = score_skill_match_with(task, skill, cfg);
+    if cfg.l1_weight > 0.0 && !l1_text.trim().is_empty() {
+        let l1_sim = crate::agent::saturation::jaccard(task, l1_text);
+        score += cfg.l1_weight * l1_sim;
+    }
     score.clamp(0.0, 1.0)
 }
 
