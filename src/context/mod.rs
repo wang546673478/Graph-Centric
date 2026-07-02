@@ -581,6 +581,360 @@ pub fn render_l1_by_distance(
 }
 
 // ---------------------------------------------------------------------------
+// v2 agent-harness spec: L0 / L1 / L2 selective context
+// ---------------------------------------------------------------------------
+//
+// Per the v2 spec §3, the model should only see:
+// - L0: full graph structure summary (always, since it's compact)
+// - L1: semantic descriptions for nodes in the current scope
+// - L2: only *references* (path:line), never inline content; the agent
+//   must call `read_graph_node(id, L2)` to fetch the actual body
+//
+// This is a different tradeoff from the existing `ContextBuilder`:
+// that one inlines L2 with distance-based compression. The v2 builder
+// is for use in scenarios where the model has the `read_graph_node`
+// tool available and we want the prompt to stay small + structured.
+
+/// Per-layer token budget for the v2 builder. Default values come
+/// from the v2 spec §3.6 (proposer 8K, verifier 4K, etc.).
+#[derive(Debug, Clone, Copy)]
+pub struct L0L1L2Budget {
+    pub l0: usize,
+    pub l1: usize,
+    pub l2_references: usize,
+    pub notes: usize,
+}
+
+impl Default for L0L1L2Budget {
+    fn default() -> Self {
+        // proposer default
+        Self {
+            l0: 4_000,
+            l1: 3_500,
+            l2_references: 500,
+            notes: 1_000,
+        }
+    }
+}
+
+impl L0L1L2Budget {
+    /// Budget preset for each model layer (tokens).
+    pub fn for_layer(layer: ModelLayer) -> Self {
+        match layer {
+            ModelLayer::Proposer => Self {
+                l0: 4_000,
+                l1: 3_500,
+                l2_references: 500,
+                notes: 1_000,
+            },
+            ModelLayer::VerifierL1 => Self {
+                l0: 1_500,
+                l1: 2_000,
+                l2_references: 500,
+                notes: 500,
+            },
+            ModelLayer::VerifierGraph => Self {
+                l0: 1_000,
+                l1: 500,
+                l2_references: 500,
+                notes: 500,
+            },
+            ModelLayer::Reviewer => Self {
+                l0: 2_000,
+                l1: 2_500,
+                l2_references: 500,
+                notes: 1_000,
+            },
+            ModelLayer::Decomposer => Self {
+                l0: 1_500,
+                l1: 2_000,
+                l2_references: 500,
+                notes: 500,
+            },
+            ModelLayer::Subagent => Self {
+                l0: 4_000,
+                l1: 6_000,
+                l2_references: 1_500,
+                notes: 500,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLayer {
+    Proposer,
+    VerifierL1,
+    VerifierGraph,
+    Reviewer,
+    Decomposer,
+    Subagent,
+}
+
+/// The v2-context output. Each field is a section of the final
+/// prompt; callers concatenate them with their own section markers.
+#[derive(Debug, Clone, Default)]
+pub struct L0L1L2Context {
+    /// L0 — full graph structure summary (always included).
+    pub l0_section: String,
+    /// L1 — semantic descriptions for the in-scope nodes.
+    pub l1_section: String,
+    /// L2 references — list of `path:line` pointers the agent can
+    /// fetch via `read_graph_node(id, L2)`. Never the actual content.
+    pub l2_references: Vec<L2Reference>,
+    /// Notes — orphan hints, known conflicts, etc. The verifier and
+    /// reviewer use this to surface concerns; main agent generally
+    /// gets an empty notes section.
+    pub notes: Vec<String>,
+    /// Per-section token usage for debugging.
+    pub l0_tokens: usize,
+    pub l1_tokens: usize,
+    pub l2_tokens: usize,
+    pub notes_tokens: usize,
+}
+
+/// Reference to a piece of L2 content the agent can fetch on demand.
+#[derive(Debug, Clone)]
+pub struct L2Reference {
+    pub node_id: NodeId,
+    pub path: String,
+    pub line_range: Option<(usize, usize)>,
+    /// Why this is in scope (e.g. "directly required by the task",
+    /// "verified by reviewer"). Helps the agent decide which to read.
+    pub reason: String,
+}
+
+/// Builder for the v2 selective L0/L1/L2 context.
+pub struct L0L1L2ContextBuilder {
+    pub counter: TokenCounter,
+    pub budget: L0L1L2Budget,
+}
+
+impl L0L1L2ContextBuilder {
+    pub fn new(layer: ModelLayer) -> Self {
+        Self {
+            counter: TokenCounter::default(),
+            budget: L0L1L2Budget::for_layer(layer),
+        }
+    }
+
+    pub fn with_budget(mut self, budget: L0L1L2Budget) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// Build a v2 context. `scope` controls L1 selection; nodes in
+    /// `scope` get full L1, their 1-hop neighbors get brief L1,
+    /// everything else is collapsed.
+    pub fn build(
+        &self,
+        graph: &Graph,
+        scope: &[NodeId],
+        notes: Vec<String>,
+    ) -> L0L1L2Context {
+        let mut out = L0L1L2Context::default();
+        out.l0_section = self.build_l0(graph);
+        out.l0_tokens = self.counter.count(&out.l0_section);
+        if out.l0_tokens > self.budget.l0 {
+            // Compress L0 — drop edge evidence first (the most
+            // verbose field), then sort+truncate node lines.
+            out.l0_section = truncate_chars(&out.l0_section, self.budget.l0 * 4);
+            out.l0_tokens = self.counter.count(&out.l0_section);
+        }
+        out.l1_section = self.build_l1(graph, scope, self.budget.l1);
+        out.l1_tokens = self.counter.count(&out.l1_section);
+        out.l2_references = self.build_l2_refs(graph, scope);
+        out.l2_tokens = out.l2_references.len() * 8; // rough estimate
+        out.notes = self.fit_notes(notes, self.budget.notes);
+        out.notes_tokens = out
+            .notes
+            .iter()
+            .map(|n| self.counter.count(n))
+            .sum();
+        out
+    }
+
+    /// L0 — full graph structure summary. Always included.
+    fn build_l0(&self, graph: &Graph) -> String {
+        let mut s = String::new();
+        writeln!(
+            s,
+            "# Graph: {} nodes, {} edges, version={}",
+            graph.node_count(),
+            graph.edge_count(),
+            graph.version
+        )
+        .ok();
+        let mut node_ids: Vec<&NodeId> = graph.nodes.keys().collect();
+        node_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        writeln!(s, "\n## Nodes (L0)").ok();
+        for id in &node_ids {
+            if let Some(n) = graph.get_node(id) {
+                writeln!(
+                    s,
+                    "- {} [{:?}] {}",
+                    n.id.as_str(),
+                    n.kind,
+                    if n.summary.is_empty() { "(no summary)" } else { &n.summary }
+                )
+                .ok();
+            }
+        }
+        writeln!(s, "\n## Edges").ok();
+        for e in graph.iter_edges() {
+            writeln!(
+                s,
+                "  {} -[{:?} c={:.2}]→ {}",
+                e.source.as_str(),
+                e.relation,
+                e.confidence,
+                e.target.as_str()
+            )
+            .ok();
+        }
+        s
+    }
+
+    /// L1 — semantic descriptions for in-scope nodes.
+    fn build_l1(&self, graph: &Graph, scope: &[NodeId], budget: usize) -> String {
+        let mut s = String::new();
+        let mut spent = 0usize;
+        let mut scope_neighbors: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::new();
+        for id in scope {
+            for e in graph.outgoing(id) {
+                scope_neighbors.insert(e.target.clone());
+            }
+            for e in graph.incoming(id) {
+                scope_neighbors.insert(e.source.clone());
+            }
+        }
+        // 1. Scope nodes get full L1.
+        writeln!(s, "## L1 (full) for in-scope nodes").ok();
+        for id in scope {
+            if spent >= budget {
+                break;
+            }
+            let entry = match graph.l1.get(id) {
+                Some(l1) if !l1.is_blank() => format!("- {} (c={:.2}): {}\n", id.as_str(), l1.confidence, l1.render_full().trim_end()),
+                _ => format!("- {}: (L1 not yet enriched)\n", id.as_str()),
+            };
+            let cost = self.counter.count(&entry);
+            if spent + cost > budget {
+                s.push_str("- [scope L1 truncated to budget]\n");
+                break;
+            }
+            s.push_str(&entry);
+            spent += cost;
+        }
+        // 2. Neighbors get brief L1.
+        writeln!(s, "\n## L1 (brief) for 1-hop neighbors").ok();
+        let mut sorted_neighbors: Vec<&NodeId> = scope_neighbors.iter().collect();
+        sorted_neighbors.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        for id in &sorted_neighbors {
+            if spent >= budget {
+                break;
+            }
+            if scope.contains(id) {
+                continue;
+            }
+            let entry = match graph.l1.get(id) {
+                Some(l1) if !l1.is_blank() => format!("- {} (c={:.2}): {}\n", id.as_str(), l1.confidence, l1.render_brief()),
+                _ => format!("- {}: (not enriched)\n", id.as_str()),
+            };
+            let cost = self.counter.count(&entry);
+            if spent + cost > budget {
+                s.push_str("- [neighbor L1 truncated to budget]\n");
+                break;
+            }
+            s.push_str(&entry);
+            spent += cost;
+        }
+        // 3. Out-of-scope nodes get a one-line pointer.
+        writeln!(s, "\n## Out-of-scope (use read_graph_node(id, L1) to inspect)").ok();
+        for node in graph.iter_nodes() {
+            if spent >= budget {
+                break;
+            }
+            if scope.contains(&node.id) || scope_neighbors.contains(&node.id) {
+                continue;
+            }
+            let entry = format!("- {}\n", node.id.as_str());
+            let cost = self.counter.count(&entry);
+            if spent + cost > budget {
+                s.push_str("- [out-of-scope list truncated]\n");
+                break;
+            }
+            s.push_str(&entry);
+            spent += cost;
+        }
+        s
+    }
+
+    /// L2 — *only* references, never inline. The agent is expected
+    /// to call `read_graph_node(id, L2)` when it actually needs the
+    /// body. This keeps the prompt small and gives the agent
+    /// explicit control over what L2 it pulls.
+    fn build_l2_refs(&self, graph: &Graph, scope: &[NodeId]) -> Vec<L2Reference> {
+        let mut refs = Vec::new();
+        for id in scope {
+            if let Some(node) = graph.get_node(id) {
+                if node.path.is_empty() {
+                    continue;
+                }
+                refs.push(L2Reference {
+                    node_id: id.clone(),
+                    path: node.path.clone(),
+                    line_range: None,
+                    reason: "in scope of the current step".to_string(),
+                });
+            }
+        }
+        refs
+    }
+
+    fn fit_notes(&self, notes: Vec<String>, budget: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut spent = 0usize;
+        for n in notes {
+            let cost = self.counter.count(&n);
+            if spent + cost > budget {
+                break;
+            }
+            spent += cost;
+            out.push(n);
+        }
+        out
+    }
+}
+
+impl std::fmt::Display for L0L1L2Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.l0_section)?;
+        writeln!(f, "{}", self.l1_section)?;
+        if !self.l2_references.is_empty() {
+            writeln!(f, "\n## L2 references (use read_graph_node(id, L2) to fetch)")?;
+            for r in &self.l2_references {
+                writeln!(
+                    f,
+                    "- {} → `{}` ({})",
+                    r.node_id.as_str(),
+                    r.path,
+                    r.reason
+                )?;
+            }
+        }
+        if !self.notes.is_empty() {
+            writeln!(f, "\n## Notes")?;
+            for n in &self.notes {
+                writeln!(f, "- {}", n)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -800,5 +1154,152 @@ mod tests {
         let n19_included = out.contains("n19");
         assert!(n0_included);
         assert!(!n19_included);
+    }
+
+    // ----- v2 L0L1L2ContextBuilder tests (spec §3) -----
+
+    fn v2_world() -> Graph {
+        let mut g = Graph::new();
+        g.add_node(Node::file("a.rs", "module A"));
+        g.add_node(Node::file("b.rs", "module B"));
+        g.add_node(Node::file("c.rs", "module C"));
+        g.add_node(Node::file("d.rs", "module D — out of scope"));
+        g.l1.set(
+            NodeId::from("a.rs"),
+            crate::graph::L1Description::new("does A", "impl A", "intent A", "constraint A"),
+        );
+        g.l1.set(
+            NodeId::from("b.rs"),
+            crate::graph::L1Description::new("does B", "impl B", "intent B", "constraint B"),
+        );
+        g.add_edge(Edge::new("a.rs", "b.rs", RelationType::Imports, 1.0, ""))
+            .unwrap();
+        g.add_edge(Edge::new("b.rs", "c.rs", RelationType::Imports, 1.0, ""))
+            .unwrap();
+        g
+    }
+
+    #[test]
+    fn v2_l0_contains_all_nodes() {
+        let g = v2_world();
+        let cb = L0L1L2ContextBuilder::new(ModelLayer::Proposer);
+        let ctx = cb.build(&g, &[NodeId::from("a.rs")], vec![]);
+        // L0 must list every node — even out-of-scope ones.
+        assert!(ctx.l0_section.contains("a.rs"));
+        assert!(ctx.l0_section.contains("b.rs"));
+        assert!(ctx.l0_section.contains("c.rs"));
+        assert!(ctx.l0_section.contains("d.rs"));
+        // And every edge.
+        assert!(ctx.l0_section.contains("Imports"));
+    }
+
+    #[test]
+    fn v2_l1_full_for_scope_brief_for_neighbors_collapsed_for_others() {
+        let g = v2_world();
+        let cb = L0L1L2ContextBuilder::new(ModelLayer::Proposer);
+        let ctx = cb.build(
+            &g,
+            &[NodeId::from("a.rs")],
+            vec![],
+        );
+        // a.rs is in scope → full L1 (responsibility + implementation +
+        // design_intent + constraints labels appear)
+        let a_section = ctx
+            .l1_section
+            .split("## L1 (brief)")
+            .next()
+            .unwrap_or("");
+        assert!(a_section.contains("responsibility: does A"));
+        assert!(a_section.contains("implementation: impl A"));
+        // b.rs is 1-hop neighbor of a.rs → brief L1 (no field labels)
+        let b_section = ctx
+            .l1_section
+            .split("## L1 (brief)")
+            .nth(1)
+            .unwrap_or("")
+            .split("## Out-of-scope")
+            .next()
+            .unwrap_or("");
+        assert!(b_section.contains("does: does B"));
+        // c.rs / d.rs should appear in out-of-scope list (no L1)
+        let oos = ctx
+            .l1_section
+            .split("## Out-of-scope")
+            .nth(1)
+            .unwrap_or("");
+        assert!(oos.contains("c.rs"));
+        assert!(oos.contains("d.rs"));
+    }
+
+    #[test]
+    fn v2_l2_contains_references_not_content() {
+        let g = v2_world();
+        let cb = L0L1L2ContextBuilder::new(ModelLayer::Proposer);
+        let ctx = cb.build(&g, &[NodeId::from("a.rs")], vec![]);
+        // Must have references
+        assert!(!ctx.l2_references.is_empty());
+        // The reference should point to the right path
+        let first = &ctx.l2_references[0];
+        assert_eq!(first.path, "a.rs");
+        // Display impl also must not include any actual file body.
+        // We don't have real file content here, but the references
+        // section is just a list of pointers.
+        let displayed = format!("{ctx}");
+        assert!(displayed.contains("L2 references"));
+        // No source code keywords in the rendered output.
+        assert!(!displayed.contains("fn handle"));
+        assert!(!displayed.contains("pub fn "));
+    }
+
+    #[test]
+    fn v2_l1_respects_budget() {
+        let mut g = Graph::new();
+        for i in 0..50 {
+            let id = format!("n{i}");
+            g.add_node(Node::file(&id, &id));
+            g.l1.set(
+                NodeId::from(id.as_str()),
+                crate::graph::L1Description::new(
+                    "a long-ish responsibility line that uses some tokens",
+                    "implementation",
+                    "intent",
+                    "constraints",
+                ),
+            );
+        }
+        let cb = L0L1L2ContextBuilder::new(ModelLayer::Proposer).with_budget(
+            L0L1L2Budget {
+                l0: 4_000,
+                l1: 500, // tight
+                l2_references: 500,
+                notes: 200,
+            },
+        );
+        let ctx = cb.build(&g, &[NodeId::from("n0")], vec![]);
+        assert!(
+            ctx.l1_tokens <= 600,
+            "l1 should fit budget ~500, got {}",
+            ctx.l1_tokens
+        );
+    }
+
+    #[test]
+    fn v2_notes_are_truncated_to_budget() {
+        let g = v2_world();
+        let cb = L0L1L2ContextBuilder::new(ModelLayer::Proposer).with_budget(
+            L0L1L2Budget {
+                l0: 4_000,
+                l1: 3_500,
+                l2_references: 500,
+                notes: 50,
+            },
+        );
+        let notes: Vec<String> = (0..100)
+            .map(|i| format!("orphan hint #{}: connect node X to Y for reason {}", i, i))
+            .collect();
+        let ctx = cb.build(&g, &[NodeId::from("a.rs")], notes);
+        // Should have fit only a few notes (each note is ~20 tokens,
+        // 50 budget ≈ 2 notes max)
+        assert!(ctx.notes.len() < 100);
     }
 }

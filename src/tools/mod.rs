@@ -36,12 +36,17 @@
 pub mod bash;
 pub mod deny_list;
 pub mod file;
+pub mod graph_aware;
 pub mod scope_guard;
 pub mod web;
 
 pub use bash::BashTool;
 pub use deny_list::{default_dangerous_patterns, match_denial, DenialMatcher, DenialPattern};
 pub use file::{EditFileTool, ReadFileTool, WriteFileTool};
+pub use graph_aware::{
+    FindSimilarNodesTool, GraphAwareTools, GraphToolsState, ReadGraphNodeTool, SearchGraphTool,
+    TraceDependencyTool,
+};
 pub use scope_guard::{ScopeGuard, ScopeViolation};
 pub use web::{WebFetchTool, WebSearchTool};
 

@@ -535,6 +535,43 @@ pub struct GraphLoopConfig {
 
     /// v2.7: max L0→L1→L2 expansion depth. Default 2.
     pub cascade_max_expand_depth: Option<u32>,
+
+    // ── v2 agent-harness spec: Clarifying v2 (soft cap 10 + similarity) ──
+    /// Soft upper bound on consecutive `ask_user` rounds during
+    /// `GraphPhase::Clarifying`. When `clarification_count >= this`,
+    /// the loop surfaces `Block("information density saturated")`
+    /// instead of asking again. The model is still free to emit
+    /// `propose_patch` earlier to end the phase. Default: 10.
+    pub clarification_max: u32,
+    /// Jaccard-token similarity threshold above which a new
+    /// `ask_user` question is treated as a repeat of a recent
+    /// question. Combined with `clarification_count >= 3` the loop
+    /// surfaces `Block("repeating the same question")`. Default: 0.85.
+    pub clarification_similarity_threshold: f64,
+    /// Sliding window of recent `ask_user` question texts used for
+    /// similarity comparison. Default: 5.
+    pub clarification_history_window: usize,
+
+    // ── v2 agent-harness spec: Explore v2 (200 soft cap + similarity) ──
+    /// Soft upper bound on consecutive `explore` rounds in any
+    /// GraphPhase. When `explorer_iter >= this`, the loop surfaces
+    /// `Block("exploration did not converge")`. Default: 200.
+    pub explore_max: u32,
+    /// Round count at which to inject a soft hint during a long
+    /// exploration streak ("if the question has no answer, consider
+    /// `block`"). Default: 100.
+    pub explore_soft_hint_at: u32,
+    /// Round count at which to inject a hard warning + last-chance
+    /// hint. Default: 150.
+    pub explore_hard_hint_at: u32,
+    /// Jaccard-token similarity threshold above which a new
+    /// `explore` question is treated as a repeat. Combined with
+    /// `explorer_iter >= 3` the loop surfaces
+    /// `Block("repeating the same exploration")`. Default: 0.85.
+    pub explore_similarity_threshold: f64,
+    /// Sliding window of recent `explore` question texts used for
+    /// similarity comparison. Default: 5.
+    pub explore_history_window: usize,
 }
 
 /// Default sub-run timeout: 30 minutes. Used when
@@ -569,6 +606,15 @@ impl GraphLoopConfig {
             skill_match_trigger_weight: None,
             skill_match_slug_weight: None,
             cascade_max_expand_depth: None,
+            // v2 agent-harness spec defaults
+            clarification_max: 10,
+            clarification_similarity_threshold: 0.85,
+            clarification_history_window: 5,
+            explore_max: 200,
+            explore_soft_hint_at: 100,
+            explore_hard_hint_at: 150,
+            explore_similarity_threshold: 0.85,
+            explore_history_window: 5,
         }
     }
 }
@@ -747,6 +793,35 @@ pub struct GraphLoop {
     /// "draw Start+Goal" patch; if the model keeps exploring instead, we
     /// hint, then auto-seed so the loop can never stall at 0 nodes.
     seeding_rounds_without_patch: u32,
+
+    // ── v2 agent-harness spec: Clarifying v2 tracking ──
+    /// Consecutive `ask_user` rounds during `GraphPhase::Clarifying`.
+    /// Incremented when the model emits `AskUser`; reset to 0 when
+    /// it emits `ProposePatch` (signaling the goal is clear) or
+    /// when the loop surfaces a Clarifying-saturation Block.
+    clarification_count: u32,
+    /// Sliding window of recent `ask_user` question texts. Used by
+    /// the saturation check to detect the model repeating itself
+    /// without learning anything new. Bounded by
+    /// `config.clarification_history_window`.
+    clarification_history: std::collections::VecDeque<String>,
+
+    // ── v2 agent-harness spec: Explore v2 tracking ──
+    /// Consecutive `explore` rounds across any GraphPhase. Reset to
+    /// 0 on `ProposePatch` / `Block` / `AskUser` / `ReadyForVerify`.
+    /// Drives the 100/150/200 tiered hints + termination.
+    explorer_iter: u32,
+    /// Sliding window of recent `explore` question texts. Used by
+    /// the saturation check to detect the model probing the same
+    /// detail over and over. Bounded by
+    /// `config.explore_history_window`.
+    explorer_history: std::collections::VecDeque<String>,
+    /// Whether the soft Explore hint has been injected for the
+    /// current streak. Reset by `reset_saturations()`.
+    explore_soft_hint_sent: bool,
+    /// Whether the hard Explore warning has been injected for the
+    /// current streak. Reset by `reset_saturations()`.
+    explore_hard_hint_sent: bool,
 
     /// Sub-graph handles keyed by complex_node_id. Non-empty when
     /// the parent is waiting on at least one child run.
@@ -1034,6 +1109,13 @@ impl GraphLoop {
             stuck_repeat_count: 0,
             last_graph_fingerprint: None,
             graph_stagnation_count: 0,
+            // v2 agent-harness spec: Clarifying v2 + Explore v2 tracking
+            clarification_count: 0,
+            clarification_history: std::collections::VecDeque::new(),
+            explorer_iter: 0,
+            explorer_history: std::collections::VecDeque::new(),
+            explore_soft_hint_sent: false,
+            explore_hard_hint_sent: false,
             tool_failure_counts: std::collections::HashMap::new(),
             tokens_used: 0,
             // Drill-down sub-graph machinery (Task 5). `event_tx` defaults to
@@ -2233,19 +2315,25 @@ impl GraphLoop {
         }
 
         // ── Clarifying phase: prime the Proposer (once) to confirm the goal ──
-        // The model emits ask_user at most 2 times. After 2 clarifications
-        // it must emit propose_patch to start building. The user can always
-        // answer with their own text (skipping the model's options) if they
-        // want the model to move on faster.
+        // v2 agent-harness spec: the model self-decides when enough
+        // information has been gathered. The loop will surface a Block
+        // if (a) the model keeps asking and information density is
+        // saturated (~10 rounds by default), or (b) it starts
+        // repeating the same question. The user can always answer
+        // with their own text to skip the model's options and force
+        // the model to proceed.
         if self.graph_phase == GraphPhase::Clarifying && !self.clarifying_primed {
             self.clarifying_primed = true;
             self.conversation.add_user(
                 "GOAL CLARIFICATION PHASE. Confirm the user's goal before building. \
-                 You may emit `ask_user` AT MOST 2 times to get clarification. After 2 \
-                 `ask_user` rounds, you MUST emit `propose_patch` to seed `start` and \
-                 `deliverable` — that begins building. Do not ask for confirmation; \
-                 starting to build IS the signal you're ready. The user can answer \
-                 with their own text to skip your options and force you to proceed.",
+                 You may emit `ask_user` to gather information, but the loop will \
+                 surface a Block if (a) you keep asking and information density is \
+                 saturated, or (b) you start repeating the same question. State your \
+                 current understanding of the goal in each `ask_user`, then provide \
+                 `options` (concrete choices the user can pick — the user can also \
+                 free-type). When you have enough to start building, emit \
+                 `propose_patch` to seed `start` and `deliverable`. Starting to \
+                 build IS the signal you're ready.",
             );
         }
 
@@ -2347,11 +2435,63 @@ impl GraphLoop {
 
         match step {
             ProposerStep::AskUser { question, options, rationale } => {
-                self.pending = Pending::AwaitingAnswer { question: question.clone() };
+                // v2 agent-harness spec: Clarifying saturation check.
+                // The model is free to keep asking, but the loop
+                // surfaces a Block once the question is a repeat of a
+                // recent one OR the count cap has been reached.
+                use crate::agent::saturation::SaturationVerdict;
+                let verdict = self.check_clarification_saturation(&question);
+                let final_question = match verdict {
+                    SaturationVerdict::CountLimit => {
+                        warn!(
+                            count = self.clarification_count,
+                            max = self.config.clarification_max,
+                            "Clarifying saturated: count cap reached"
+                        );
+                        // Reset so a follow-up resume doesn't keep
+                        // the streak alive.
+                        self.reset_saturations();
+                        self.pending = Pending::None;
+                        return Ok(LoopState::Paused {
+                            question: format!(
+                                "[block] 信息密度已饱和:已问 {} 轮,模型认为已有足够信息,\
+                                 但仍在继续追问。请给一个更明确的答复,或回复「继续」强制让 agent \
+                                 进入下一阶段(emit `propose_patch`)。",
+                                self.config.clarification_max
+                            ),
+                            options: vec!["继续".to_string(), "中止".to_string()],
+                            rationale: "clarification_count saturated".to_string(),
+                        });
+                    }
+                    SaturationVerdict::Repeat => {
+                        warn!(
+                            count = self.clarification_count,
+                            "Clarifying saturated: question repeats a recent one"
+                        );
+                        self.reset_saturations();
+                        self.pending = Pending::None;
+                        return Ok(LoopState::Paused {
+                            question: format!(
+                                "[block] agent 在重复追问同一话题(相似度 > {:.2})。\
+                                 请换个角度回答,或回复「继续」让 agent 进入下一阶段。",
+                                self.config.clarification_similarity_threshold
+                            ),
+                            options: vec!["继续".to_string(), "中止".to_string()],
+                            rationale: "clarification similarity saturated".to_string(),
+                        });
+                    }
+                    SaturationVerdict::Proceed => question.clone(),
+                };
+                self.record_clarification(question.clone());
+                self.pending = Pending::AwaitingAnswer { question: final_question.clone() };
                 // Reset stuck detector — engaging the user is a way out.
                 self.stuck_repeat_count = 0;
                 self.last_stuck_signature = None;
-                Ok(LoopState::Paused { question, options, rationale })
+                Ok(LoopState::Paused {
+                    question: final_question,
+                    options,
+                    rationale,
+                })
             }
             ProposerStep::Block { reason, needed_from_user, rationale } => {
                 // Reset stuck detector — the model is explicitly
@@ -2371,6 +2511,78 @@ impl GraphLoop {
                 Ok(LoopState::Paused { question, options: Vec::new(), rationale })
             }
             ProposerStep::Explore { items, rationale: _ } => {
+                // v2 agent-harness spec: Explore saturation check.
+                // The model is free to keep exploring, but the loop
+                // surfaces a Block once a question repeats OR the
+                // iter cap has been reached.
+                use crate::agent::saturation::SaturationVerdict;
+                if let Some(item) = items.first() {
+                    let verdict = self.check_explore_saturation(&item.question);
+                    match verdict {
+                        SaturationVerdict::CountLimit => {
+                            warn!(
+                                iter = self.explorer_iter,
+                                max = self.config.explore_max,
+                                "Explore saturated: iter cap reached"
+                            );
+                            self.reset_saturations();
+                            return Ok(LoopState::Paused {
+                                question: format!(
+                                    "[block] 探索无收敛:已 Explore {} 轮仍未达成 commit。\
+                                     模型对此问题可能找不到答案。请考虑:(a) 提供更多上下文;\
+                                     (b) 回复「继续」让 agent 强制 ProposePatch;\
+                                     (c) 中止。",
+                                    self.config.explore_max
+                                ),
+                                options: vec!["继续".to_string(), "中止".to_string()],
+                                rationale: "explore iter cap reached".to_string(),
+                            });
+                        }
+                        SaturationVerdict::Repeat => {
+                            warn!(
+                                iter = self.explorer_iter,
+                                "Explore saturated: question repeats a recent one"
+                            );
+                            self.reset_saturations();
+                            return Ok(LoopState::Paused {
+                                question: format!(
+                                    "[block] agent 在重复探索同一问题(相似度 > {:.2})。\
+                                     请换个角度提问,或回复「继续」让 agent 强制 commit。",
+                                    self.config.explore_similarity_threshold
+                                ),
+                                options: vec!["继续".to_string(), "中止".to_string()],
+                                rationale: "explore similarity saturated".to_string(),
+                            });
+                        }
+                        SaturationVerdict::Proceed => {
+                            self.record_explore(item.question.clone());
+                            // Inject tier hint if a soft/hard threshold
+                            // has been crossed this round. The hint is
+                            // informational; the model keeps final say.
+                            if let Some(hint) = self.explore_tier_hint() {
+                                use crate::agent::saturation::TierHint;
+                                match hint {
+                                    TierHint::Soft => {
+                                        self.conversation.add_user(
+                                            "⚠️ 你已经连续 Explore 100 轮。如果这个问题本质无法回答,\
+                                             考虑 emit `block` 或直接 emit `propose_patch` 落图。\
+                                             不收敛的探索浪费 token。",
+                                        );
+                                        self.mark_explore_soft_hint_sent();
+                                    }
+                                    TierHint::Hard => {
+                                        self.conversation.add_user(
+                                            "🚨 你已经连续 Explore 150 轮。再不 commit 就要 Block 了。\
+                                             立即 emit `propose_patch` 把已有信息落图,\
+                                             或 emit `block` 声明这是模型搞不定的问题。",
+                                        );
+                                        self.mark_explore_hard_hint_sent();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Claude Code's `EXPLORE_AGENT` pattern, with
                 // parallel fan-out when the model emits multiple
                 // items. Each item is a (scope, question) pair;
@@ -2582,6 +2794,13 @@ impl GraphLoop {
                 Ok(LoopState::Running)
             }
             ProposerStep::ProposePatch { mut patch, rationale: _ } => {
+                // v2 agent-harness spec: a ProposePatch signals the
+                // model is making progress — reset BOTH Clarifying
+                // and Explore saturation counters. The next ask_user
+                // or explore starts a fresh streak.
+                if self.clarification_count > 0 || self.explorer_iter > 0 {
+                    self.reset_saturations();
+                }
                 // If we're still Clarifying and the model starts building, that's
                 // the "goal confirmed" signal — advance to Seeding so the seed/guard
                 // logic treats this as the first build patch.
@@ -4304,6 +4523,136 @@ impl GraphLoop {
             return false;
         }
         self.path_exists(&d, &a) || self.path_exists(&a, &d)
+    }
+
+    // -----------------------------------------------------------------------
+    // v2 agent-harness spec: Clarifying v2 + Explore v2 saturation
+    // -----------------------------------------------------------------------
+    //
+    // Per the spec, both `Clarifying.ask_user` and `Explore` rounds are
+    // bounded by:
+    // 1. A *soft upper bound* on consecutive rounds (Clarifying 10,
+    //    Explore 200).
+    // 2. A *similarity threshold* (default 0.85 on char-bigrams): a new
+    //    question that matches any recent question at or above the
+    //    threshold is treated as a repeat.
+    //
+    // When either guard trips, the loop surfaces a Block-style
+    // `LoopState::Paused` with a `[block]` prefix on the question.
+    // Tier hints (soft at 100, hard at 150) are also injected into
+    // the conversation when Explore iter crosses those thresholds.
+    //
+    // The actual Jaccard math lives in `crate::agent::saturation`; the
+    // methods here are thin wrappers over the four state fields.
+
+    /// Inspect an `ask_user` question for Clarifying saturation.
+    /// Does NOT mutate state. Caller records on `Proceed`.
+    pub fn check_clarification_saturation(
+        &self,
+        new_question: &str,
+    ) -> crate::agent::saturation::SaturationVerdict {
+        use crate::agent::saturation::{jaccard, SaturationVerdict};
+        if self.clarification_count >= self.config.clarification_max {
+            return SaturationVerdict::CountLimit;
+        }
+        if self.clarification_history.is_empty() {
+            return SaturationVerdict::Proceed;
+        }
+        let threshold = self.config.clarification_similarity_threshold;
+        if self
+            .clarification_history
+            .iter()
+            .any(|h| jaccard(new_question, h) >= threshold)
+        {
+            return SaturationVerdict::Repeat;
+        }
+        SaturationVerdict::Proceed
+    }
+
+    /// Record a successful `ask_user` Proceed: bump count, push to
+    /// history. History is bounded by `clarification_history_window`.
+    pub fn record_clarification(&mut self, question: String) {
+        self.clarification_count = self.clarification_count.saturating_add(1);
+        let cap = self.config.clarification_history_window.max(1);
+        if self.clarification_history.len() >= cap {
+            self.clarification_history.pop_front();
+        }
+        self.clarification_history.push_back(question);
+    }
+
+    /// Inspect an `explore` question for Explore saturation.
+    /// Does NOT mutate state. Caller records on `Proceed`.
+    pub fn check_explore_saturation(
+        &self,
+        new_question: &str,
+    ) -> crate::agent::saturation::SaturationVerdict {
+        use crate::agent::saturation::{jaccard, SaturationVerdict};
+        if self.explorer_iter >= self.config.explore_max {
+            return SaturationVerdict::CountLimit;
+        }
+        if self.explorer_history.is_empty() {
+            return SaturationVerdict::Proceed;
+        }
+        let threshold = self.config.explore_similarity_threshold;
+        if self
+            .explorer_history
+            .iter()
+            .any(|h| jaccard(new_question, h) >= threshold)
+        {
+            return SaturationVerdict::Repeat;
+        }
+        SaturationVerdict::Proceed
+    }
+
+    /// Record a successful `explore` Proceed: bump iter, push to
+    /// history.
+    pub fn record_explore(&mut self, question: String) {
+        self.explorer_iter = self.explorer_iter.saturating_add(1);
+        let cap = self.config.explore_history_window.max(1);
+        if self.explorer_history.len() >= cap {
+            self.explorer_history.pop_front();
+        }
+        self.explorer_history.push_back(question);
+    }
+
+    /// Reset both Clarifying and Explore saturation counters.
+    /// Called when the model emits a `propose_patch` (signals
+    /// convergence) or when the loop surfaces a Block.
+    pub fn reset_saturations(&mut self) {
+        self.clarification_count = 0;
+        self.clarification_history.clear();
+        self.explorer_iter = 0;
+        self.explorer_history.clear();
+    }
+
+    /// Returns the tier hint to inject for the current Explore iter,
+    /// if any: `Soft` at `explore_soft_hint_at`, `Hard` at
+    /// `explore_hard_hint_at`. Caller is responsible for actually
+    /// pushing the hint and tracking the "sent" state via
+    /// `mark_explore_soft_hint_sent` / `mark_explore_hard_hint_sent`.
+    pub fn explore_tier_hint(
+        &self,
+    ) -> Option<crate::agent::saturation::TierHint> {
+        use crate::agent::saturation::TierHint;
+        if self.explorer_iter >= self.config.explore_hard_hint_at
+            && !self.explore_hard_hint_sent
+        {
+            return Some(TierHint::Hard);
+        }
+        if self.explorer_iter >= self.config.explore_soft_hint_at
+            && !self.explore_soft_hint_sent
+        {
+            return Some(TierHint::Soft);
+        }
+        None
+    }
+
+    pub fn mark_explore_soft_hint_sent(&mut self) {
+        self.explore_soft_hint_sent = true;
+    }
+
+    pub fn mark_explore_hard_hint_sent(&mut self) {
+        self.explore_hard_hint_sent = true;
     }
 
     /// Directed reachability: is `to` reachable from `from` following

@@ -641,6 +641,15 @@ pub async fn drive_run(
         } else {
             None
         },
+        // v2 agent-harness spec: Clarifying v2 (soft cap 10) + Explore v2 (soft cap 200)
+        clarification_max: engine.loop_tuning.clarification_max,
+        clarification_similarity_threshold: engine.loop_tuning.clarification_similarity_threshold,
+        clarification_history_window: engine.loop_tuning.clarification_history_window,
+        explore_max: engine.loop_tuning.explore_max,
+        explore_soft_hint_at: engine.loop_tuning.explore_soft_hint_at,
+        explore_hard_hint_at: engine.loop_tuning.explore_hard_hint_at,
+        explore_similarity_threshold: engine.loop_tuning.explore_similarity_threshold,
+        explore_history_window: engine.loop_tuning.explore_history_window,
     };
 
     let mut gl = GraphLoop::new(

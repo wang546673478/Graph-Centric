@@ -240,6 +240,37 @@ pub struct LoopTuningConfig {
     /// the "emit ready_for_verify" convergence hint. 0 disables.
     #[serde(default = "default_convergence_stable_rounds")]
     pub convergence_stable_rounds: u32,
+
+    // ── v2 agent-harness spec: Clarifying v2 + Explore v2 ──
+    /// Soft upper bound on consecutive `ask_user` rounds during
+    /// `GraphPhase::Clarifying`. The loop surfaces a Block once this
+    /// is reached. Default: 10.
+    #[serde(default = "default_clarification_max")]
+    pub clarification_max: u32,
+    /// Jaccard similarity threshold above which a new `ask_user`
+    /// question is treated as a repeat. Default: 0.85.
+    #[serde(default = "default_clarification_similarity_threshold")]
+    pub clarification_similarity_threshold: f64,
+    /// Sliding window of recent `ask_user` question texts. Default: 5.
+    #[serde(default = "default_clarification_history_window")]
+    pub clarification_history_window: usize,
+    /// Soft upper bound on consecutive `explore` rounds. Default: 200.
+    #[serde(default = "default_explore_max")]
+    pub explore_max: u32,
+    /// Round at which to inject a soft hint during a long explore
+    /// streak. Default: 100.
+    #[serde(default = "default_explore_soft_hint_at")]
+    pub explore_soft_hint_at: u32,
+    /// Round at which to inject a hard warning. Default: 150.
+    #[serde(default = "default_explore_hard_hint_at")]
+    pub explore_hard_hint_at: u32,
+    /// Jaccard similarity threshold for explore-question repeat
+    /// detection. Default: 0.85.
+    #[serde(default = "default_explore_similarity_threshold")]
+    pub explore_similarity_threshold: f64,
+    /// Sliding window of recent `explore` question texts. Default: 5.
+    #[serde(default = "default_explore_history_window")]
+    pub explore_history_window: usize,
 }
 
 fn default_true() -> bool {
@@ -259,6 +290,15 @@ fn default_force_search_after_filling_stall() -> u32 { 5 }
 fn default_convergence_stable_rounds() -> u32 { 3 }
 fn default_max_drilldown_depth() -> usize { 2 }
 fn default_sub_run_timeout_ms() -> u64 { 1_800_000 } // 30 min
+// v2 agent-harness spec defaults
+fn default_clarification_max() -> u32 { 10 }
+fn default_clarification_similarity_threshold() -> f64 { 0.85 }
+fn default_clarification_history_window() -> usize { 5 }
+fn default_explore_max() -> u32 { 200 }
+fn default_explore_soft_hint_at() -> u32 { 100 }
+fn default_explore_hard_hint_at() -> u32 { 150 }
+fn default_explore_similarity_threshold() -> f64 { 0.85 }
+fn default_explore_history_window() -> usize { 5 }
 
 // AdvancedTuningConfig defaults — match the pre-config hardcoded values.
 fn default_subagent_max_steps() -> usize { 8 }
@@ -442,6 +482,15 @@ impl Default for EngineConfig {
                 event_channel_capacity: 256,
                 force_search_after_filling_stall: 5,
                 convergence_stable_rounds: 3,
+                // v2 agent-harness spec defaults
+                clarification_max: 10,
+                clarification_similarity_threshold: 0.85,
+                clarification_history_window: 5,
+                explore_max: 200,
+                explore_soft_hint_at: 100,
+                explore_hard_hint_at: 150,
+                explore_similarity_threshold: 0.85,
+                explore_history_window: 5,
             },
         }
     }

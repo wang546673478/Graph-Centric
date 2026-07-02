@@ -497,13 +497,17 @@ regular Task nodes.");
 
         // Layer 3: post-Explore commit gate. After an Explore step the
         // next step MUST be a graph-committing or pause-declaring step
-        // (ProposePatch / Block / AskUser / ReadyForVerify) — never
-        // another Explore (or CallTool that bypasses the graph). Without
-        // this, the model keeps dispatching subagents and never updates
-        // the graph, which is the 602-round infinite-explore failure
-        // mode we hit in production 2026-06-09. The error message is
-        // picked up by the fix-it retry path so the model gets a
-        // second chance to commit before the run dies.
+        // (ProposePatch / Block / AskUser / ReadyForVerify) — or, per
+        // the v2 spec, another Explore if the model is genuinely
+        // iterating on the same uncertain detail (saturation is
+        // tracked in `graph_loop::SaturationState` separately).
+        //
+        // Without this gate the model would loop `Explore` forever
+        // without ever updating the graph (the 602-round production
+        // failure mode from 2026-06-09). The v2 relaxation is bounded
+        // by `explore_max` (default 200) and a similarity check, so
+        // the gate can safely allow another Explore when the model
+        // is iterating on a different question.
         if let Some(ProposerStep::Explore { .. }) = prev_step {
             let ok = matches!(
                 step,
@@ -511,6 +515,7 @@ regular Task nodes.");
                     | ProposerStep::Block { .. }
                     | ProposerStep::AskUser { .. }
                     | ProposerStep::ReadyForVerify { .. }
+                    | ProposerStep::Explore { .. }
             );
             if !ok {
                 return Err(HarnessError::model(format!(
@@ -522,10 +527,10 @@ regular Task nodes.");
                      2) `block` — declare you're stuck on something the user must \
                         resolve, \
                      3) `ask_user` — ask the user a clarifying question, \
-                     4) `ready_for_verify` — declare the graph is complete. \
-                     Dispatching another Explore (or any non-committing step) \
-                     without first committing the previous subagent's findings \
-                     is a violation. Got step kind: {}",
+                     4) `ready_for_verify` — declare the graph is complete, \
+                     5) `explore` — keep probing a different aspect (bounded by \
+                        the loop's saturation guard). \
+                     Got step kind: {}",
                     step.kind()
                 )));
             }
@@ -2443,9 +2448,14 @@ mod tests {
 
     #[tokio::test]
     async fn next_step_rejects_explore_after_explore_without_commit() {
-        // Post-Explore commit gate (added 2026-06-09): after an Explore
-        // step, the next step must be a graph-committing or
-        // pause-declaring step. A second Explore is rejected.
+        // v2 spec: the post-Explore gate now *allows* another Explore
+        // (per agent self-decides-with-saturation-guards), but still
+        // rejects any other non-committing step (CallTool, etc.). The
+        // saturation guard at the graph_loop level (explore_max=200
+        // + similarity check) is what bounds it. So this test now
+        // asserts that an Explore-after-Explore passes the gate —
+        // the saturation tier hint / block is what would actually
+        // surface a stop signal.
         use crate::agent::proposer::ExploreItem;
         let prev = ProposerStep::Explore {
             items: vec![ExploreItem {
@@ -2455,18 +2465,20 @@ mod tests {
             rationale: "r".into(),
         };
         // Model tries to dispatch another Explore right after the
-        // first one — should be rejected.
+        // first one — v2 spec: should now PASS the gate.
         let p = proposer_with(vec![
             r#"{"step":"explore","items":[{"scope":"src/web/","question":"what's the entry?"}],"rationale":"more"}"#,
         ]);
         let conv = p.make_conversation("test task");
         let graph = Graph::new();
         let r = p.next_step(&conv, &graph, Some(&prev)).await;
-        let err = r.unwrap_err();
-        let msg = format!("{err:?}");
+        let (step, _tokens) = r.expect(
+            "v2 spec: Explore-after-Explore is now allowed; saturation \
+             is handled at the graph_loop tier, not the post-Explore gate",
+        );
         assert!(
-            msg.contains("post-Explore commit gate"),
-            "expected post-Explore commit gate error, got: {msg}"
+            matches!(step, ProposerStep::Explore { .. }),
+            "expected an Explore step to come through, got {step:?}"
         );
     }
 

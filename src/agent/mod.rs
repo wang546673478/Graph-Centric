@@ -30,6 +30,7 @@ pub mod intake;
 pub mod proposer;
 pub mod repairer;
 pub mod reviewer;
+pub mod saturation;
 pub mod subagent;
 pub mod validator;
 pub mod verifier;
