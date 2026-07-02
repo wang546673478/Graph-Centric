@@ -555,7 +555,7 @@ impl GraphLoopConfig {
             is_heartbeat: false,
             stagnation_soft_hint: 4,
             stagnation_hard_hint: 6,
-            stagnation_terminate: 8,
+            stagnation_terminate: 12,
             stuck_soft_hint: 3,
             stuck_hard_hint: 5,
             stuck_terminate: 6,
@@ -2233,19 +2233,19 @@ impl GraphLoop {
         }
 
         // ── Clarifying phase: prime the Proposer (once) to confirm the goal ──
-        // The model keeps asking via ask_user until it is confident; when it
-        // decides the goal is clear it emits propose_patch — that IS the signal
-        // (handled in the ProposePatch arm below, Change 2).
+        // The model emits ask_user at most 2 times. After 2 clarifications
+        // it must emit propose_patch to start building. The user can always
+        // answer with their own text (skipping the model's options) if they
+        // want the model to move on faster.
         if self.graph_phase == GraphPhase::Clarifying && !self.clarifying_primed {
             self.clarifying_primed = true;
             self.conversation.add_user(
                 "GOAL CLARIFICATION PHASE. Confirm the user's goal before building. \
-                 Emit `ask_user`: state your current understanding of the goal, and \
-                 provide 2-4 concrete `options` (the user can also type their own \
-                 answer). Keep asking until the goal is clear. When you are confident \
-                 about the deliverable, emit `propose_patch` to seed `start` and \
+                 You may emit `ask_user` AT MOST 2 times to get clarification. After 2 \
+                 `ask_user` rounds, you MUST emit `propose_patch` to seed `start` and \
                  `deliverable` — that begins building. Do not ask for confirmation; \
-                 starting to build IS the signal you're ready.",
+                 starting to build IS the signal you're ready. The user can answer \
+                 with their own text to skip your options and force you to proceed.",
             );
         }
 

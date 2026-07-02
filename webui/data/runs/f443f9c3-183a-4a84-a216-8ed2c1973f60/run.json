@@ -2,9 +2,9 @@
   "id": "f443f9c3-183a-4a84-a216-8ed2c1973f60",
   "task": "设计一个电商微服务后端系统:用户认证、商品目录、订单处理(复杂:含状态机+分布式事务)、支付集成、库存同步、通知系统。先规划架构,然后展开订单处理的详细设计。",
   "status": {
-    "Paused": null
+    "Done": null
   },
-  "duration_ms": 1154062,
+  "duration_ms": 2666845,
   "captured_skill": null,
-  "tokens_used": 29892
+  "tokens_used": 69265
 }

@@ -1,0 +1,10 @@
+{
+  "id": "c7e43d28-d35b-4540-906b-d963a9fef5da",
+  "task": "为电商系统设计订单处理模块的详细逻辑(状态机+Saga+分层兜底)。用 Mermaid 状态机源码,只展开 order-detail 这一步的详细子图,其他步骤保持高层抽象。",
+  "status": {
+    "Paused": null
+  },
+  "duration_ms": 28776177,
+  "captured_skill": null,
+  "tokens_used": 15139
+}
