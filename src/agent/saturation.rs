@@ -47,8 +47,9 @@ fn bigrams(s: &str) -> HashSet<String> {
         .collect()
 }
 
-/// Jaccard similarity over character bigrams. Returns 0.0 for empty
-/// inputs (so a 0-history check trivially passes for any new text).
+/// Jaccard similarity over character bigrams.
+/// Token boundary: empty or single-char inputs return 0.0 (safe edge case).
+/// Returns 0.0 for empty inputs (so a 0-history check trivially passes for any new text).
 pub fn jaccard(a: &str, b: &str) -> f64 {
     let sa = bigrams(a);
     let sb = bigrams(b);
