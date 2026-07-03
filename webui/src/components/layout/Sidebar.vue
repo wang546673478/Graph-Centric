@@ -12,6 +12,12 @@ onMounted(() => { loadRuns(); setInterval(loadRuns, 5000) })
 const search = ref('')
 const statusFilter = ref<'all' | 'running' | 'paused' | 'done' | 'error'>('all')
 
+// Pagination: with 24+ runs the sidebar becomes a vertical scroll
+// wall. Cap at PAGE_SIZE=15; a '显示更多' button reveals the rest
+// when the user opts in. Same UX pattern as HistoryView.
+const PAGE_SIZE = 15
+const showAll = ref(false)
+
 const filtered = computed(() => {
   const q = search.value.trim().toLowerCase()
   return runs.value.filter(r => {
@@ -27,6 +33,11 @@ const filtered = computed(() => {
     return true
   })
 })
+const visible = computed(() => {
+  if (showAll.value) return filtered.value
+  return filtered.value.slice(0, PAGE_SIZE)
+})
+const hiddenCount = computed(() => filtered.value.length - visible.value.length)
 
 async function selectRun(id: string) {
   activeRunId.value = id
@@ -46,8 +57,22 @@ function quickStart() {
 }
 
 function statusClass(s: string) {
-  const m: Record<string, string> = { running: 's-running', paused: 's-paused', done: 's-done', error: 's-error' }
-  return m[s] || ''
+  // Normalize the status string from the backend
+  // ('Done' / 'Error' / 'Paused' / '{Done: null}') into a CSS
+  // class key. Used both for the inline status text color and
+  // for the run-item's left border color.
+  const m: Record<string, string> = {
+    running: 's-running',
+    paused: 's-paused',
+    done: 's-done',
+    error: 's-error',
+  }
+  const k = (s || '').toLowerCase()
+  if (k.includes('error')) return m.error
+  if (k.includes('paused')) return m.paused
+  if (k.includes('running') || k.includes('graph')) return m.running
+  if (k.includes('done')) return m.done
+  return ''
 }
 </script>
 
@@ -75,11 +100,28 @@ function statusClass(s: string) {
         <div class="empty-msg">没有匹配的 run</div>
         <button class="empty-cta-secondary" @click="search = ''; statusFilter = 'all'">清除过滤</button>
       </div>
-      <div v-for="r in filtered" :key="r.id" class="run-item" :class="{ active: activeRunId === r.id }" @click="selectRun(r.id)">
-        <div class="task-line">{{ r.task?.slice(0, 50) || '(untitled)' }}</div>
+      <!-- Layout fix: each run-item gets a 3px left border tinted
+           by status. Previously the only visual cue was the
+           inline status text color — indistinguishable for
+           Done/Paused at a glance. Now Done is green, Paused
+           amber, Error red, Running accent. -->
+      <div
+        v-for="r in visible"
+        :key="r.id"
+        class="run-item"
+        :class="[statusClass(r.status), { active: activeRunId === r.id }]"
+        @click="selectRun(r.id)"
+      >
+        <div class="task-line" :title="r.task">{{ r.task?.slice(0, 50) || '(untitled)' }}</div>
         <div class="meta-line">
-          <span :class="statusClass(r.status)">{{ r.status }}</span> · {{ r.duration_sec }}s
+          <span :class="['s-dot', statusClass(r.status)]" />
+          {{ r.status }} · {{ r.duration_sec }}s
         </div>
+      </div>
+      <!-- Pagination expand link — same UX as HistoryView.
+           Local component state, not persisted. -->
+      <div v-if="hiddenCount > 0" class="show-more">
+        <button @click="showAll = true">还有 {{ hiddenCount }} 个 ▼</button>
       </div>
     </div>
   </aside>
@@ -108,13 +150,42 @@ function statusClass(s: string) {
 .empty-cta:hover, .empty-cta-secondary:hover { filter: brightness(1.1); }
 .empty-cta-secondary { background: var(--bg); color: var(--text-muted); border: 1px solid var(--border); }
 .run-list { flex: 1; overflow-y: auto; }
-.run-item { padding: 8px 14px; cursor: pointer; border-left: 3px solid transparent; transition: background 0.1s ease; }
+.run-item {
+  padding: 8px 14px; cursor: pointer;
+  /* 3px left border — colored by status class. Transparent by
+     default so the item is visually identical to before when
+     no status resolves (the inline status text still shows the
+     status). */
+  border-left: 3px solid transparent;
+  transition: background 0.1s ease, border-color 0.1s ease;
+}
 .run-item:hover { background: var(--bg); }
-.run-item.active { background: var(--accent-soft); border-left-color: var(--accent); }
+.run-item.active { background: var(--accent-soft); }
+/* Status colors drive the left-border accent (visible at a
+   glance, complements the inline status text). */
+.run-item.s-done { border-left-color: var(--success); }
+.run-item.s-error { border-left-color: var(--danger); }
+.run-item.s-paused { border-left-color: var(--warning); }
+.run-item.s-running { border-left-color: var(--accent); }
+.run-item.active { border-left-color: var(--accent) !important; }
 .task-line { font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.meta-line { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; }
+.meta-line { font-size: 0.7rem; color: var(--text-muted); margin-top: 2px; display: flex; align-items: center; gap: 5px; }
+/* Status dot — small colored bullet before the text. Adds a
+   second visual cue so Done/Paused/Error are distinguishable
+   even when the text is truncated. */
+.s-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.s-dot.s-done { background: var(--success); }
+.s-dot.s-error { background: var(--danger); }
+.s-dot.s-paused { background: var(--warning); }
+.s-dot.s-running { background: var(--accent); }
 .s-running { color: var(--accent); font-weight: 500; }
 .s-paused { color: var(--warning); }
 .s-done { color: var(--success); }
 .s-error { color: var(--danger); }
+.show-more { padding: 6px 14px; text-align: center; }
+.show-more button {
+  width: 100%; padding: 5px 10px; background: var(--bg); color: var(--text-muted);
+  border: 1px solid var(--border); border-radius: 4px; font-size: 0.7rem; cursor: pointer;
+}
+.show-more button:hover { color: var(--text); border-color: var(--accent); }
 </style>
