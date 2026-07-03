@@ -701,7 +701,16 @@ pub async fn drive_run(
         .with_max_concurrent(engine.policy.max_concurrent_subagents);
 
     // Phase 4 — Reviewer + PostExecutionValidator.
-    let reviewer = Reviewer::with_model(deep_model.clone());
+    // P12: wire the advisor model as a second opinion for the
+    // LLM-as-judge layer. The advisor is a separate vendor
+    // (DeepSeek by default) and runs alongside the main judge.
+    // Both judges must agree for the run to be marked Done;
+    // disagreement is logged with full context.
+    let mut reviewer = Reviewer::with_model(deep_model.clone());
+    if let Some(advisor) = cfg.advisor_model() {
+        reviewer = reviewer.with_advisor(advisor);
+        info!("reviewer: advisor model attached for second-opinion judgment");
+    }
     let validator: Arc<dyn PostExecutionValidator> =
         Arc::new(
             BashCheckValidator::cargo_check_for(&state.config.project_root)
