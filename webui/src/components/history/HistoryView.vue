@@ -103,10 +103,10 @@ function statusKey(s: string) {
       <tbody>
         <tr v-for="r in visible" :key="r.id" @click="openRun(r.id)" class="clickable">
           <td class="mono">{{ r.id.slice(0, 8) }}…</td>
-          <td>{{ r.task?.slice(0, 60) || '(untitled)' }}</td>
+          <td class="task-cell" :title="r.task">{{ r.task?.slice(0, 80) || '(untitled)' }}</td>
           <td><span class="status-pill" :class="statusKey(r.status)">{{ r.status }}</span></td>
-          <td>{{ r.duration_sec }}s</td>
-          <td><button class="row-del" @click="deleteRun(r.id, $event)" title="删除此运行">🗑</button></td>
+          <td class="duration-cell">{{ r.duration_sec }}s</td>
+          <td><button class="row-del" @click="deleteRun(r.id, $event)" :title="`删除 ${r.id.slice(0, 8)}`">×</button></td>
         </tr>
       </tbody>
     </table>
@@ -130,14 +130,34 @@ h2 { font-size: 1.3rem; font-weight: 700; }
 .search:focus { outline: none; border-color: var(--accent); }
 .filter { padding: 6px 10px; font-size: 0.8rem; border: 1px solid var(--border); background: var(--bg); color: var(--text); border-radius: 4px; }
 .match-count { font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono); white-space: nowrap; }
-.run-table { width: 100%; border-collapse: collapse; }
+.run-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .run-table th { text-align: left; padding: 8px 12px; font-size: 0.65rem; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.08em; border-bottom: 1px solid var(--border); }
+.run-table th:nth-child(2) { width: auto; }  /* TASK column gets the rest */
+.run-table th:nth-child(3) { width: 110px; }  /* STATUS pill column */
+.run-table th:nth-child(4) { width: 80px; }  /* DURATION column */
+.run-table th:last-child { width: 40px; }  /* delete button */
 .run-table td { padding: 10px 12px; font-size: 0.82rem; border-bottom: 1px solid var(--border); }
+/* Task text: single-line + ellipsis + tooltip on hover so the
+   full text is always reachable, even when truncated. */
+.run-table td.task-cell {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 0;  /* table-layout: fixed + max-width 0 = let the cell shrink to fit */
+}
+.run-table td.duration-cell { font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-muted); }
 .mono { font-family: var(--font-mono); font-size: 0.75rem !important; color: var(--text-muted); }
 .clickable { cursor: pointer; transition: background 0.1s; }
 .clickable:hover { background: var(--bg-hover); }
-.row-del { background: none; border: none; cursor: pointer; font-size: 0.85rem; opacity: 0.5; padding: 2px 6px; border-radius: 4px; }
-.row-del:hover { opacity: 1; background: var(--danger-soft); }
+/* Trash button: a clear '×' (×) at 16px is more readable than
+   the small 🗑 emoji. Sits inside its own 40px column with
+   right-align so it doesn't push the task text around. */
+.row-del {
+  background: none; border: none; cursor: pointer;
+  font-size: 1.2rem; line-height: 1;
+  opacity: 0.4; padding: 0; width: 28px; height: 28px;
+  border-radius: 4px; color: var(--text-muted);
+  transition: opacity 0.1s, background 0.1s, color 0.1s;
+}
+.row-del:hover { opacity: 1; background: var(--danger-soft); color: var(--danger); }
 .status-pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.7rem; font-weight: 500; }
 .status-pill.done { background: var(--success-soft); color: var(--success); }
 .status-pill.error { background: var(--danger-soft); color: var(--danger); }
