@@ -12,8 +12,18 @@ provide('runs', runs)
 
 const SIDEBAR_KEY = 'gc-sidebar-collapsed'
 const RIGHT_KEY = 'gc-right-collapsed'
+// Layout fix: default BOTH side rails collapsed on first load
+// (no localStorage entry yet). The right rail is a P3
+// placeholder ("对话 / 顾问面板, Phase 3 实现") that wastes
+// 340px of screen estate until it has real content. Users can
+// re-open any rail via its ›/‹ toggle; the state is then
+// persisted. Once Phase 3 lands, flip the right default back
+// to expanded.
 const sidebarCollapsed = ref(localStorage.getItem(SIDEBAR_KEY) === '1')
-const rightCollapsed = ref(localStorage.getItem(RIGHT_KEY) === '1')
+const rightCollapsed = ref(
+  localStorage.getItem(RIGHT_KEY) === '1'
+    || localStorage.getItem(RIGHT_KEY) === null
+)
 watch(sidebarCollapsed, (v) => localStorage.setItem(SIDEBAR_KEY, v ? '1' : '0'))
 watch(rightCollapsed, (v) => localStorage.setItem(RIGHT_KEY, v ? '1' : '0'))
 
@@ -44,8 +54,9 @@ onMounted(() => { loadRuns() })
     </button>
     <aside class="col-right" :class="{ collapsed: rightCollapsed }">
       <div class="right-placeholder">
-        <p>对话 / 顾问面板</p>
-        <span>P3 在此填充</span>
+        <p class="rp-title">对话 / 顾问面板</p>
+        <span class="rp-note">预留区域,Phase 3 实现</span>
+        <p class="rp-hint">点击 › 收起此面板以获得更宽的图区域</p>
       </div>
     </aside>
 
@@ -70,9 +81,11 @@ onMounted(() => { loadRuns() })
 .col-right.collapsed { width: 0; border-left: none; }
 .right-placeholder {
   padding: 20px 16px; color: var(--text-muted); font-size: 0.8rem;
-  display: flex; flex-direction: column; gap: 4px;
+  display: flex; flex-direction: column; gap: 6px;
 }
-.right-placeholder span { font-size: 0.7rem; opacity: 0.6; }
+.right-placeholder .rp-title { font-weight: 500; font-size: 0.85rem; color: var(--text); }
+.right-placeholder .rp-note { font-size: 0.7rem; opacity: 0.6; }
+.right-placeholder .rp-hint { font-size: 0.7rem; opacity: 0.5; margin-top: 8px; line-height: 1.5; }
 .rail-toggle {
   width: 14px; flex-shrink: 0; background: var(--bg-panel);
   border: none; border-right: 1px solid var(--border);

@@ -2,18 +2,10 @@
 import DetailModeToggle from './DetailModeToggle.vue'
 import StatusPill from './StatusPill.vue'
 import { useI18n, locale } from '../../composables/useI18n'
-import { activeRunId } from '../../composables/useRunSocket'
-import { useRouter } from 'vue-router'
 import { useTheme } from '../../composables/useTheme'
 
 const { t } = useI18n()
-const router = useRouter()
 const { theme, toggleTheme } = useTheme()
-
-function newChat() {
-  activeRunId.value = null
-  router.push('/')
-}
 
 function toggleLang() {
   locale.value = locale.value === 'en' ? 'zh-CN' : 'en'
@@ -30,7 +22,6 @@ function toggleLang() {
       <router-link to="/settings">{{ t('nav.settings') }}</router-link>
     </nav>
     <div class="right">
-      <button class="primary new-chat-btn" @click="newChat">{{ t('run.newChat') }}</button>
       <button class="shortcut-hint" @click="$root?.$el?.dispatchEvent?.(new KeyboardEvent('keydown', { key: '?' }))" title="按 ? 打开快捷键帮助">⌨ ?</button>
       <button class="lang-btn" @click="toggleLang" :title="locale === 'en' ? '切换到中文' : 'Switch to English'">
         {{ locale === 'en' ? '中文' : 'EN' }}
