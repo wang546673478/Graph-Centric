@@ -343,13 +343,22 @@ async function submitTask(task: string) {
           <button :class="{ active: graphView === '2d' }" @click="graphView = '2d'">2D</button>
           <button :class="{ active: graphView === '3d' }" @click="graphView = '3d'">3D</button>
         </div>
+        <div class="tab-divider" />
         <button :class="{ active: tab === 'graph' }" @click="tab = 'graph'">{{ t('graph.tab') }}</button>
         <button :class="{ active: tab === 'debug' }" @click="tab = 'debug'">Debug</button>
       </div>
       <RunDashboard v-if="activeRunId" :status="status" :tokensUsed="tokensUsed" :round="round" :durationSec="durationSec" />
       <PhaseProgress v-if="activeRunId" :progress="phaseProgress" />
       <ExplorerBar v-if="activeRunId" :iter="phaseProgress?.explorer_iter ?? 0" :recent="explorerRecent" />
-      <template v-if="tab === 'graph'">
+      <!-- Layout fix: when no run is active, the GraphPanel renders an
+           empty canvas with no instructions. Show a clear "send a task"
+           CTA so the user knows what to do. -->
+      <div v-if="!activeRunId" class="empty-graph-cta">
+        <div class="cta-icon">⬡</div>
+        <h3>{{ t('run.emptyGraph.title') || '等待任务' }}</h3>
+        <p>{{ t('run.emptyGraph.hint') || '在右侧 composer 中输入任务,或从左侧选一个已有的 run。' }}</p>
+      </div>
+      <template v-if="tab === 'graph' && activeRunId">
         <GraphPanel v-if="graphView === '2d'" :key="(activeRunId || 'empty') + '-2d'"
           :nodes="nodes" :edges="edges" :scopeNodeIds="scopeNodeIds" :fx="graphFx" />
         <GraphPanel3D v-else :key="(activeRunId || 'empty') + '-3d'"
@@ -401,6 +410,7 @@ async function submitTask(task: string) {
 .run-view { display: flex; flex: 1; min-height: 0; }
 .graph-stage { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
 .stage-tabs { display: flex; align-items: center; gap: 4px; border-bottom: 1px solid var(--border); background: var(--bg-panel); padding: 0 6px; }
+.tab-divider { width: 1px; height: 18px; background: var(--border); margin: 0 6px; opacity: 0.6; }
 .stage-tabs > button { padding: 8px 10px; background: none; color: var(--text-muted); border-radius: 0; font-size: 0.8rem; }
 .stage-tabs > button.active { color: var(--accent); border-bottom: 2px solid var(--accent); font-weight: 500; }
 .view-toggle { display: flex; gap: 2px; margin-right: auto; padding: 4px 0; }
@@ -410,6 +420,13 @@ async function submitTask(task: string) {
 .splitter:hover { background: var(--accent); }
 .chat-panel { flex-shrink: 0; display: flex; flex-direction: column; min-width: 0; border-left: 1px solid var(--border); background: var(--bg-panel); }
 .toolbar { display: flex; align-items: center; gap: 8px; padding: 4px 12px; border-top: 1px solid var(--border); background: var(--bg); }
+.empty-graph-cta {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 40px 20px; color: var(--text-muted); text-align: center; gap: 8px;
+}
+.empty-graph-cta .cta-icon { font-size: 3rem; opacity: 0.3; line-height: 1; }
+.empty-graph-cta h3 { font-size: 1rem; font-weight: 500; color: var(--text); margin: 0; }
+.empty-graph-cta p { font-size: 0.8rem; opacity: 0.7; margin: 0; line-height: 1.5; max-width: 360px; }
 .toolbar button { font-size: 0.75rem; padding: 4px 10px; }
 .run-label { font-size: 0.7rem; color: var(--text-muted); font-family: var(--font-mono); }
 .sub-runs-badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); margin-left: auto; cursor: help; }

@@ -3,7 +3,7 @@ export default {
   nav: { run: 'Run', history: 'History', skills: 'Skills', files: 'Files', settings: 'Settings' },
   sidebar: { runs: 'Runs', noRuns: 'No runs', checkpoints: 'Checkpoints', noneYet: 'None yet' },
   composer: { placeholder: 'Type a task…', send: 'Send' },
-  run: { newChat: 'New Chat', stop: 'Stop' },
+  run: { newChat: 'New Chat', stop: 'Stop', emptyGraph: { title: 'No task yet', hint: 'Enter a task in the composer on the right, or pick an existing run from the sidebar.' } },
   transcript: { empty: 'Send a task to start building the relationship graph.', thinking: 'thinking…' },
   status: { idle: 'idle', running: 'Running', paused: 'Paused', done: 'Done', error: 'Error', graphInvalid: 'Invalid' },
   detail: { label: 'Detail' },
