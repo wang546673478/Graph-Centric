@@ -692,12 +692,30 @@ fn build_initial_user_prompt(task: &SubTask, context_text: &str, scope: Option<&
     // task shapes without limiting the agent's flexibility
     // for genuinely exploratory tasks.
     let task_kind = detect_task_kind(&task.description);
+    // Extract a path if the user mentioned one — used by the Write
+    // directive to enforce the exact location.
+    let path_hint = extract_path_hint(&task.description);
     let directive = match task_kind {
-        TaskKind::Write => "\n\n🚨 **THIS IS A WRITE/CREATE TASK. DO NOT EXPLORE FIRST.**\n\
-                            Your first action MUST be `write_file` (or `edit_file` if a file already exists). \
-                            Do NOT `ls`, do NOT `find`, do NOT browse. The user wants the artifact, not exploration.\n\
-                            Pattern: 1) `write_file(path=..., content=...)` → 2) `bash` to verify (e.g. `go build` or `cargo check`) → 3) `final_answer`.\n",
-        TaskKind::Modify => "\n\n🔧 **THIS IS A MODIFY TASK. CRITICAL: you DO NOT have `read_file`/`edit_file`/`write_file` directly —\n\
+        TaskKind::Write => {
+            // P11 fix: if user specified a path, use edit_file on
+            // that file (or write_file to create it). Don't
+            // create files in random other locations.
+            let path_section = match &path_hint {
+                Some(p) => format!(
+                    "\n\n📍 The user specified a path: `{}`. Your artifact MUST go to that exact path. \
+                     If the file exists, use `edit_file` to append/insert; if it doesn't, use `write_file` to create it.\n",
+                    p
+                ),
+                None => String::new(),
+            };
+            format!(
+                "\n\n🚨 **THIS IS A WRITE/CREATE TASK. DO NOT EXPLORE FIRST.**\n\
+                 Your first action MUST be `write_file` (or `edit_file` if a file already exists). \
+                 Do NOT `ls`, do NOT `find`, do NOT browse. The user wants the artifact, not exploration.\n\
+                 Pattern: 1) `write_file(path=..., content=...)` → 2) `bash` to verify (e.g. `go build` or `cargo check`) → 3) `final_answer`.{path_section}",
+            )
+        }
+        TaskKind::Modify => String::from("\n\n🔧 **THIS IS A MODIFY TASK. CRITICAL: you DO NOT have `read_file`/`edit_file`/`write_file` directly —\n\
                              these are sub-agent tools. To modify code, you MUST go through drill-down.**\n\n\
                              ## Required pattern (FOLLOW THIS EXACTLY):\n\
                              1) `explore` (1 item): find the exact file path + line range to change. e.g.\n\
@@ -710,10 +728,21 @@ fn build_initial_user_prompt(task: &SubTask, context_text: &str, scope: Option<&
                              4) The graph loop will fork a sub-run that has `read_file`/`edit_file`/`write_file`.\n\
                              5) The sub-run's result is folded back into the parent graph.\n\n\
                              DO NOT call `read_file` / `edit_file` / `write_file` from here — they will fail. \n\
-                             DO NOT explore the entire repo. One explore is enough.\n",
-        TaskKind::Read => "\n\n🔍 **THIS IS A READ/ANALYZE TASK.** Use `read_file` (with `offset`/`limit` for large files) or `bash` \
-                           with `grep`/`head`/`cat`. After 2-3 reads, emit `final_answer`.\n",
-        TaskKind::Unknown => "",
+                             DO NOT explore the entire repo. One explore is enough.\n"),
+        TaskKind::Read => String::from("\n\n🔍 **THIS IS A READ/ANALYZE TASK.** Use `read_file` (with `offset`/`limit` for large files) or `bash` \
+                           with `grep`/`head`/`cat`. After 2-3 reads, emit `final_answer`.\n\n\
+                           ## CRITICAL: the deliverable node's `summary` field MUST contain the COMPLETE answer text.\n\
+                           Do not just put a label like 'Explain the saturation check'. Put the actual explanation:\n\
+                           e.g. `summary: 'The saturation check uses Jaccard similarity on char bigrams (threshold 0.85). \
+                           It tracks the last 5 questions in a sliding window. When a new question matches any recent \
+                           one above the threshold, the loop surfaces a Block. ...'`\n\
+                           The reviewer reads the `summary` field to verify the answer is complete.\n"),
+        TaskKind::Unknown => String::from("\n\n📋 **GENERIC TASK. Match the scale to the question.**\n\
+                              - For a tiny / one-sentence question: just emit `start` → `deliverable` (1 edge), then \
+                                `ready_for_verify`. The deliverable's `summary` is the answer. Don't break it into \
+                                many nodes.\n\
+                              - For a multi-step task: decompose into Task nodes with `LeadsTo` edges.\n\
+                              - For a code task: see the Modify / Write directives above.\n"),
     };
     format!(
         "{directive}{context}\n\n## Your sub-task ({task_id})\n{desc}{scope_section}\n\n\
@@ -738,6 +767,37 @@ enum TaskKind {
     Read,
     /// Couldn't classify.
     Unknown,
+}
+
+/// v2 spec §5.1: extract a file path from the task description, if
+/// the user named one. Used by the Write directive to enforce
+/// the exact target path. Returns the first plausible path
+/// matching common source-tree shapes.
+fn extract_path_hint(description: &str) -> Option<String> {
+    // Match: src/foo.rs, /abs/path, ./relative, ../parent
+    // Quoted variants: "src/foo.rs", 'src/foo.rs', `src/foo.rs`
+    let candidates: Vec<String> = description
+        .split(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == '`')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_matches(|c: char| ",.;:?!()[]{}'\"`".contains(c)).to_string())
+        .collect();
+    for c in candidates {
+        // Require a path-like shape: contains a `/` or a `.`
+        if !c.contains('/') && !c.contains('.') {
+            continue;
+        }
+        // Must look like a file (has an extension) or an absolute path
+        if c.starts_with('/') {
+            return Some(c);
+        }
+        if c.contains('/') && c.rsplit_once('.').is_some() {
+            return Some(c);
+        }
+        if c.starts_with("./") || c.starts_with("../") {
+            return Some(c);
+        }
+    }
+    None
 }
 
 fn detect_task_kind(description: &str) -> TaskKind {
@@ -789,6 +849,50 @@ mod task_kind_tests {
     #[test]
     fn unknown_when_no_keyword() {
         assert_eq!(detect_task_kind("do the thing"), TaskKind::Unknown);
+    }
+
+    #[test]
+    fn extracts_relative_path() {
+        assert_eq!(
+            extract_path_hint("在 src/agent/saturation.rs 末尾添加测试"),
+            Some("src/agent/saturation.rs".to_string())
+        );
+        assert_eq!(
+            extract_path_hint("modify src/foo.rs to add comments"),
+            Some("src/foo.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_quoted_path() {
+        assert_eq!(
+            extract_path_hint("write content to \"docs/architecture.md\""),
+            Some("docs/architecture.md".to_string())
+        );
+        assert_eq!(
+            extract_path_hint("open `src/main.rs` and edit"),
+            Some("src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_absolute_path() {
+        assert_eq!(
+            extract_path_hint("read /home/user/file.txt"),
+            Some("/home/user/file.txt".to_string())
+        );
+    }
+
+    #[test]
+    fn no_path_when_description_has_none() {
+        assert_eq!(extract_path_hint("用一句话描述这个项目"), None);
+        assert_eq!(extract_path_hint("search the codebase"), None);
+    }
+
+    #[test]
+    fn ignores_inline_extensions_that_arent_paths() {
+        // e.g. "v1.0" or "0.85" should not be returned as paths
+        assert_eq!(extract_path_hint("threshold is 0.85"), None);
     }
 }
 
