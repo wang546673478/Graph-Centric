@@ -12,9 +12,9 @@
 //! Claude Code avoids — it adapts by capability, not by identity), we
 //! capture those differences once in [`ModelCapabilities`] and let
 //! [`ModelCapabilities::from_model_name`] infer them from the configured
-//! model string. The HTTP client (`OpenAICompatModel`) reads the capability
-//! struct when building requests and parsing responses; the agent core never
-//! sees any of it.
+//! model string. The HTTP client (`AnthropicModel`) reads the capability
+//! struct when building requests and parsing responses; the agent core
+//! never sees any of it.
 //!
 //! Adding a new backend = add one match arm here, not a new code path.
 

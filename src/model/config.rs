@@ -34,10 +34,9 @@
 //! ## Protocol
 //!
 //! S4 of the OpenAI → Anthropic migration: the factory in this module
-//! constructs an `AnthropicModel` (speaking the `/v1/messages` wire protocol
-//! with `x-api-key` + `anthropic-version` headers). The OpenAI-compatible
-//! client is preserved in `openai_compat.rs` for tests and an optional
-//! future fallback — see S5 / S6 of the migration plan.
+//! constructs an `AnthropicModel` (speaking the `/v1/messages` wire
+//! protocol with `x-api-key` + `anthropic-version` headers). The
+//! OpenAI-compatible client was deleted as part of S6 final cleanup.
 
 use super::anthropic::{AnthropicConfig, AnthropicModel};
 use super::Model;

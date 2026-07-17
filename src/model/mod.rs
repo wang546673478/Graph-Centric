@@ -6,20 +6,19 @@
 pub mod capabilities;
 pub mod config;
 pub mod cache;
-pub mod openai_compat;
 pub mod anthropic;
 pub mod streaming;
 
-// S1 of the OpenAI -> Anthropic migration: provider-agnostic types and
-// future Anthropic-protocol impl. Private to crate so the existing public
-// `Message`, `Role`, `Model` surface stays intact for current callers.
-// S2 (HTTP+SSE), S4 (caller migration), S5 (M3 reasoning), S6 (cleanup)
-// make these public as they consume the new shapes.
+// S1 of the OpenAI -> Anthropic migration: provider-agnostic types.
+// Private to crate. The harness's public surface (Message, Role,
+// ModelRequest, ModelResponse, StreamDelta, ModelWithEvents) is the OLD
+// shape that 50+ caller sites in agent/*, web/*, skills/*, bin/* depend on;
+// AnthropicModel translates at the wire boundary. S5 (M3 reasoning) and
+// any future Type migration will broaden this visibility.
 pub(crate) mod types;
 
 pub use capabilities::{ModelCapabilities, ReasoningField, ThinkingStyle};
 pub use config::ModelConfig;
-pub use openai_compat::OpenAICompatModel;
 pub use streaming::ModelWithEvents;
 
 use crate::error::Result;
@@ -57,6 +56,24 @@ impl Message {
             content: content.into(),
             extra: std::collections::HashMap::new(),
         }
+    }
+
+    /// Convenience constructors for the four message roles. These were
+    /// historically defined in `openai_compat.rs`; moved here during the
+    /// OpenAI → Anthropic migration (S6 final cleanup) so callers in
+    /// `agent/*`, `web/*`, `skills/*`, `bin/*` could keep working after the
+    /// legacy OpenAI file was deleted.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self { role: Role::System, content: content.into(), extra: std::collections::HashMap::new() }
+    }
+    pub fn user(content: impl Into<String>) -> Self {
+        Self { role: Role::User, content: content.into(), extra: std::collections::HashMap::new() }
+    }
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self { role: Role::Assistant, content: content.into(), extra: std::collections::HashMap::new() }
+    }
+    pub fn tool(content: impl Into<String>) -> Self {
+        Self { role: Role::Tool, content: content.into(), extra: std::collections::HashMap::new() }
     }
 }
 
@@ -192,9 +209,10 @@ pub trait Model: Send + Sync {
         });
         // Forward any tool_calls as assembled-arguments fragments (one
         // per tool_call) so the streaming path mirrors the non-streaming
-        // path's behavior. The SSE-aware `complete_stream` override in
-        // openai_compat fires per-fragment events that the downstream
-        // forwarder (in `model::streaming`) coalesces into this shape.
+        // path's behavior. The SSE-aware AnthropicModel::complete_stream
+        // override (in `model::anthropic`) fires per-fragment events that
+        // the downstream forwarder (in `model::streaming`) coalesces
+        // into this shape.
         for (i, tc) in resp.tool_calls.iter().enumerate() {
             let _ = tx.send(StreamDelta::ToolCallArgument {
                 index: i,

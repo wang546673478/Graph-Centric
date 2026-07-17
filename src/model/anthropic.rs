@@ -1,10 +1,8 @@
 //! Anthropic-compatible HTTP client (`/v1/messages`).
 //!
-//! S2 of the OpenAI -> Anthropic migration. Speaks the Anthropic Messages API,
-//! which the MiniMax (`https://api.minimaxi.com/anthropic`) endpoint exposes.
-//! This file coexists with `openai_compat.rs` — both implement the existing
-//! `Model` trait surface from `mod.rs`. S4 (caller migration) decides which
-//! one the gateway actually wires up.
+//! S2 of the OpenAI -> Anthropic migration. Speaks the Anthropic Messages
+//! API, which the MiniMax (`https://api.minimaxi.com/anthropic`) endpoint
+//! exposes. This is the **sole** `Model` impl after S6 final cleanup.
 //!
 //! Wire shape (non-streaming):
 //! - POST `{base_url}/v1/messages`
@@ -56,8 +54,9 @@ impl Default for AnthropicConfig {
             api_key: String::new(),
             model: String::new(),
             max_retries: 2,
-            // 180s matches OpenAICompatModel — reasoning models (M3, DeepSeek)
-            // with thinking enabled regularly exceed 30s on a single completion.
+            // 180s is sized for reasoning models (M3, DeepSeek) — with
+            // thinking enabled they regularly exceed 30s on a single
+            // completion; smaller timeouts drop late completions.
             request_timeout: Duration::from_secs(180),
         }
     }
@@ -99,8 +98,8 @@ impl AnthropicModel {
     }
 
     /// Convenience: build a model from environment. Reads `MODEL_BASE_URL`,
-    /// `MODEL_API_KEY`, `MODEL_NAME` (matching OpenAICompatModel's env
-    /// contract) and falls back to MiniMax when unset.
+    /// `MODEL_API_KEY`, `MODEL_NAME` (the existing env contract) and falls
+    /// back to MiniMax defaults when unset.
     ///
     /// Note: the Anthropic endpoint is at `{base}/v1/messages`, not
     /// `{base}/v1/chat/completions`, so the env var semantics are slightly
@@ -400,10 +399,9 @@ pub(crate) fn translate_response(parsed: AnthropicWireResponse) -> ModelResponse
 #[async_trait]
 impl Model for AnthropicModel {
     fn name(&self) -> &str {
-        // S4: return the actual model identifier (e.g. "MiniMax-M3") for
-        // parity with OpenAICompatModel::name(). S2 originally returned
-        // the protocol tag "anthropic" — fine for the migration tests
-        // but useless in `probe_model` logs and skills::capture (which
+        // Return the actual model identifier (e.g. "MiniMax-M3") so
+        // `probe_model` logs and skills::capture see the resolved model,
+        // not just a protocol tag.
         // records `model.name()` into the run metadata).
         &self.cfg.model
     }
