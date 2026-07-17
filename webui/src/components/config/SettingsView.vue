@@ -101,8 +101,8 @@ onMounted(async () => {
 })
 
 // Persist prompt edits to localStorage on every keystroke.
-watch(hbPrompt, (v) => localStorage.setItem('hb-prompt', v))
-watch(hbRounds, (v) => localStorage.setItem('hb-rounds', String(v)))
+watch(hbPrompt, (v) => { try { localStorage.setItem('hb-prompt', v) } catch { /* blocked */ } })
+watch(hbRounds, (v) => { try { localStorage.setItem('hb-rounds', String(v)) } catch { /* blocked */ } })
 
 async function startHeartbeat() {
   try {

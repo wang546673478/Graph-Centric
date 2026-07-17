@@ -76,7 +76,7 @@ onMounted(() => { msgEl.value?.focus() })
       <div v-for="(h, i) in history" :key="i" class="history-item" @click="pickHistory(h)">
         {{ h.length > 60 ? h.slice(0, 60) + '…' : h }}
       </div>
-      <div class="history-clear" @click="history = []; localStorage.removeItem(KEY)">清空</div>
+      <div class="history-clear" @click="history = []; try { localStorage.removeItem(KEY) } catch { /* blocked */ }">清空</div>
     </div>
     <div v-if="!msg.length && !showHistory" class="templates">
       <span class="tpl-label">模板:</span>

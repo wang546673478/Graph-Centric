@@ -15,9 +15,17 @@ export function useSplitter(opts: SplitterOptions, fromRight = false): {
   size: Ref<number>
   startDrag: (e: MouseEvent) => void
 } {
-  const saved = Number(localStorage.getItem(opts.storageKey))
+  // localStorage can throw SecurityError in private mode / iframe sandbox;
+  // the read runs at composable setup so an unprotected call would break the
+  // caller. Wrap defensively and fall back to the supplied initial size.
+  let saved = NaN
+  try {
+    saved = Number(localStorage.getItem(opts.storageKey))
+  } catch { /* fall through to initial */ }
   const size = ref(Number.isFinite(saved) && saved > 0 ? saved : opts.initial)
-  watch(size, (v) => localStorage.setItem(opts.storageKey, String(Math.round(v))))
+  watch(size, (v) => {
+    try { localStorage.setItem(opts.storageKey, String(Math.round(v))) } catch { /* blocked */ }
+  })
 
   function startDrag(e: MouseEvent) {
     e.preventDefault()
