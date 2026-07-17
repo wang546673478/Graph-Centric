@@ -1,0 +1,188 @@
+/* 8 selector blocks (4 styles × 2 modes).
+   Each redefines ALL custom-property tokens the app uses, so the rest of the
+   codebase keeps reading `var(--accent)` etc. and gets the right values for
+   the currently active (theme, style) combination. */
+
+[data-theme="light"][data-style="minimal"] {
+  --bg: #f5f5f0;
+  --bg-panel: #ffffff;
+  --bg-hover: #f0ede8;
+  --border: #e0ddd6;
+  --text: #1a1a2e;
+  --text-muted: #787878;
+  --accent: #7c3aed;
+  --accent-hover: #6d28d9;
+  --accent-soft: #f5f3ff;
+  --danger: #dc2626;
+  --danger-soft: #fef2f2;
+  --success: #059669;
+  --success-soft: #ecfdf5;
+  --warning: #d97706;
+  --warning-soft: #fffbeb;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 4px 6px rgba(0, 0, 0, 0.05), 0 2px 4px rgba(0, 0, 0, 0.04);
+  --radius: 8px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="dark"][data-style="minimal"] {
+  --bg: #0f1117;
+  --bg-panel: #151823;
+  --bg-hover: #1c2030;
+  --border: #232838;
+  --text: #e5e7eb;
+  --text-muted: #8b8fa3;
+  --accent: #a78bfa;
+  --accent-hover: #b9a3fc;
+  --accent-soft: #1e1b3a;
+  --danger: #f87171;
+  --danger-soft: #2a1517;
+  --success: #34d399;
+  --success-soft: #0f2922;
+  --warning: #fbbf24;
+  --warning-soft: #2a2310;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.5), 0 2px 4px rgba(0, 0, 0, 0.3);
+  --radius: 8px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="light"][data-style="glassmorphism"] {
+  --bg: #e8e4f8;
+  --bg-panel: rgba(255, 255, 255, 0.55);
+  --bg-hover: rgba(255, 255, 255, 0.75);
+  --border: rgba(124, 58, 237, 0.20);
+  --text: #1a1a2e;
+  --text-muted: #6b6580;
+  --accent: #7c3aed;
+  --accent-hover: #6d28d9;
+  --accent-soft: rgba(124, 58, 237, 0.12);
+  --danger: #dc2626;
+  --danger-soft: rgba(220, 38, 38, 0.12);
+  --success: #059669;
+  --success-soft: rgba(5, 150, 105, 0.14);
+  --warning: #d97706;
+  --warning-soft: rgba(217, 119, 6, 0.14);
+  --shadow: 0 4px 16px rgba(124, 58, 237, 0.12), 0 1px 3px rgba(0, 0, 0, 0.04);
+  --shadow-md: 0 12px 32px rgba(124, 58, 237, 0.20), 0 4px 12px rgba(124, 58, 237, 0.10);
+  --radius: 16px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="dark"][data-style="glassmorphism"] {
+  --bg: #0a0c14;
+  --bg-panel: rgba(21, 24, 35, 0.55);
+  --bg-hover: rgba(167, 139, 250, 0.12);
+  --border: rgba(167, 139, 250, 0.25);
+  --text: #e5e7eb;
+  --text-muted: #8b8fa3;
+  --accent: #a78bfa;
+  --accent-hover: #b9a3fc;
+  --accent-soft: rgba(167, 139, 250, 0.15);
+  --danger: #f87171;
+  --danger-soft: rgba(248, 113, 113, 0.15);
+  --success: #34d399;
+  --success-soft: rgba(52, 211, 153, 0.15);
+  --warning: #fbbf24;
+  --warning-soft: rgba(251, 191, 36, 0.15);
+  --shadow: 0 4px 16px rgba(167, 139, 250, 0.20), 0 1px 3px rgba(0, 0, 0, 0.30);
+  --shadow-md: 0 12px 32px rgba(167, 139, 250, 0.30), 0 4px 12px rgba(0, 0, 0, 0.40);
+  --radius: 16px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="light"][data-style="notion"] {
+  --bg: #f7f3ec;
+  --bg-panel: #ffffff;
+  --bg-hover: #efe9df;
+  --border: #e6dfd3;
+  --text: #2c2620;
+  --text-muted: #8b7e6e;
+  --accent: #c4694a;
+  --accent-hover: #a85738;
+  --accent-soft: #f9ede6;
+  --danger: #c43c3c;
+  --danger-soft: #fbeaea;
+  --success: #4a8a5c;
+  --success-soft: #ebf5ee;
+  --warning: #b87a2b;
+  --warning-soft: #fbf2e3;
+  --shadow: 0 2px 8px rgba(60, 40, 20, 0.08);
+  --shadow-md: 0 6px 16px rgba(60, 40, 20, 0.12);
+  --radius: 12px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="dark"][data-style="notion"] {
+  --bg: #2a2520;
+  --bg-panel: #3a322a;
+  --bg-hover: #443c33;
+  --border: #4d443a;
+  --text: #ece2d3;
+  --text-muted: #a89882;
+  --accent: #d99770;
+  --accent-hover: #e7a784;
+  --accent-soft: #3d2e22;
+  --danger: #e88a8a;
+  --danger-soft: #4a2626;
+  --success: #8cc099;
+  --success-soft: #1f3a28;
+  --warning: #e0b06a;
+  --warning-soft: #3d2f18;
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 6px 16px rgba(0, 0, 0, 0.45);
+  --radius: 12px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="light"][data-style="bento"] {
+  --bg: #f5f7fa;
+  --bg-panel: #ffffff;
+  --bg-hover: #ebeef3;
+  --border: #d8dee9;
+  --text: #1a1a2e;
+  --text-muted: #6a7585;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-soft: #e0eaff;
+  --danger: #d93636;
+  --danger-soft: #fde8e8;
+  --success: #1f8a4f;
+  --success-soft: #e3f5ea;
+  --warning: #b26407;
+  --warning-soft: #faecc8;
+  --shadow: 0 1px 2px rgba(20, 30, 50, 0.06);
+  --shadow-md: 0 2px 4px rgba(20, 30, 50, 0.08), 0 1px 2px rgba(20, 30, 50, 0.04);
+  --radius: 6px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
+
+[data-theme="dark"][data-style="bento"] {
+  --bg: #0d1117;
+  --bg-panel: #161b22;
+  --bg-hover: #21262d;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-muted: #8b949e;
+  --accent: #58a6ff;
+  --accent-hover: #79b8ff;
+  --accent-soft: #1c2330;
+  --danger: #ff7b72;
+  --danger-soft: #3a1c19;
+  --success: #56d364;
+  --success-soft: #14301c;
+  --warning: #e3b341;
+  --warning-soft: #3a2c12;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.55), 0 1px 2px rgba(0, 0, 0, 0.40);
+  --radius: 6px;
+  --font: 'Inter', -apple-system, 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+}
