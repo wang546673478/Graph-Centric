@@ -4,7 +4,7 @@
 
 A universal LLM agent orchestrator in Rust (~15K LOC). Core thesis: **every agent task is fundamentally an operation on a relationship graph.** The graph is the orchestrator's plan — the LLM maintains it as working memory through Graph → Task → Review phases.
 
-- **Model-agnostic**: speaks OpenAI-compatible HTTP (`/v1/chat/completions`)
+- **Model-agnostic**: speaks Anthropic-protocol HTTP (`/v1/messages`). S4 of the OpenAI → Anthropic migration made `AnthropicModel` the default factory in `model::config`; MiniMax's `https://api.minimaxi.com/anthropic` endpoint with `MiniMax-M3` is the default. The legacy OpenAI-compatible client in `openai_compat.rs` is kept for tests and an optional future fallback.
 - **State machine**: fixed FSM (Graph / Task / Review / Done), not free-form ReAct
 - **Three-layer graph**: L0 (nodes+edges) / L1 (semantic descriptions) / L2 (raw source, on-demand)
 - **Defense in depth**: every "trust the model" decision is checked at least twice (sub-agent + dispatcher; verifier + reviewer; graph self-check + post-execution validator). The hard gate is always deterministic.
@@ -190,10 +190,11 @@ src/
 │   └── mod.rs            #   agent module root
 ├── graph/                # L0/L1/L2 data model: Node, Edge, Graph, GraphPatch
 ├── scheduler/            # DagScheduler (Kahn-based wave decomposition)
-├── model/                # Model trait + OpenAI-compatible HTTP client
+├── model/                # Model trait + Anthropic-protocol HTTP client (S4 default)
 │   ├── mod.rs            #   Model trait, StreamDelta, ModelResponse,
 │   │                     #   ModelResponse::text_or_reasoning() helper
-│   ├── openai_compat.rs  #   SSE streaming + tool_call fragment forwarding
+│   ├── anthropic.rs      #   /v1/messages client (default; MiniMax anthropic-compat)
+│   ├── openai_compat.rs  #   Legacy /v1/chat/completions client (kept for tests)
 │   └── streaming.rs      #   ModelWithEvents wrapper (forwards StreamDelta to RunEvent)
 ├── skills/               # Skill capture & reuse
 │   ├── matcher.rs        #   Token-based skill scoring (Jaccard ≥ 0.25)

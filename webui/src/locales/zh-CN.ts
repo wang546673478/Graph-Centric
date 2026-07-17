@@ -10,9 +10,10 @@ export default {
   settings: {
     title: '引擎配置',
     model: '模型',
-    baseUrl: '接口地址',
+    baseUrl: '接口地址（Anthropic-兼容）',
     fastModel: '快速模型',
     deepModel: '深度模型',
+    fetchModelsDisabled: 'Anthropic 端点的模型需手动配置。',
     policy: '策略',
     maxConcurrent: '最大并发子代理数',
     loopTuning: '循环调优',

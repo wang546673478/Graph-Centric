@@ -400,7 +400,12 @@ pub(crate) fn translate_response(parsed: AnthropicWireResponse) -> ModelResponse
 #[async_trait]
 impl Model for AnthropicModel {
     fn name(&self) -> &str {
-        "anthropic"
+        // S4: return the actual model identifier (e.g. "MiniMax-M3") for
+        // parity with OpenAICompatModel::name(). S2 originally returned
+        // the protocol tag "anthropic" — fine for the migration tests
+        // but useless in `probe_model` logs and skills::capture (which
+        // records `model.name()` into the run metadata).
+        &self.cfg.model
     }
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {

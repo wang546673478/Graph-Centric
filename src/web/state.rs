@@ -347,6 +347,11 @@ impl Default for AdvancedTuningConfig {
 
 impl EngineConfig {
     /// Load config from disk, falling back to env vars + defaults.
+    ///
+    /// S4 — OpenAI → Anthropic migration: when no JSON config and no env
+    /// vars are present, fall back to MiniMax anthropic-compat defaults
+    /// (`https://api.minimaxi.com/anthropic`, `MiniMax-M3`) so the
+    /// gateway starts cleanly with just `ANTHROPIC_API_KEY` set.
     pub fn load() -> Self {
         let path = std::path::PathBuf::from(".graph_harness_config.json");
         let mut cfg = if path.exists() {
@@ -361,18 +366,31 @@ impl EngineConfig {
             }
         } else {
             // Fallback: read from env vars like ModelConfig does.
-            // Default the model names to `MODEL_NAME_DEFAULT` (or empty
-            // if not set) so an empty model name fails fast at the
-            // first model call with a clear "model name is empty"
-            // error — instead of silently failing with a 400 "unknown
-            // model" when the user is on a non-DeepSeek backend.
-            let base_url = std::env::var("MODEL_BASE_URL").unwrap_or_default();
-            let api_key = std::env::var("MODEL_API_KEY").unwrap_or_default();
-            let default_model = std::env::var("MODEL_NAME_DEFAULT").unwrap_or_default();
+            // S4: default base_url → MiniMax anthropic-compat; default
+            // models → MiniMax-M3; api_key reads MODEL_API_KEY →
+            // ANTHROPIC_API_KEY → MINIMAX_API_KEY in that order.
+            let base_url = std::env::var("MODEL_BASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "https://api.minimaxi.com/anthropic".to_string());
+            let api_key = std::env::var("MODEL_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()))
+                .or_else(|| std::env::var("MINIMAX_API_KEY").ok().filter(|s| !s.is_empty()))
+                .unwrap_or_default();
+            let default_model = std::env::var("MODEL_NAME_DEFAULT")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "MiniMax-M3".to_string());
             let fast_model = std::env::var("MODEL_NAME_FAST")
-                .unwrap_or_else(|_| default_model.clone());
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default_model.clone());
             let deep_model = std::env::var("MODEL_NAME_DEEP")
-                .unwrap_or_else(|_| default_model.clone());
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default_model.clone());
             EngineConfig {
                 model: ModelTierConfig {
                     base_url,
@@ -382,7 +400,11 @@ impl EngineConfig {
                     deep_model,
                     default_model: None,
                     advisor_base_url: std::env::var("ADVISOR_BASE_URL").unwrap_or_default(),
-                    advisor_api_key: std::env::var("ADVISOR_API_KEY").unwrap_or_default(),
+                    advisor_api_key: std::env::var("ADVISOR_API_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()))
+                        .unwrap_or_default(),
                     advisor_api_key_masked: String::new(),
                     advisor_model: std::env::var("ADVISOR_MODEL").unwrap_or_default(),
                 },
@@ -444,11 +466,17 @@ impl Default for EngineConfig {
             max_drilldown_depth: default_max_drilldown_depth(),
             sub_run_timeout_ms: default_sub_run_timeout_ms(),
             model: ModelTierConfig {
-                base_url: String::new(),
-                api_key: String::new(),
+                // S4 — OpenAI → Anthropic migration: defaults point at
+                // MiniMax's Anthropic-compatible endpoint with MiniMax-M3
+                // on both tiers. The factory in `model::config` reads these
+                // into `AnthropicConfig` and constructs `AnthropicModel`.
+                base_url: "https://api.minimaxi.com/anthropic".to_string(),
+                api_key: std::env::var("ANTHROPIC_API_KEY")
+                    .or_else(|_| std::env::var("MINIMAX_API_KEY"))
+                    .unwrap_or_default(),
                 api_key_masked: String::new(),
-                fast_model: String::new(),
-                deep_model: String::new(),
+                fast_model: "MiniMax-M3".to_string(),
+                deep_model: "MiniMax-M3".to_string(),
                 default_model: None,
                 advisor_base_url: String::new(),
                 advisor_api_key: String::new(),

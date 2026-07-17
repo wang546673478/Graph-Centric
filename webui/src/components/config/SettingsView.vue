@@ -152,38 +152,47 @@ function deleteProfile(name: string) {
 }
 
 async function fetchModels(target: 'task' | 'advisor' = 'task') {
-  const isAdvisor = target === 'advisor'
-  const baseUrl = (isAdvisor
-    ? config.value.model?.advisor_base_url
-    : config.value.model?.base_url)?.trim()
-  if (!baseUrl) {
-    alert(isAdvisor
-      ? 'Please fill in Advisor Base URL first'
-      : 'Please fill in Base URL first')
-    return
-  }
-  const loadingRef = isAdvisor ? fetchingAdvisor : fetching
-  loadingRef.value = true
-  try {
-    // Prefer the real (unmasked) key the user typed; fall back to the
-    // masked form (e.g. "sk-***abcd") if no real key is set.
-    const rawKey = isAdvisor
-      ? config.value.model?.advisor_api_key
-      : config.value.model?.api_key
-    const maskedKey = isAdvisor
-      ? config.value.model?.advisor_api_key_masked
-      : config.value.model?.api_key_masked
-    const key = (rawKey && !rawKey.includes('***')) ? rawKey : (maskedKey || '')
-    const resp = await fetch(`/api/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(key)}`)
-    const data = await resp.json()
-    const list = (data.models || []).filter((m: any) => typeof m === 'string')
-    if (isAdvisor) {
-      advisorModelList.value = list
-    } else {
-      modelList.value = list
+  // S4 — OpenAI → Anthropic migration: the MiniMax anthropic-compat
+  // endpoint does not expose a `/models` listing (verified: returns 404
+  // for `/v1/models`, 401-with-auth for `/anthropic/v1/models`). The
+  // "Fetch Models" button is disabled in the template; the function body
+  // is preserved behind `if false` so S6 can revisit this once we have a
+  // reliable model-discovery strategy (e.g. a static catalog or a MiniMax
+  // admin endpoint). Models are configured manually for now.
+  if (false) {
+    const isAdvisor = target === 'advisor'
+    const baseUrl = (isAdvisor
+      ? config.value.model?.advisor_base_url
+      : config.value.model?.base_url)?.trim()
+    if (!baseUrl) {
+      alert(isAdvisor
+        ? 'Please fill in Advisor Base URL first'
+        : 'Please fill in Base URL first')
+      return
     }
-  } catch (e) { alert(String(e)) }
-  finally { loadingRef.value = false }
+    const loadingRef = isAdvisor ? fetchingAdvisor : fetching
+    loadingRef.value = true
+    try {
+      // Prefer the real (unmasked) key the user typed; fall back to the
+      // masked form (e.g. "sk-***abcd") if no real key is set.
+      const rawKey = isAdvisor
+        ? config.value.model?.advisor_api_key
+        : config.value.model?.api_key
+      const maskedKey = isAdvisor
+        ? config.value.model?.advisor_api_key_masked
+        : config.value.model?.api_key_masked
+      const key = (rawKey && !rawKey.includes('***')) ? rawKey : (maskedKey || '')
+      const resp = await fetch(`/api/models?base_url=${encodeURIComponent(baseUrl)}&api_key=${encodeURIComponent(key)}`)
+      const data = await resp.json()
+      const list = (data.models || []).filter((m: any) => typeof m === 'string')
+      if (isAdvisor) {
+        advisorModelList.value = list
+      } else {
+        modelList.value = list
+      }
+    } catch (e) { alert(String(e)) }
+    finally { loadingRef.value = false }
+  }
 }
 
 async function save() {
@@ -296,30 +305,28 @@ async function save() {
 
     <section>
       <h3>{{ t('settings.model') }}</h3>
-      <label>{{ t('settings.baseUrl') }} <input v-model="config.model.base_url" placeholder="https://api.deepseek.com/v1" /></label>
+      <label>{{ t('settings.baseUrl') }} <input v-model="config.model.base_url" placeholder="https://api.minimaxi.com/anthropic" /></label>
       <div class="fetch-row">
-        <button class="secondary" @click="fetchModels" :disabled="fetching">
-          {{ fetching ? 'Fetching…' : '🔍 Fetch Models' }}
+        <button
+          class="secondary"
+          :disabled="true"
+          :title="t('settings.fetchModelsDisabled')"
+        >
+          🔍 Fetch Models
         </button>
-        <span v-if="modelList.length" class="hint">{{ modelList.length }} model(s) found</span>
+        <span class="hint">{{ t('settings.fetchModelsDisabled') }}</span>
       </div>
       <label>API Key
         <div class="key-row">
-          <input :type="showKey ? 'text' : 'password'" v-model="config.model.api_key_masked" placeholder="sk-…" @input="onKeyInput" />
+          <input :type="showKey ? 'text' : 'password'" v-model="config.model.api_key_masked" placeholder="sk-ant-…" @input="onKeyInput" />
           <button class="secondary" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button>
         </div>
       </label>
       <label>{{ t('settings.fastModel') }}
-        <select v-if="modelList.length" v-model="config.model.fast_model">
-          <option v-for="m in modelList" :key="m" :value="m">{{ m }}</option>
-        </select>
-        <input v-else v-model="config.model.fast_model" placeholder="deepseek-v4-flash" />
+        <input v-model="config.model.fast_model" placeholder="MiniMax-M3" />
       </label>
       <label>{{ t('settings.deepModel') }}
-        <select v-if="modelList.length" v-model="config.model.deep_model">
-          <option v-for="m in modelList" :key="m" :value="m">{{ m }}</option>
-        </select>
-        <input v-else v-model="config.model.deep_model" placeholder="deepseek-v4-pro" />
+        <input v-model="config.model.deep_model" placeholder="MiniMax-M3" />
       </label>
     </section>
 
@@ -337,25 +344,25 @@ async function save() {
           decisions. Leave all fields empty to disable the advisor.
         </p>
         <label>Advisor Base URL
-          <input v-model="config.model.advisor_base_url" placeholder="https://api.openai.com/v1" />
+          <input v-model="config.model.advisor_base_url" placeholder="https://api.minimaxi.com/anthropic" />
         </label>
         <label>Advisor API Key
           <div class="key-row">
-            <input :type="showKey ? 'text' : 'password'" v-model="config.model.advisor_api_key_masked" placeholder="sk-…" @input="onAdvisorKeyInput" />
+            <input :type="showKey ? 'text' : 'password'" v-model="config.model.advisor_api_key_masked" placeholder="sk-ant-…" @input="onAdvisorKeyInput" />
             <button class="secondary" @click="showKey = !showKey">{{ showKey ? '隐藏' : '显示' }}</button>
           </div>
         </label>
         <label>Advisor Model
           <div class="fetch-row">
-            <select v-if="advisorModelList.length" v-model="config.model.advisor_model">
-              <option v-for="m in advisorModelList" :key="m" :value="m">{{ m }}</option>
-            </select>
-            <input v-else v-model="config.model.advisor_model" placeholder="gpt-4o" />
-            <button class="secondary" @click="fetchModels('advisor')" :disabled="fetchingAdvisor">
-              {{ fetchingAdvisor ? 'Fetching…' : '🔍 Fetch Models' }}
+            <input v-model="config.model.advisor_model" placeholder="MiniMax-M3" />
+            <button
+              class="secondary"
+              :disabled="true"
+              :title="t('settings.fetchModelsDisabled')"
+            >
+              🔍 Fetch Models
             </button>
           </div>
-          <span v-if="advisorModelList.length" class="hint">{{ advisorModelList.length }} model(s) found</span>
         </label>
         <p class="hint" style="margin-top: 8px;">
           The advisor and task models are fully independent — different

@@ -10,9 +10,10 @@ export default {
   settings: {
     title: 'Engine Configuration',
     model: 'Model',
-    baseUrl: 'Base URL',
+    baseUrl: 'Base URL (Anthropic-compatible)',
     fastModel: 'Fast Model',
     deepModel: 'Deep Model',
+    fetchModelsDisabled: 'Models are configured manually for the Anthropic endpoint.',
     policy: 'Policy',
     maxConcurrent: 'Max Concurrent Subagents',
     loopTuning: 'Loop Tuning',

@@ -7,31 +7,47 @@
 //!
 //! ## Environment variables
 //!
-//! | Var                  | Required? | Purpose                                          |
-//! |----------------------|-----------|--------------------------------------------------|
-//! | `MODEL_BASE_URL`     | yes       | OpenAI-compatible endpoint, e.g. `https://api.deepseek.com/v1` |
-//! | `MODEL_API_KEY`      | usually   | Bearer token; required for cloud endpoints       |
-//! | `MODEL_NAME_FAST`    | yes       | Fast/cheap model — used by Proposer, Verifier    |
-//! | `MODEL_NAME_DEEP`    | yes       | Deeper/slower model — used by Enricher, Repairer |
-//! | `MODEL_NAME_DEFAULT` | no        | Single-model override; if set, both tiers use it |
+//! | Var                  | Required? | Default                                | Purpose                                          |
+//! |----------------------|-----------|----------------------------------------|--------------------------------------------------|
+//! | `MODEL_BASE_URL`     | no        | `https://api.minimaxi.com/anthropic`  | Anthropic-protocol endpoint (`/v1/messages`)     |
+//! | `MODEL_API_KEY`      | usually   | (empty)                                | API key; falls back to `ANTHROPIC_API_KEY` / `MINIMAX_API_KEY` |
+//! | `ANTHROPIC_API_KEY`  | usually   | (empty)                                | Preferred key env var name (per Anthropic convention) |
+//! | `MINIMAX_API_KEY`    | no        | (empty)                                | Fallback key env var (MiniMax-specific)          |
+//! | `MODEL_NAME_FAST`    | no        | `MiniMax-M3`                           | Fast/cheap model — used by Proposer, Verifier    |
+//! | `MODEL_NAME_DEEP`    | no        | `MiniMax-M3`                           | Deeper/slower model — used by Enricher, Repairer |
+//! | `MODEL_NAME_DEFAULT` | no        | `MiniMax-M3`                           | Single-model override; if set, both tiers use it |
 //!
 //! ## Tier rationale
 //!
 //! Different components have different cost/quality trade-offs:
 //!
-//! - **Fast tier** (e.g. `deepseek-v4-flash`): called every turn in the
+//! - **Fast tier** (e.g. `MiniMax-M3`): called every turn in the
 //!   GraphLoop — Proposer (4 step kinds), Verifier (sampling + self-check).
 //!   Volume is high; latency and price dominate.
-//! - **Deep tier** (e.g. `deepseek-v4-pro`): called when correctness matters
+//! - **Deep tier** (e.g. `MiniMax-M3`): called when correctness matters
 //!   more than throughput — L1Enricher (semantic descriptions), LocalRepairer
 //!   (must produce a working patch on first try), Reviewer (final judgment).
 //!
 //! A caller wanting one model everywhere can set `MODEL_NAME_DEFAULT` and
 //! both tiers resolve to it.
+//!
+//! ## Protocol
+//!
+//! S4 of the OpenAI → Anthropic migration: the factory in this module
+//! constructs an `AnthropicModel` (speaking the `/v1/messages` wire protocol
+//! with `x-api-key` + `anthropic-version` headers). The OpenAI-compatible
+//! client is preserved in `openai_compat.rs` for tests and an optional
+//! future fallback — see S5 / S6 of the migration plan.
 
-use super::{Model, OpenAICompatModel};
-use crate::error::{HarnessError, Result};
+use super::anthropic::{AnthropicConfig, AnthropicModel};
+use super::Model;
+use crate::error::Result;
 use std::sync::Arc;
+
+/// Default base URL — MiniMax's Anthropic-compatible endpoint.
+const DEFAULT_BASE_URL: &str = "https://api.minimaxi.com/anthropic";
+/// Default model — MiniMax-M3 (used for both tiers until S5 introduces a tier split).
+const DEFAULT_MODEL: &str = "MiniMax-M3";
 
 /// v2 spec §5.2: which model layer a call belongs to. Used by
 /// `model_for_layer` to route the call to the right tier.
@@ -97,31 +113,43 @@ impl ModelConfig {
 
     /// Same as [`load`] but does NOT touch `.env`. Useful in tests that
     /// want to inject env vars programmatically.
+    ///
+    /// Defaults (S4 — OpenAI → Anthropic migration):
+    /// - `base_url` → `https://api.minimaxi.com/anthropic` (MiniMax anthropic-compat).
+    /// - `api_key` → `MODEL_API_KEY` → `ANTHROPIC_API_KEY` → `MINIMAX_API_KEY` → empty.
+    /// - `fast` / `deep` → `MODEL_NAME_FAST` / `MODEL_NAME_DEEP` →
+    ///   `MODEL_NAME_DEFAULT` → `MiniMax-M3`.
+    ///
+    /// None of the env vars are required; everything has a sensible
+    /// MiniMax default so a fresh `.env` can run without edits.
     pub fn from_current_env() -> Result<Self> {
         let base_url = std::env::var("MODEL_BASE_URL")
-            .map_err(|_| HarnessError::model("MODEL_BASE_URL not set"))?;
-        let api_key = std::env::var("MODEL_API_KEY").ok().filter(|s| !s.is_empty());
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+
+        // Read API key with three-way fallback: MODEL_API_KEY (legacy),
+        // ANTHROPIC_API_KEY (Anthropic convention), MINIMAX_API_KEY
+        // (MiniMax vendor var). First non-empty wins.
+        let api_key = std::env::var("MODEL_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()))
+            .or_else(|| std::env::var("MINIMAX_API_KEY").ok().filter(|s| !s.is_empty()));
 
         // `MODEL_NAME_DEFAULT` overrides both tiers when present.
-        let default = std::env::var("MODEL_NAME_DEFAULT").ok().filter(|s| !s.is_empty());
+        let default = std::env::var("MODEL_NAME_DEFAULT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
         let fast = std::env::var("MODEL_NAME_FAST")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| default.clone())
-            .ok_or_else(|| {
-                HarnessError::model(
-                    "MODEL_NAME_FAST not set (and no MODEL_NAME_DEFAULT fallback)",
-                )
-            })?;
+            .unwrap_or_else(|| default.clone());
         let deep = std::env::var("MODEL_NAME_DEEP")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| default.clone())
-            .ok_or_else(|| {
-                HarnessError::model(
-                    "MODEL_NAME_DEEP not set (and no MODEL_NAME_DEFAULT fallback)",
-                )
-            })?;
+            .unwrap_or_else(|| default.clone());
 
         Ok(Self {
             base_url,
@@ -134,12 +162,17 @@ impl ModelConfig {
         })
     }
 
-    /// Read the optional advisor backend from `ADVISOR_*` env vars.
-    /// Returns None unless both base_url and model are set.
+    /// Read the optional advisor backend from `ADVISOR_*` env vars
+    /// (with `ANTHROPIC_API_KEY` / `MINIMAX_API_KEY` fallback for the
+    /// key). Returns None unless both base_url and model are set.
     fn advisor_from_env() -> Option<AdvisorConfig> {
         let base_url = std::env::var("ADVISOR_BASE_URL").ok().filter(|s| !s.is_empty())?;
         let model = std::env::var("ADVISOR_MODEL").ok().filter(|s| !s.is_empty())?;
-        let api_key = std::env::var("ADVISOR_API_KEY").ok().filter(|s| !s.is_empty());
+        let api_key = std::env::var("ADVISOR_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()))
+            .or_else(|| std::env::var("MINIMAX_API_KEY").ok().filter(|s| !s.is_empty()));
         Some(AdvisorConfig { base_url, api_key, model })
     }
 
@@ -203,12 +236,12 @@ impl ModelConfig {
 
     /// Build the **fast-tier** model client.
     pub fn fast_model(&self) -> Arc<dyn Model> {
-        Arc::new(self.build(&self.fast))
+        self.build(&self.fast)
     }
 
     /// Build the **deep-tier** model client.
     pub fn deep_model(&self) -> Arc<dyn Model> {
-        Arc::new(self.build(&self.deep))
+        self.build(&self.deep)
     }
 
     /// v2 spec §5.2: pick the right model for a given layer.
@@ -231,26 +264,36 @@ impl ModelConfig {
 
     /// Build the optional **advisor** model client. Returns None when no
     /// advisor backend is configured. The advisor uses its own base_url +
-    /// key + model, and automatically gets the right per-backend request
-    /// format via `ModelCapabilities::from_model_name` (so a MiniMax
-    /// advisor speaks MiniMax, a DeepSeek advisor speaks DeepSeek).
+    /// key + model and speaks the same Anthropic-protocol as the main
+    /// client (S4 — both client paths now go through `AnthropicModel`).
     pub fn advisor_model(&self) -> Option<Arc<dyn Model>> {
         let a = self.advisor.as_ref()?;
-        let mut m = OpenAICompatModel::new(a.base_url.clone(), a.model.clone())
-            .with_thinking(self.thinking_enabled, self.reasoning_effort.clone());
-        if let Some(k) = &a.api_key {
-            m = m.with_api_key(k.clone());
-        }
-        Some(Arc::new(m))
+        Some(self.build_anthropic(&a.base_url, a.api_key.as_deref(), &a.model))
     }
 
-    fn build(&self, name: &str) -> OpenAICompatModel {
-        let mut m = OpenAICompatModel::new(self.base_url.clone(), name.to_string())
-            .with_thinking(self.thinking_enabled, self.reasoning_effort.clone());
-        if let Some(k) = &self.api_key {
-            m = m.with_api_key(k.clone());
-        }
-        m
+    /// Internal: construct an `AnthropicModel` from a (base_url, api_key,
+    /// model) tuple. Centralizes the AnthropicConfig wiring so advisor
+    /// and tier builders can't drift.
+    fn build_anthropic(
+        &self,
+        base_url: &str,
+        api_key: Option<&str>,
+        model: &str,
+    ) -> Arc<dyn Model> {
+        let cfg = AnthropicConfig {
+            base_url: base_url.to_string(),
+            api_key: api_key.unwrap_or("").to_string(),
+            model: model.to_string(),
+            ..Default::default()
+        };
+        Arc::new(AnthropicModel::new(cfg))
+    }
+
+    /// Build the configured-tier AnthropicModel client.
+    /// Returns `Arc<dyn Model>` so callers (proposer, decomposer, etc.)
+    /// keep their existing trait-surface call patterns.
+    fn build(&self, name: &str) -> Arc<dyn Model> {
+        self.build_anthropic(&self.base_url, self.api_key.as_deref(), name)
     }
 }
 
@@ -289,8 +332,10 @@ mod tests {
         }
     }
 
+    // -- S4: defaults point at MiniMax anthropic-compat --
+
     #[test]
-    fn missing_base_url_errors() {
+    fn missing_base_url_defaults_to_minimax() {
         scoped(
             &[
                 ("MODEL_BASE_URL", None),
@@ -298,24 +343,29 @@ mod tests {
                 ("MODEL_NAME_DEEP", Some("y")),
             ],
             || {
-                let err = ModelConfig::from_current_env().unwrap_err();
-                assert!(format!("{err}").contains("MODEL_BASE_URL"));
+                let cfg = ModelConfig::from_current_env().unwrap();
+                assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+                assert_eq!(cfg.fast, "x");
+                assert_eq!(cfg.deep, "y");
             },
         );
     }
 
     #[test]
-    fn missing_both_fast_and_default_errors() {
+    fn missing_tiers_default_to_minimax_m3() {
         scoped(
             &[
-                ("MODEL_BASE_URL", Some("https://x/v1")),
+                ("MODEL_BASE_URL", None),
                 ("MODEL_NAME_FAST", None),
-                ("MODEL_NAME_DEEP", Some("d")),
+                ("MODEL_NAME_DEEP", None),
                 ("MODEL_NAME_DEFAULT", None),
             ],
             || {
-                let err = ModelConfig::from_current_env().unwrap_err();
-                assert!(format!("{err}").contains("MODEL_NAME_FAST"));
+                let cfg = ModelConfig::from_current_env().unwrap();
+                assert_eq!(cfg.fast, DEFAULT_MODEL);
+                assert_eq!(cfg.deep, DEFAULT_MODEL);
+                assert_eq!(cfg.base_url, DEFAULT_BASE_URL);
+                assert!(cfg.api_key.is_none());
             },
         );
     }
@@ -377,6 +427,55 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_api_key_fallback_when_model_api_key_unset() {
+        scoped(
+            &[
+                ("MODEL_BASE_URL", None),
+                ("MODEL_API_KEY", None),
+                ("ANTHROPIC_API_KEY", Some("sk-ant-test")),
+                ("MINIMAX_API_KEY", None),
+            ],
+            || {
+                let cfg = ModelConfig::from_current_env().unwrap();
+                assert_eq!(cfg.api_key.as_deref(), Some("sk-ant-test"));
+            },
+        );
+    }
+
+    #[test]
+    fn minimax_api_key_fallback_when_others_unset() {
+        scoped(
+            &[
+                ("MODEL_BASE_URL", None),
+                ("MODEL_API_KEY", None),
+                ("ANTHROPIC_API_KEY", None),
+                ("MINIMAX_API_KEY", Some("sk-minimax-test")),
+            ],
+            || {
+                let cfg = ModelConfig::from_current_env().unwrap();
+                assert_eq!(cfg.api_key.as_deref(), Some("sk-minimax-test"));
+            },
+        );
+    }
+
+    #[test]
+    fn model_api_key_wins_over_anthropic_fallback() {
+        scoped(
+            &[
+                ("MODEL_BASE_URL", None),
+                ("MODEL_API_KEY", Some("sk-primary")),
+                ("ANTHROPIC_API_KEY", Some("sk-ant-should-lose")),
+            ],
+            || {
+                let cfg = ModelConfig::from_current_env().unwrap();
+                // First non-empty wins in declaration order: MODEL_API_KEY
+                // takes precedence over ANTHROPIC_API_KEY.
+                assert_eq!(cfg.api_key.as_deref(), Some("sk-primary"));
+            },
+        );
+    }
+
+    #[test]
     fn programmatic_constructor_works() {
         let cfg = ModelConfig::new("https://x/v1", Some("sk-test".into()), "a", "b");
         assert_eq!(cfg.fast, "a");
@@ -396,8 +495,10 @@ mod tests {
     #[test]
     fn advisor_model_built_when_configured() {
         let cfg = ModelConfig::new("https://x/v1", None, "a", "b")
-            .with_advisor("https://api.deepseek.com/v1", Some("sk-adv".into()), "deepseek-v4-pro");
+            .with_advisor("https://api.deepseek.com/anthropic", Some("sk-adv".into()), "deepseek-v4-pro");
         let advisor = cfg.advisor_model().expect("advisor should be Some");
+        // S4: AnthropicModel::name() returns the cfg model (parity with
+        // the OpenAI client). The advisor model here is "deepseek-v4-pro".
         assert_eq!(advisor.name(), "deepseek-v4-pro");
     }
 }
