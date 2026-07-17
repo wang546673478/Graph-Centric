@@ -9,6 +9,13 @@ pub mod cache;
 pub mod openai_compat;
 pub mod streaming;
 
+// S1 of the OpenAI -> Anthropic migration: provider-agnostic types and
+// future Anthropic-protocol impl. Private to crate so the existing public
+// `Message`, `Role`, `Model` surface stays intact for current callers.
+// S2 (HTTP+SSE), S4 (caller migration), S5 (M3 reasoning), S6 (cleanup)
+// make these public as they consume the new shapes.
+pub(crate) mod types;
+
 pub use capabilities::{ModelCapabilities, ReasoningField, ThinkingStyle};
 pub use config::ModelConfig;
 pub use openai_compat::OpenAICompatModel;

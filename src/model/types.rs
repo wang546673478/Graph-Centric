@@ -30,7 +30,7 @@ pub enum ContentBlockInit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ContentBlockDelta {
     TextDelta(String),
     ThinkingDelta(String),
