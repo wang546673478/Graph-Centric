@@ -1,7 +1,7 @@
 # OpenAI → Anthropic Migration S1 — Model Trait Abstraction
 
 **Date:** 2026-07-18
-**Status:** Approved (pending user spec review)
+**Status:** Implemented (with Option A scope amendment — see below)
 **Owner:** user + assistant
 **Series:** First of 6 sub-projects in the OpenAI → Anthropic migration.
 
@@ -364,8 +364,45 @@ S3 — but every layer compiles must keep that file compiling in S1.
    `ContentBlock::*` variants yet (those land in S4).
 5. Commit pushed to `origin/main`.
 
-## Out of Scope Reminder
+## Out of Scope Reminder (post-Option-A)
 
-This spec ends with `src/model/types.rs`, `src/model/anthropic.rs` skeleton, and
-`openai_compat.rs` boundary adapted to the new types. **No HTTP client code yet** (S2).
-**No caller changes yet** (S4). **No M3-reasoning adapter yet** (S5).
+This spec ends with `src/model/types.rs` (Anthropic-native types), declared
+`pub(crate)` in `src/model/mod.rs`. Existing public `Message` / `Role` / `Model`
+surface is preserved unchanged. **No HTTP client code yet** (S2 — re-scoped
+under Option A). **No caller changes yet** (S4). **No M3-reasoning adapter
+yet** (S5).
+
+## Status — Implementation Outcome (Option A)
+
+The original S1 plan called for `pub use types::{...}` re-exports, a new `Model`
+trait with `BoxStream<Result<StreamDelta>>` signatures, and an `openai_compat.rs`
+boundary adapter. Task 3 implementation surfaced a critical issue: the project
+has **30+ import sites** under `agent/*`, `web/*`, `skills/*`, `bin/*` that
+reference the old `crate::model::{Message, Role, ToolCall, FinishReason, Usage,
+StreamDelta}` shape directly. Replacing `mod.rs` re-exports with new types
+broke all of them at once.
+
+**Resolution (Option A, user-chosen 2026-07-18):** introduce the new types
+module as a **private, crate-internal** sibling to the existing public type
+surface. AnthropicModel (S2) and the caller-migration work (S4) will use the
+new types; existing callers continue using the legacy types until S4 rewires
+them. This preserves the CLAUDE.md principle of "Narrow protocols at the
+boundary" — the model layer is a boundary, and two parallel type systems
+on either side of it are kept narrow.
+
+**What landed in S1 (`39774c0`):**
+- `src/model/types.rs` with 7 round-trip tests, declared `pub(crate) mod types;`.
+- `src/model/mod.rs` adds the bare `pub(crate) mod types;` declaration with a
+  comment block referencing S2/S4/S5/S6.
+- Build green, 659 passing + 1 pre-existing flake (no caller regressions;
+  the existing `validator_passed_lets_loop_proceed_to_review` flake remained).
+
+**Deferred (re-scoped):**
+- AnthropicModel skeleton + `classify_status` helper → **moves to S2.**
+- `openai_compat.rs` boundary adapter → **moves to S4** (caller migration).
+- The new `Model` trait shape (`BoxStream<Result<StreamDelta>>`) and the
+  translation at the AnthropicModel boundary → **designed during S2
+  brainstorming, not before**.
+
+See `docs/superpowers/plans/2026-07-18-anthropic-s1-model-trait.md` for
+the updated task list and rationale.
