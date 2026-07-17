@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Graph-Centric — Style Mockup Gallery</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+      background: #0f1117;
+      color: #e5e7eb;
+      padding: 32px 24px 64px;
+      line-height: 1.5;
+    }
+    header {
+      max-width: 1200px;
+      margin: 0 auto 32px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid #232838;
+    }
+    header h1 { font-size: 1.6rem; margin-bottom: 6px; }
+    header p { color: #8b8fa3; font-size: 0.9rem; }
+    .grid {
+      max-width: 1200px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 24px;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: #151823;
+      border: 1px solid #232838;
+      border-radius: 12px;
+      overflow: hidden;
+      transition: transform 0.2s, border-color 0.2s;
+    }
+    .card:hover { transform: translateY(-2px); border-color: #a78bfa; }
+    .card a.image-link {
+      display: block;
+      aspect-ratio: 1440 / 896;
+      overflow: hidden;
+      background: #0a0c14;
+    }
+    .card img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: top center;
+    }
+    .card-meta {
+      padding: 14px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .card-title { font-size: 1rem; font-weight: 600; }
+    .chip {
+      font-size: 0.7rem;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+    }
+    .chip.light { background: #f5f3ff; color: #6d28d9; }
+    .chip.dark  { background: #1e1b3a; color: #a78bfa; }
+    .card-caption {
+      padding: 0 16px 16px;
+      color: #8b8fa3;
+      font-size: 0.85rem;
+    }
+    footer {
+      max-width: 1200px;
+      margin: 48px auto 0;
+      padding-top: 16px;
+      border-top: 1px solid #232838;
+      color: #8b8fa3;
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Graph-Centric — Style Mockup Gallery</h1>
+    <p>Four visual directions × light / dark. Click any mockup to view full size. Tell me which one (or which few) to keep.</p>
+  </header>
+
+  <section class="grid">
+    <article class="card" id="m01">
+      <a class="image-link" href="01_minimal-light.jpg" target="_blank">
+        <img src="01_minimal-light.jpg" alt="Minimal style, light mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">01 · Minimal · light</span>
+        <span class="chip light">light</span>
+      </div>
+      <p class="card-caption">Pure whitespace, single violet accent, hairline borders — Linear / Vercel inspired.</p>
+    </article>
+
+    <article class="card" id="m02">
+      <a class="image-link" href="02_minimal-dark.jpg" target="_blank">
+        <img src="02_minimal-dark.jpg" alt="Minimal style, dark mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">02 · Minimal · dark</span>
+        <span class="chip dark">dark</span>
+      </div>
+      <p class="card-caption">Same as 01 inverted to deep neutral with violet glow — for night-shift use.</p>
+    </article>
+
+    <article class="card" id="m03">
+      <a class="image-link" href="03_glassmorphism-light.jpg" target="_blank">
+        <img src="03_glassmorphism-light.jpg" alt="Glassmorphism style, light mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">03 · Glassmorphism · light</span>
+        <span class="chip light">light</span>
+      </div>
+      <p class="card-caption">Frosted glass over pastel gradient — soft, modern, low contrast.</p>
+    </article>
+
+    <article class="card" id="m04">
+      <a class="image-link" href="04_glassmorphism-dark.jpg" target="_blank">
+        <img src="04_glassmorphism-dark.jpg" alt="Glassmorphism style, dark mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">04 · Glassmorphism · dark</span>
+        <span class="chip dark">dark</span>
+      </div>
+      <p class="card-caption">Dark frosted glass with neon purple/cyan glow — Replit / Cursor adjacent.</p>
+    </article>
+
+    <article class="card" id="m05">
+      <a class="image-link" href="05_notion-light.jpg" target="_blank">
+        <img src="05_notion-light.jpg" alt="Notion style, light mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">05 · Notion · light</span>
+        <span class="chip light">light</span>
+      </div>
+      <p class="card-caption">Warm cream paper-toned surfaces, soft shadows — Notion / Arc inspired.</p>
+    </article>
+
+    <article class="card" id="m06">
+      <a class="image-link" href="06_notion-dark.jpg" target="_blank">
+        <img src="06_notion-dark.jpg" alt="Notion style, dark mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">06 · Notion · dark</span>
+        <span class="chip dark">dark</span>
+      </div>
+      <p class="card-caption">Warm dark brown surfaces, muted accents — Notion at night.</p>
+    </article>
+
+    <article class="card" id="m07">
+      <a class="image-link" href="07_bento-light.jpg" target="_blank">
+        <img src="07_bento-light.jpg" alt="Bento style, light mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">07 · Bento · light</span>
+        <span class="chip light">light</span>
+      </div>
+      <p class="card-caption">Bento-grid card mosaic, mono accents — info-dense IDE-flavored.</p>
+    </article>
+
+    <article class="card" id="m08">
+      <a class="image-link" href="08_bento-dark.jpg" target="_blank">
+        <img src="08_bento-dark.jpg" alt="Bento style, dark mode" loading="lazy" />
+      </a>
+      <div class="card-meta">
+        <span class="card-title">08 · Bento · dark</span>
+        <span class="chip dark">dark</span>
+      </div>
+      <p class="card-caption">Same as 07 inverted for late-night dev work.</p>
+    </article>
+  </section>
+
+  <footer>
+    8 mockups × 1440×896 JPEG · generated via <code>mmx image generate</code> ·
+    served by Python <code>http.server</code> bound to <code>0.0.0.0</code>.
+  </footer>
+</body>
+</html>
