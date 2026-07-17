@@ -8,8 +8,10 @@ const THEME_STORAGE_KEY = 'gc-theme'
 const DEFAULT_THEME: Theme = 'dark'
 
 function initialTheme(): Theme {
-  const saved = localStorage.getItem(THEME_STORAGE_KEY)
-  if (saved === 'light' || saved === 'dark') return saved
+  try {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY)
+    if (saved === 'light' || saved === 'dark') return saved
+  } catch { /* localStorage blocked — fall through to default */ }
   return DEFAULT_THEME
 }
 
