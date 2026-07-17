@@ -3,7 +3,7 @@ import { ref, onMounted, watch } from 'vue'
 import { api } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 const { t } = useI18n()
-import { useTheme, type StyleId } from '../../composables/useTheme'
+import { useTheme } from '../../composables/useTheme'
 const { style: currentStyle, setStyle, STYLES } = useTheme()
 
 const config = ref<any>({ model: {}, policy: {}, loop_tuning: {}, advanced: {} })
@@ -494,7 +494,6 @@ button.primary { margin-top: 8px; padding: 10px 24px; }
 .hb-idle { display: flex; flex-direction: column; gap: 8px; }
 .hb-idle .hint { font-size: 0.72rem; color: var(--text-muted); line-height: 1.5; }
 .rounds-input { width: 60px; padding: 4px 6px; }
-.appearance-section { /* tokens handle the look */ }
 .theme-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
