@@ -39,9 +39,10 @@ pub enum ContentBlockDelta {
 
 // ---------- Messages ----------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Role {
+    #[default]
     User,
     Assistant,
 }
