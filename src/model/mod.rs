@@ -7,6 +7,7 @@ pub mod capabilities;
 pub mod config;
 pub mod cache;
 pub mod openai_compat;
+pub mod anthropic;
 pub mod streaming;
 
 // S1 of the OpenAI -> Anthropic migration: provider-agnostic types and
