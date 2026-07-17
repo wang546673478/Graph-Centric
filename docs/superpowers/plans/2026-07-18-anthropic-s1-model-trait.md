@@ -11,13 +11,15 @@
 ## Global Constraints
 
 - **Crate name:** `graph_harness`. Verify with `grep '^name = ' Cargo.toml` before running test commands.
-- **Test commands:** `cargo test --lib` (matches CLAUDE.md guidance for the existing 606-test suite).
+- **Test commands:** `cargo test --lib` (matches CLAUDE.md guidance).
 - **Build:** `cargo build --bin serve` is the canonical check; will fail-fast on any compile error.
+- **Baseline test count is 653 (652 pass + 1 pre-existing flake), NOT the "606" CLAUDE.md cites.** The 1 failing test is `agent::graph_loop::tests::validator_passed_lets_loop_proceed_to_review` at `src/agent/graph_loop.rs:6069` — a flaky LLM-shim fixture, **unrelated to the model layer**. Track pass-count delta, not absolute. A green S1 should show **652 + 12 new (types + anthropic) = 664 passing**, with the same 1 pre-existing failure.
+- **Test pass/fail convergence is the metric, not the absolute count.** If S1 implementation flips a previously-passing test to failing, that's a regression regardless of baseline count.
 - **Branch:** commit directly on `main` (project memory rule). No feature branches.
 - **Push:** every commit followed by `git push origin main`. Network may hiccup — retry with `sleep 2-5` if "Connection closed" returned.
 - **No caller changes in S1.** The 7 model layers (proposer/decomposer/enricher/verifier/reviewer/cascade/subagent) MUST compile unchanged after this plan lands. S4 is the dedicated sub-project for caller migration.
 - **`openai_compat.rs` does not change its wire behavior in S1.** It still speaks the OpenAI protocol over HTTP; only the Rust types it deals with are reshaped. The wire format (HTTP requests, SSE event names) is preserved verbatim so production OpenAI usage continues to work until S4.
-- **`ModelWithEvents::events()` continues to emit `RunEvent::StreamChunk / StreamToolCall / StreamEnd`** as today. S1 only changes how `StreamDelta` is structured internally.
+- **`ModelWithEvents::events()` continues to emit `RunEvent::StreamChunk / StreamToolCall / StreamEnd`** as today. S1 only changes how `StreamDelta` is structured internally. For `StreamDelta::Error` (the new variant for Anthropic-protocol errors), `ModelWithEvents` emits **`RunEvent::Error { message }`** (the existing variant) in S1. Adding a structured `RunEvent::StreamError { code, message }` is deferred to S6 (config + WebUI + docs cleanup).
 - **Status-classifier function `classify_status(u16) -> &'static str` lives in `src/model/anthropic.rs`** as `pub(crate)`. The string values are: `bad_request`, `auth`, `forbidden`, `not_found`, `context_overrun`, `rate_limit`, `server_error`, `overload`, `unknown`.
 - **`AnthropicModel::complete()` and `complete_stream()` use `todo!()`** with a descriptive message. They satisfy the trait, but panic if called. S2 implements them.
 - **The new `src/model/types.rs` and `src/model/anthropic.rs` files must compile cleanly** under the same toolchain as the rest of the crate (`rust-toolchain.toml` if present — otherwise whatever `rustup default` returns).
@@ -705,7 +707,7 @@ Look for:
 
 - [ ] **Step 2: Write a boundary adapter module-or-section**
 
-The simplest pattern: keep the wire-format structs local to `openai_compat.rs` (under `mod wire` or just `pub(super) struct` with `Wire*` prefix), and add two functions:
+The simplest pattern: keep the wire-format structs local to `openai_compat.rs` (under `mod wire` or just `pub(super) struct` with `Wire*` prefix), and add **FOUR** functions (not three — the implementer may have underestimated the scope):
 
 ```rust
 // At the top of openai_compat.rs (or wherever fits the layout):
@@ -724,10 +726,24 @@ fn req_to_openai_body(req: &ModelRequest) -> WireChatCompletionRequest { ... }
 fn resp_from_openai(c: &WireChatCompletionResponse) -> ModelResponse { ... }
 
 /// Translate a single OpenAI SSE chunk into zero-or-more `StreamDelta`s.
-fn chunk_to_stream_deltas(c: &WireChatCompletionChunk) -> Vec<StreamDelta> { ... }
+/// Holds a per-stream tool-state in `state: &mut ToolCallStreamState` for
+/// per-index accumulation (see Task 1 report §4 for the state shape).
+fn chunk_to_stream_deltas(c: &WireChatCompletionChunk, state: &mut ToolCallStreamState) -> Vec<StreamDelta> { ... }
+
+/// FOURTH ADAPTER — for non-streaming callers: aggregate a `Vec<StreamDelta>`
+/// produced by streaming into a single `ModelResponse`. The new `Model` trait
+/// adds `complete_stream()` returning a `BoxStream`; some legacy
+/// `complete()`-style callers (front-end "request a response, get one
+/// ModelResponse" paths) want this for completeness. Optionally used by
+/// `OpenAiCompatModel::complete` if you choose to give it a default
+/// implementation that aggregates its own stream.
+fn stream_deltas_to_response(deltas: Vec<StreamDelta>) -> ModelResponse { ... }
 ```
 
-This is roughly a 100-200 line file if the existing adapter is mid-sized. Don't refactor more than necessary — the goal is "wire stays the same, types change."
+This is roughly a 150-250 line file if the existing adapter is mid-sized. Don't refactor more than necessary — the goal is "wire stays the same, types change."
+
+**OpenAI wire-side struct changes required:**
+- `WireMessage` (or whatever the local name is) needs a `tool_call_id: Option<String>` field. The current OpenAI tool-result shape is `Message { role: "tool", content, tool_call_id }` — your wire type currently has only `content`. Add the field; the boundary adapter fills it from `ConversationMessage::tool_results[i].tool_use_id`.
 
 - [ ] **Step 3: Wire the new functions into `OpenAiCompatModel`**
 
@@ -763,7 +779,7 @@ cd /home/hhhh/Graph-Centric
 cargo test --lib 2>&1 | tail -15
 ```
 
-Expected: same `test result: ok` count as Task 1's baseline (about 606 plus the 7 new types + 5 anthropic = 618 new pass lines; existing tests must not regress).
+Expected: **652 + 12 new (7 types + 5 anthropic) = 664 passing**, with the same 1 pre-existing failure (`validator_passed_lets_loop_proceed_to_review`, unrelated to model layer) present. Track delta only, not absolute. If a previously-passing test flipped to failing → regression; if a previously-failing unrelated test now passes → bonus, not a requirement.
 
 - [ ] **Step 6: One final smoke build**
 
@@ -857,7 +873,7 @@ Save to `/home/hhhh/Graph-Centric/.superpowers/sdd/s1-report.md` with:
 - [ ] `src/model/openai_compat.rs` is adapted — its `Model` impl matches the new trait signatures; the wire format is unchanged from pre-S1.
 - [ ] `src/model/streaming.rs` consumes `StreamDelta` and emits the same `RunEvent` shape as before (no `RunEvent` enum changes leak out).
 - [ ] `cargo build --bin serve` green.
-- [ ] `cargo test --lib` shows **all original 606+ tests passing** PLUS the 12 new tests = **618+** total.
+- [ ] `cargo test --lib` shows **652 baseline passing** + **12 new tests passing** = **664+** total, with the 1 pre-existing flake still present (unrelated).
 - [ ] `cargo build --release --bin serve` green.
 - [ ] Single git commit on main, pushed to origin/main, working tree clean.
 - [ ] Report saved at `/home/hhhh/Graph-Centric/.superpowers/sdd/s1-report.md`.
