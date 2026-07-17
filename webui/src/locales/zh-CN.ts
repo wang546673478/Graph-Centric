@@ -28,6 +28,14 @@ export default {
     drilldown: '子图钻取',
     maxDrilldownDepth: '最大钻取深度',
     subRunTimeoutMs: '子 run 超时（毫秒）',
+    appearance: {
+      title: '🎨 外观',
+      hint: '选择视觉风格。点击任意缩略图即可应用，刷新后保留。',
+      minimal: '极简',
+      glassmorphism: '玻璃拟态',
+      notion: 'Notion',
+      bento: '便当',
+    },
     advanced: {
       title: '🔧 高级调优',
       hint: '以下字段之前硬编码在源码中，默认值与改动前完全一致。',

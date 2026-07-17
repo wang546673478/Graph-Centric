@@ -3,6 +3,8 @@ import { ref, onMounted, watch } from 'vue'
 import { api } from '../../composables/useRunSocket'
 import { useI18n } from '../../composables/useI18n'
 const { t } = useI18n()
+import { useTheme, type StyleId } from '../../composables/useTheme'
+const { style: currentStyle, setStyle, STYLES } = useTheme()
 
 const config = ref<any>({ model: {}, policy: {}, loop_tuning: {}, advanced: {} })
 const saved = ref(false)
@@ -234,6 +236,25 @@ async function save() {
 <template>
   <div class="settings">
     <h2>{{ t('settings.title') }}</h2>
+
+    <!-- Appearance -->
+    <section class="appearance-section">
+      <h3>{{ t('settings.appearance.title') }}</h3>
+      <p class="hint">{{ t('settings.appearance.hint') }}</p>
+      <div class="theme-grid">
+        <button
+          v-for="s in STYLES"
+          :key="s"
+          type="button"
+          :class="['theme-card', { active: currentStyle === s }]"
+          :aria-pressed="currentStyle === s"
+          @click="setStyle(s)"
+        >
+          <img :src="`/themes/${s}.jpg`" :alt="s" loading="lazy" />
+          <span class="theme-name">{{ t(`settings.appearance.${s}`) }}</span>
+        </button>
+      </div>
+    </section>
 
     <!-- Heartbeat -->
     <section class="heartbeat-section">
@@ -473,4 +494,47 @@ button.primary { margin-top: 8px; padding: 10px 24px; }
 .hb-idle { display: flex; flex-direction: column; gap: 8px; }
 .hb-idle .hint { font-size: 0.72rem; color: var(--text-muted); line-height: 1.5; }
 .rounds-input { width: 60px; padding: 4px 6px; }
+.appearance-section { /* tokens handle the look */ }
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+@media (max-width: 900px) {
+  .theme-grid { grid-template-columns: repeat(2, 1fr); }
+}
+.theme-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 8px;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  cursor: pointer;
+  transition: transform 0.15s ease, border-color 0.15s ease;
+  font: inherit;
+  color: inherit;
+}
+.theme-card:hover { transform: translateY(-2px); border-color: var(--accent); }
+.theme-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.theme-card img {
+  width: 100%;
+  aspect-ratio: 1440 / 896;
+  object-fit: cover;
+  object-position: top center;
+  border-radius: calc(var(--radius) - 2px);
+  display: block;
+}
+.theme-name {
+  margin-top: 6px;
+  font-size: 0.8rem;
+  font-weight: 500;
+  text-align: center;
+  color: var(--text);
+}
 </style>

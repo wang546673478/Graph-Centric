@@ -28,6 +28,14 @@ export default {
     drilldown: 'Drill-down',
     maxDrilldownDepth: 'Max drill-down depth',
     subRunTimeoutMs: 'Sub-run timeout (ms)',
+    appearance: {
+      title: '🎨 Appearance',
+      hint: 'Pick a visual style. Click any thumbnail to apply; the choice persists across reloads.',
+      minimal: 'Minimal',
+      glassmorphism: 'Glassmorphism',
+      notion: 'Notion',
+      bento: 'Bento',
+    },
     advanced: {
       title: '🔧 Advanced tuning',
       hint: 'These were previously hardcoded in source. Defaults match the pre-config behavior.',
