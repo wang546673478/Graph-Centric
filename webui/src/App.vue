@@ -19,13 +19,27 @@ const RIGHT_KEY = 'gc-right-collapsed'
 // re-open any rail via its ›/‹ toggle; the state is then
 // persisted. Once Phase 3 lands, flip the right default back
 // to expanded.
-const sidebarCollapsed = ref(localStorage.getItem(SIDEBAR_KEY) === '1')
-const rightCollapsed = ref(
-  localStorage.getItem(RIGHT_KEY) === '1'
-    || localStorage.getItem(RIGHT_KEY) === null
-)
-watch(sidebarCollapsed, (v) => localStorage.setItem(SIDEBAR_KEY, v ? '1' : '0'))
-watch(rightCollapsed, (v) => localStorage.setItem(RIGHT_KEY, v ? '1' : '0'))
+//
+// localStorage is wrapped because it throws SecurityError in
+// private/incognito mode; an unprotected call here would crash
+// <script setup> and render `#app` empty (blank page).
+function readBool(key: string, fallback: boolean): boolean {
+  try { return localStorage.getItem(key) === '1' } catch { return fallback }
+}
+function readEq(key: string, sentinel: string | null, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key)
+    if (v === null) return sentinel === null  // first-load default
+    return v === '1'
+  } catch { return fallback }
+}
+function writeBool(key: string, v: boolean) {
+  try { localStorage.setItem(key, v ? '1' : '0') } catch { /* blocked */ }
+}
+const sidebarCollapsed = ref(readBool(SIDEBAR_KEY, false))
+const rightCollapsed = ref(readEq(RIGHT_KEY, null, true))
+watch(sidebarCollapsed, (v) => writeBool(SIDEBAR_KEY, v))
+watch(rightCollapsed, (v) => writeBool(RIGHT_KEY, v))
 
 // Global keyboard shortcuts. "/" focuses search/composer; "?" toggles help.
 const { showHelp, isMac } = useShortcuts()
