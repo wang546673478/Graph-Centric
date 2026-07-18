@@ -76,6 +76,14 @@ pub struct EngineConfig {
     /// `GRAPH_HARNESS_SUB_RUN_TIMEOUT_MS` env var.
     #[serde(default = "default_sub_run_timeout_ms")]
     pub sub_run_timeout_ms: u64,
+    /// Hooks system configuration (borrowed from xAI's grok-build plugin
+    /// architecture). Loaded from `hooks.toml` in the project root, or
+    /// default-empty when the file is absent. The loop fires hooks at
+    /// 7 event points: RunStart / RunEnd / BeforeProposePatch /
+    /// AfterPatchApplied / BeforeSubagent / AfterSubagent / BeforeVerdict.
+    /// Default: empty config — no hooks fire.
+    #[serde(default)]
+    pub hooks: crate::agent::hooks::HooksConfig,
 }
 
 /// v2.7: advanced tuning knobs that were once hardcoded in source.
@@ -423,6 +431,12 @@ impl EngineConfig {
                 cfg.sub_run_timeout_ms = v;
             }
         }
+        // Hooks live in their own TOML file (mirroring xAI's grok-build
+        // plugin layout). Loaded fresh from disk every config read so
+        // operators can edit hooks.toml without restarting the gateway.
+        cfg.hooks = crate::agent::hooks::HooksConfig::load_or_default(
+            Some(std::path::Path::new("hooks.toml")),
+        );
         cfg
     }
 
@@ -465,6 +479,10 @@ impl Default for EngineConfig {
             advanced: AdvancedTuningConfig::default(),
             max_drilldown_depth: default_max_drilldown_depth(),
             sub_run_timeout_ms: default_sub_run_timeout_ms(),
+            // Hooks default-empty; EngineConfig::load() populates from disk
+            // when `hooks.toml` exists. The Default impl intentionally
+            // doesn't read the disk so unit tests stay deterministic.
+            hooks: crate::agent::hooks::HooksConfig::default(),
             model: ModelTierConfig {
                 // S4 — OpenAI → Anthropic migration: defaults point at
                 // MiniMax's Anthropic-compatible endpoint with MiniMax-M3

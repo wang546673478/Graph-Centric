@@ -146,6 +146,10 @@ Across three rounds of reading the code, one pattern keeps surfacing: **the syst
 
 The first instinct on encountering this is to **unify** — make the sub-agent also use `tool_calls`, make skills emit full `GraphPatch`es. Resist. Each narrowing is a **defense-in-depth decision**: the narrower the protocol at a boundary, the easier it is to validate at that boundary, and the smaller the blast radius if a model misbehaves at that layer. The main agent is the rich one because that's where the creative work happens; everything inside it is on rails. If a future contributor proposes unifying these protocols, the question to ask is: **what's the safety guarantee we'd lose?** If there's no good answer, keep them split.
 
+### 23. Hooks are the fourth integration point, not a replacement
+
+`src/agent/hooks.rs` adds a config-driven hook system borrowed from xAI's `grok-build` plugin architecture. Seven events (`RunStart`, `RunEnd`, `BeforeProposePatch`, `AfterPatchApplied`, `BeforeSubagent`, `AfterSubagent`, `BeforeVerdict`) fire at fixed integration points in the loop. Three action kinds: `shell` (run a command, JSON payload on stdin), `log_file` (append JSONL), and `gate` (rejects with `{"reject": "..."}` on stdout). Configuration lives in `hooks.toml` at the project root and is loaded by `EngineConfig::load` into `EngineConfig::hooks`, then attached to `GraphLoop` via `with_hooks`. **Hooks are observational + side-effect-only — they never fail the loop.** A `Gate` returning a reject is logged via `tracing::warn!` and the operation continues, so a misbehaving hook can never wedge the run. The five wired sites today are `RunStart`, `RunEnd`, `BeforeProposePatch`, `AfterPatchApplied`, `BeforeSubagent`, `AfterSubagent`, and `BeforeVerdict` — see `src/agent/graph_loop.rs` for the exact fire points.
+
 ## Build & run
 
 ```bash

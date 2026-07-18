@@ -236,7 +236,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_dispatcher(dispatcher)
         .with_subagent_loader(loader)
         .with_validator(validator)
-        .with_reviewer(reviewer);
+        .with_reviewer(reviewer)
+        // Hooks: load from cwd/hooks.toml (or empty default). The CLI
+        // demo keeps the same hook contract as the web gateway.
+        .with_hooks(crate::agent::hooks::HookRegistry::new(
+            crate::agent::hooks::HooksConfig::load_or_default(Some(
+                std::path::Path::new("hooks.toml"),
+            )),
+        ));
 
     println!("\n══════════════════════════════════════════════════════");
     println!(" Graph-Centric Agent — Demo A (Phase 3 + Phase 4 enabled)");

@@ -1,0 +1,38 @@
+# Example hooks.toml for Graph-Centric — copy to `hooks.toml` to enable.
+# Each list runs in `priority` order (low first). All hooks receive the
+# payload as JSON on stdin. Shell hooks' stdout/stderr are logged.
+
+# Notify Slack when a run finishes.
+[[on_run_end]]
+priority = 0
+enabled = true
+[on_run_end.action]
+kind = "shell"
+command = "curl"
+args = ["-X", "POST", "-d", "@-", "https://hooks.slack.com/services/XXX"]
+
+# Auto-commit successful patches.
+[[on_after_patch_applied]]
+priority = 0
+enabled = true
+[on_after_patch_applied.action]
+kind = "shell"
+command = "git"
+args = ["-C", ".", "commit", "-am", "[graph-centric] auto-commit hook"]
+
+# Force human approval before propose_patch executes.
+[[on_before_propose_patch]]
+priority = 0
+enabled = true
+[on_before_propose_patch.action]
+kind = "gate"
+command = "cat"
+args = []  # Echo nothing on stdin -> empty JSON -> pass. Replace with a real gate in practice.
+
+# Log every model call to a JSONL file.
+[[on_run_start]]
+priority = 0
+enabled = true
+[on_run_start.action]
+kind = "log_file"
+path = "./gc_hooks.log"

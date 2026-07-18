@@ -805,7 +805,11 @@ pub async fn drive_run(
             .with_step_sink(cascade_tx),
     )
     // v2.5: auto-match and apply stored skills.
-    .with_skill_storage(state.skills.clone());
+    .with_skill_storage(state.skills.clone())
+    // v2.7: hooks system (borrowed from xAI's grok-build plugin architecture).
+    // Wired last so the same EngineConfig.hooks that the UI just edited
+    // takes effect on the very next run.
+    .with_hooks(crate::agent::hooks::HookRegistry::new(engine.hooks.clone()));
 
     if let Some(dto) = initial_graph {
         let g = dto.into_graph();

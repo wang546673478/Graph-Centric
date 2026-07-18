@@ -37,6 +37,11 @@
 use super::decomposer::Decomposer;
 use super::dispatcher::{DispatchOutcome, Dispatcher};
 use super::enricher::L1Enricher;
+use super::hooks::{
+    after_patch_applied_payload, after_subagent_payload, before_propose_patch_payload,
+    before_subagent_payload, before_verdict_payload, run_end_payload, run_start_payload,
+    HookEvent, HookRegistry,
+};
 use super::proposer::{ExploreItem, GraphProposer, ProposerStep};
 use super::repairer::LocalRepairer;
 use super::reviewer::{ReviewResult, Reviewer, RootCause};
@@ -694,6 +699,10 @@ pub struct GraphLoop {
     /// + optional LLM-as-judge before declaring Done. Without it the
     /// stub Review fires (immediate Done after Task phase).
     pub reviewer: Option<Reviewer>,
+    /// Hooks system (borrowed from xAI's grok-build plugin architecture).
+    /// Fires user-configured actions at 7 integration points in the loop.
+    /// Default-empty registry = no hooks fire.
+    pub hooks: HookRegistry,
     /// Tools available to the **main agent**. In pure-orchestrator
     /// mode this is empty (no bash) — the main agent's only
     /// execution path is `explore`, which dispatches a subagent
@@ -1081,6 +1090,7 @@ impl GraphLoop {
             skill_storage: None,
             validator: None,
             reviewer: None,
+            hooks: HookRegistry::default(),
             tools: tools.clone(),
             // Default: subagent gets the same toolset as the
             // main agent. Production web/CLI paths override
@@ -1242,6 +1252,19 @@ impl GraphLoop {
         persistence: crate::web::persistence::RunPersistence,
         _event_tx: tokio::sync::broadcast::Sender<crate::web::events::EngineEvent>,
     ) -> Result<()> {
+        // Hooks: fire RunStart as soon as we own the loop. Errors are
+        // logged and swallowed — user hooks never block the run.
+        if let Err(reason) = self
+            .hooks
+            .fire(
+                HookEvent::RunStart,
+                run_start_payload(&self.task),
+                &self.run_id,
+            )
+            .await
+        {
+            warn!(reason = %reason, "hooks: RunStart failed; continuing");
+        }
         let started = std::time::Instant::now();
         let terminal = loop {
             match self.step().await {
@@ -1249,6 +1272,27 @@ impl GraphLoop {
                 terminal => break terminal,
             }
         };
+        // Hooks: fire RunEnd at terminal state. Same swallow-errors policy
+        // as RunStart — hooks never break the run.
+        let outcome_label = match &terminal {
+            LoopState::Done(_) => "done",
+            LoopState::Error(_) => "error",
+            LoopState::GraphInvalid { .. } => "graph_invalid",
+            LoopState::Paused { .. } => "paused",
+            LoopState::TaskFailed { .. } => "task_failed",
+            LoopState::Running => "running",
+        };
+        if let Err(reason) = self
+            .hooks
+            .fire(
+                HookEvent::RunEnd,
+                run_end_payload(outcome_label, self.round),
+                &self.run_id,
+            )
+            .await
+        {
+            warn!(reason = %reason, "hooks: RunEnd failed; continuing");
+        }
         let duration_ms = started.elapsed().as_millis() as u64;
         let status = match &terminal {
             LoopState::Done(_) => "Done",
@@ -2004,6 +2048,15 @@ impl GraphLoop {
         self
     }
 
+    /// Hooks system (borrowed from xAI's grok-build plugin architecture):
+    /// attach a [`HookRegistry`] populated from `EngineConfig::hooks`.
+    /// Hooks fire at 7 integration points in the loop (see
+    /// [`super::hooks::HookEvent`]).
+    pub fn with_hooks(mut self, hooks: HookRegistry) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     /// Try to match the current task against stored skills and compile the
     /// best match into a task graph. Returns `None` when:
     /// - No skill storage configured (`skill_storage` is `None`).
@@ -2112,6 +2165,17 @@ impl GraphLoop {
             return LoopState::Done(self.build_final_result());
         }
         if self.phase == Phase::Poisoned {
+            // Hooks: fire RunEnd at terminal Poisoned state, when the
+            // main step() is the entry point (web gateway uses this path
+            // rather than `run_with_persistence`).
+            let _ = self
+                .hooks
+                .fire(
+                    HookEvent::RunEnd,
+                    run_end_payload("poisoned", self.round),
+                    &self.run_id,
+                )
+                .await;
             return LoopState::Error("loop poisoned by previous error".into());
         }
         if let Pending::AwaitingAnswer { question } = &self.pending {
@@ -2960,6 +3024,31 @@ impl GraphLoop {
                 // dispatch L1 enrichment for just those nodes after apply.
                 let new_node_ids: Vec<NodeId> =
                     patch.add_nodes.iter().map(|n| n.id.clone()).collect();
+                // Hooks: BeforeProposePatch fires here, right before the
+                // patch lands on the graph. A `Gate` hook returning
+                // `{"reject": ...}` is logged but does NOT block the apply
+                // — per spec, hooks never fail the loop, they surface
+                // observability + side effects only.
+                if let Err(reason) = self
+                    .hooks
+                    .fire(
+                        HookEvent::BeforeProposePatch,
+                        before_propose_patch_payload(
+                            &format!(
+                                "add_nodes={} add_edges={} remove_nodes={} remove_edges={}",
+                                patch.add_nodes.len(),
+                                patch.add_edges.len(),
+                                patch.remove_node_ids.len(),
+                                patch.remove_edge_indices.len()
+                            ),
+                            self.round,
+                        ),
+                        &self.run_id,
+                    )
+                    .await
+                {
+                    warn!(reason = %reason, "hooks: BeforeProposePatch returned reject; applying patch anyway");
+                }
                 match self.graph.apply_patch(patch.clone()) {
                     Ok(()) => {
                         // Reset stuck detector — the model is making progress.
@@ -2970,6 +3059,28 @@ impl GraphLoop {
                             self.graph.node_count(),
                             self.graph.edge_count()
                         ));
+                        // Hooks: AfterPatchApplied fires once the graph
+                        // has actually accepted the patch. Carries the
+                        // summary of what changed (added/removed counts).
+                        let applied = serde_json::json!({
+                            "added_nodes": new_node_ids.len(),
+                            "added_edges": patch.add_edges.len(),
+                            "removed_nodes": patch.remove_node_ids.len(),
+                            "removed_edges": patch.remove_edge_indices.len(),
+                            "graph_nodes": self.graph.node_count(),
+                            "graph_edges": self.graph.edge_count(),
+                        });
+                        if let Err(reason) = self
+                            .hooks
+                            .fire(
+                                HookEvent::AfterPatchApplied,
+                                after_patch_applied_payload(applied),
+                                &self.run_id,
+                            )
+                            .await
+                        {
+                            warn!(reason = %reason, "hooks: AfterPatchApplied failed; continuing");
+                        }
                         // ── Orchestration: phase transitions after patch ──
                         {
                             let nodes_increased = self.graph.node_count() > before_nodes;
@@ -3424,6 +3535,30 @@ impl GraphLoop {
         }
 
         // 2. Dispatch
+        // Hooks: BeforeSubagent fires once per Task phase, carrying a
+        // summary of the task graph so hooks can log/notify before any
+        // sub-agent actually starts.
+        if let Err(reason) = self
+            .hooks
+            .fire(
+                HookEvent::BeforeSubagent,
+                before_subagent_payload(
+                    &self.task,
+                    &[
+                        "bash",
+                        "read_file",
+                        "write_file",
+                        "edit_file",
+                        "web_search",
+                        "web_fetch",
+                    ],
+                ),
+                &self.run_id,
+            )
+            .await
+        {
+            warn!(reason = %reason, "hooks: BeforeSubagent returned reject; dispatching anyway");
+        }
         let outcome = match disp.run(&task_graph, &self.graph, loader).await {
             Ok(o) => o,
             Err(e) => {
@@ -3439,6 +3574,26 @@ impl GraphLoop {
             tokens = outcome.total_tokens,
             "graph_loop: dispatcher complete"
         );
+        // Hooks: AfterSubagent fires after the dispatcher finishes its
+        // full DAG. Carries the success flag and a tiny summary; per-
+        // sub-agent result data lives on the graph (in L1) for
+        // hooks that need it.
+        let summary = format!(
+            "{} results; {} succeeded",
+            outcome.results.len(),
+            outcome.results.iter().filter(|r| r.success).count()
+        );
+        if let Err(reason) = self
+            .hooks
+            .fire(
+                HookEvent::AfterSubagent,
+                after_subagent_payload(outcome.all_succeeded, &summary),
+                &self.run_id,
+            )
+            .await
+        {
+            warn!(reason = %reason, "hooks: AfterSubagent failed; continuing");
+        }
         self.conversation.add_user(format!(
             "Task phase: dispatched {} task(s); {} succeeded, {} failed.",
             outcome.results.len(),
@@ -3591,6 +3746,20 @@ impl GraphLoop {
         };
 
         info!("graph_loop: entering Review phase");
+        // Hooks: BeforeVerdict fires once per Review phase, carrying the
+        // final graph size so hooks can gate the review (e.g. require
+        // human approval before the LLM-as-judge call).
+        if let Err(reason) = self
+            .hooks
+            .fire(
+                HookEvent::BeforeVerdict,
+                before_verdict_payload(self.graph.node_count(), self.graph.edge_count()),
+                &self.run_id,
+            )
+            .await
+        {
+            warn!(reason = %reason, "hooks: BeforeVerdict returned reject; running review anyway");
+        }
         let result = match reviewer
             .review(
                 &self.task,
