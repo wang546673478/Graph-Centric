@@ -1105,4 +1105,208 @@ mod tests {
             "header must be absent when disabled — non-Anthropic-compatible endpoints may reject it"
         );
     }
+
+    // -- Stress: prompt-caching body construction stability across iterations --
+    //
+    // This test runs `build_anthropic_body` 100 times with mutated inputs
+    // and asserts the cache_control: ephemeral markers appear in BOTH the
+    // `system` block and every tool entry on every iteration. The point is
+    // to surface any latent non-determinism / serde bug / cache_control
+    // insertion edge case — sharing one ModelRequest across iterations
+    // would mask mutation bugs, so we build a fresh request per iter.
+    //
+    // On zero iterations failing across 10 rounds × 100 iters = 1000
+    // stress executions, prompt-caching body construction is stable.
+    #[test]
+    fn prompt_caching_body_stress_100_iterations() {
+        let cfg = AnthropicConfig::default();
+        assert!(
+            cfg.prompt_caching,
+            "prompt_caching must be on by default; otherwise this test is vacuous"
+        );
+
+        for i in 0..100usize {
+            // Fresh input per iteration (mutation is the signal — sharing one
+            // ModelRequest across iterations would mask any stateful bug).
+            let req = ModelRequest {
+                messages: vec![
+                    Message::system(format!("You are agent #{}, respond concisely.", i)),
+                    Message::user(format!("task message {}", i)),
+                    Message::assistant(format!("ack {}", i)),
+                ],
+                tools: vec![serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "propose_patch",
+                        "description": "submit a patch to the graph",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"patches": {"type": "array"}},
+                        },
+                    },
+                })],
+                temperature: 0.4,
+                max_tokens: Some(1024),
+                stop: vec![],
+            };
+
+            let body = build_anthropic_body("MiniMax-M3", &req, cfg.prompt_caching)
+                .unwrap_or_else(|e| panic!("iteration {}: build_body failed: {}", i, e));
+
+            // Assert: body serializes to JSON without panic.
+            let body_str = serde_json::to_string(&body)
+                .unwrap_or_else(|e| panic!("iteration {}: serialize failed: {}", i, e));
+
+            // Assert: body is well-formed JSON (round-trip parse).
+            let parsed: serde_json::Value = serde_json::from_str(&body_str)
+                .unwrap_or_else(|e| panic!("iteration {}: parse failed: {}", i, e));
+
+            // Assert: when prompt_caching=true, system MUST be an array
+            // with at least one text block carrying cache_control:ephemeral.
+            // A plain string here means the cache_control header becomes a
+            // no-op — silent regression.
+            let sys = parsed.get("system").expect("system key");
+            match sys {
+                serde_json::Value::String(s) => {
+                    panic!(
+                        "iteration {}: expected system to be an array (with cache_control), \
+                         got plain string {:?}",
+                        i, s
+                    );
+                }
+                serde_json::Value::Array(_) => {
+                    let sys_arr = sys.as_array().unwrap();
+                    assert!(
+                        sys_arr.iter().any(|b| {
+                            b.get("cache_control")
+                                .and_then(|c| c.get("type"))
+                                .and_then(|t| t.as_str())
+                                == Some("ephemeral")
+                        }),
+                        "iteration {}: system array missing cache_control:ephemeral — body={}",
+                        i,
+                        body_str
+                    );
+                }
+                _ => panic!("iteration {}: system is neither string nor array", i),
+            }
+
+            // Assert: every tool carries cache_control:ephemeral.
+            let tools = parsed
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .expect("tools array");
+            assert!(!tools.is_empty(), "iteration {}: tools should be non-empty", i);
+            for (j, tool) in tools.iter().enumerate() {
+                assert_eq!(
+                    tool.get("cache_control")
+                        .and_then(|c| c.get("type"))
+                        .and_then(|t| t.as_str()),
+                    Some("ephemeral"),
+                    "iteration {} tool[{}]: missing cache_control:ephemeral — tool={:?}",
+                    i,
+                    j,
+                    tool
+                );
+            }
+
+            // Assert: structural shape invariants hold on every iteration.
+            assert!(parsed.get("model").is_some(), "iter {}: missing model key", i);
+            assert!(parsed.get("messages").is_some(), "iter {}: missing messages", i);
+            assert!(parsed.get("max_tokens").is_some(), "iter {}: missing max_tokens", i);
+            assert!(
+                parsed
+                    .get("max_tokens")
+                    .map(|v| v.is_u64() || v.is_i64())
+                    .unwrap_or(false),
+                "iter {}: max_tokens must be numeric, got {:?}",
+                i,
+                parsed.get("max_tokens")
+            );
+
+            // Assert: the system prompt text we sent is actually present
+            // in the body's system block — guards against accidental
+            // dropping of coalesced system content.
+            let sys_text_contains_iter = parsed["system"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|b| b.get("text"))
+                .and_then(|t| t.as_str())
+                .map(|s| s.contains(&format!("agent #{}", i)))
+                .unwrap_or(false);
+            assert!(
+                sys_text_contains_iter,
+                "iter {}: system text should contain 'agent #{}', got body={}",
+                i,
+                i,
+                body_str
+            );
+
+            // Assert: temperature is preserved through the round-trip
+            // (no float-precision loss or sign flip).
+            assert_eq!(
+                parsed.get("temperature").and_then(|t| t.as_f64()),
+                Some(0.4_f64),
+                "iter {}: temperature should be 0.4, got {:?}",
+                i,
+                parsed.get("temperature")
+            );
+        }
+    }
+
+    // -- Stress: prompt_caching=false body shape stays byte-stable --
+    //
+    // Companion test: when prompt_caching is OFF, the body must NOT contain
+    // any cache_control markers (the regression direction is the inverse
+    // of the test above — accidentally emitting cache_control when the
+    // feature is off would be just as broken).
+    #[test]
+    fn prompt_caching_disabled_body_stress_50_iterations() {
+        for i in 0..50usize {
+            let req = ModelRequest {
+                messages: vec![
+                    Message::system(format!("off-mode system {}", i)),
+                    Message::user(format!("hi {}", i)),
+                ],
+                tools: vec![serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": "propose_patch",
+                        "description": "submit a patch to the graph",
+                        "parameters": {"type": "object"},
+                    },
+                })],
+                temperature: 0.0,
+                max_tokens: Some(256),
+                stop: vec![],
+            };
+            let body = build_anthropic_body("MiniMax-M3", &req, false)
+                .unwrap_or_else(|e| panic!("iter {}: build failed: {}", i, e));
+            let body_str = serde_json::to_string(&body).unwrap();
+
+            // system should be a plain string (no cache_control block).
+            assert_eq!(
+                body["system"].as_str(),
+                Some(format!("off-mode system {}", i).as_str()),
+                "iter {}: prompt_caching=false should emit plain string system",
+                i
+            );
+            assert!(
+                body_str.contains("cache_control") == false,
+                "iter {}: prompt_caching=false body must not contain 'cache_control' anywhere",
+                i
+            );
+
+            // tools should NOT have cache_control.
+            let tools = body["tools"].as_array().expect("tools array");
+            for (j, t) in tools.iter().enumerate() {
+                assert!(
+                    t.get("cache_control").is_none(),
+                    "iter {} tool[{}]: must not carry cache_control when disabled",
+                    i,
+                    j
+                );
+            }
+        }
+    }
 }
