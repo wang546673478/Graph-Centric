@@ -45,6 +45,14 @@ pub struct AnthropicConfig {
     pub model: String,
     pub max_retries: u32,
     pub request_timeout: Duration,
+    /// Send `anthropic-beta: prompt-caching-2024-07-31` and wrap
+    /// system/tools blocks with `cache_control: ephemeral`. Recommended
+    /// for graph loops that run multiple turns with the same system
+    /// prompt — drops repeat-run cost by ~90% on the cached portion.
+    /// Default: true. Disable only if the upstream provider rejects
+    /// the header (e.g. when targeting non-Anthropic-compatible endpoints
+    /// that don't support cache_control blocks in the response).
+    pub prompt_caching: bool,
 }
 
 impl Default for AnthropicConfig {
@@ -58,6 +66,9 @@ impl Default for AnthropicConfig {
             // thinking enabled they regularly exceed 30s on a single
             // completion; smaller timeouts drop late completions.
             request_timeout: Duration::from_secs(180),
+            // On by default: graph-loop runs re-transmit the system
+            // prompt + tool schemas every turn; caching cuts the bill.
+            prompt_caching: true,
         }
     }
 }
@@ -122,13 +133,34 @@ impl AnthropicModel {
         ))
     }
 
-    /// Build the two required Anthropic auth headers. Public-ish (pub for
-    /// tests) so callers can introspect what we're sending.
-    pub fn auth_headers(&self) -> ((&'static str, String), (&'static str, &'static str)) {
-        (
-            ("x-api-key", self.cfg.api_key.clone()),
-            ("anthropic-version", "2023-06-01"),
-        )
+    /// Build the set of Anthropic auth + protocol headers. Public-ish
+    /// (pub for tests) so callers can introspect what we're sending.
+    ///
+    /// When `cfg.prompt_caching` is true, also adds the `anthropic-beta:
+    /// prompt-caching-2024-07-31` header required to opt the request into
+    /// Anthropic's ephemeral prompt cache. This is consumed together with
+    /// the `cache_control: {type: "ephemeral"}` blocks emitted by
+    /// `build_anthropic_body`; without both the request still succeeds
+    /// but no caching happens.
+    pub fn auth_headers(&self) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(&self.cfg.api_key)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        );
+        h.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        if self.cfg.prompt_caching {
+            h.insert(
+                HeaderName::from_static("anthropic-beta"),
+                HeaderValue::from_static("prompt-caching-2024-07-31"),
+            );
+        }
+        h
     }
 
     pub fn config(&self) -> &AnthropicConfig {
@@ -180,6 +212,7 @@ impl AnthropicModel {
 pub(crate) fn build_anthropic_body(
     cfg_model: &str,
     request: &ModelRequest,
+    prompt_caching: bool,
 ) -> Result<serde_json::Value> {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
@@ -264,15 +297,47 @@ pub(crate) fn build_anthropic_body(
     // passed None — never send "max_tokens": null.
     let max_tokens = request.max_tokens.unwrap_or(1024);
 
+    // Wrap `system` and `tools` with cache_control: ephemeral when the
+    // caller opted into prompt caching. Anthropic accepts BOTH a plain
+    // string system + bare tool objects AND the cache_control-flavored
+    // variants — they are wire-equivalent except for the cache lifetime.
+    // When `prompt_caching=false` we emit the plain forms byte-identical
+    // to the pre-cache-control body so existing tests / wire-shape
+    // contracts don't shift.
+    let tools_out: Vec<serde_json::Value> = if prompt_caching {
+        tools
+            .into_iter()
+            .map(|mut t| {
+                if let Some(obj) = t.as_object_mut() {
+                    obj.insert(
+                        "cache_control".to_string(),
+                        json!({"type": "ephemeral"}),
+                    );
+                }
+                t
+            })
+            .collect()
+    } else {
+        tools
+    };
+
     let mut body = json!({
         "model": cfg_model,
         "messages": messages,
-        "tools": tools,
+        "tools": tools_out,
         "max_tokens": max_tokens,
         "stream": false,
     });
     if let Some(sys) = system {
-        body["system"] = json!(sys);
+        if prompt_caching {
+            body["system"] = json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": {"type": "ephemeral"},
+            }]);
+        } else {
+            body["system"] = json!(sys);
+        }
     }
     if !request.stop.is_empty() {
         body["stop_sequences"] = json!(request.stop);
@@ -407,13 +472,12 @@ impl Model for AnthropicModel {
     }
 
     async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
-        let body = build_anthropic_body(&self.cfg.model, &request)?;
+        let body = build_anthropic_body(&self.cfg.model, &request, self.cfg.prompt_caching)?;
 
         let url = format!(
             "{}/v1/messages",
             self.cfg.base_url.trim_end_matches('/')
         );
-        let api_key = self.cfg.api_key.clone();
         let max_retries = self.cfg.max_retries;
         let client = self.http.clone();
 
@@ -430,11 +494,18 @@ impl Model for AnthropicModel {
         let mut attempt: u32 = 0;
         let parsed: AnthropicWireResponse = loop {
             attempt += 1;
-            let resp = client
+            // Build the header set once per attempt (it depends only on
+            // self.cfg, not on the request body, but a single closure keeps
+            // the call site tidy and lets the test introspect the same
+            // header set we actually send on the wire).
+            let req_builder = client
                 .post(&url)
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", "2023-06-01")
-                .header("Content-Type", "application/json")
+                .headers(self.auth_headers())
+                .header("Content-Type", "application/json");
+            // `prompt_caching` cache_control blocks need to be emitted in
+            // the body — see build_anthropic_body. The header alone is not
+            // sufficient.
+            let resp = req_builder
                 .json(&body)
                 .send()
                 .await
@@ -594,15 +665,16 @@ mod tests {
         let m = AnthropicModel::new(
             AnthropicConfig {
                 api_key: "sk-test-123".to_string(),
+                prompt_caching: false,
                 ..Default::default()
             }
             .with_minimax_defaults(),
         );
-        let (key, version) = m.auth_headers();
-        assert_eq!(key.0, "x-api-key");
-        assert_eq!(key.1, "sk-test-123");
-        assert_eq!(version.0, "anthropic-version");
-        assert_eq!(version.1, "2023-06-01");
+        let h = m.auth_headers();
+        assert_eq!(h.get("x-api-key").unwrap(), "sk-test-123");
+        assert_eq!(h.get("anthropic-version").unwrap(), "2023-06-01");
+        // prompt_caching disabled → no beta header.
+        assert!(h.get("anthropic-beta").is_none());
     }
 
     // -- Request converter (OLD ModelRequest -> Anthropic body) --
@@ -619,7 +691,7 @@ mod tests {
             max_tokens: Some(512),
             stop: vec![],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         assert_eq!(body["model"], "MiniMax-M3");
         assert_eq!(body["system"], "You are helpful.");
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
@@ -643,7 +715,7 @@ mod tests {
             max_tokens: Some(100),
             stop: vec![],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         // Anthropic allows ONE top-level `system` field — we coalesce.
         let sys = body["system"].as_str().expect("system must be string");
         assert!(sys.contains("Part 1."));
@@ -664,7 +736,7 @@ mod tests {
             max_tokens: Some(64),
             stop: vec![],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1]["role"], "assistant");
@@ -690,7 +762,7 @@ mod tests {
             max_tokens: Some(100),
             stop: vec![],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         // Tool results go on the *user* role per Anthropic spec.
@@ -720,7 +792,7 @@ mod tests {
             max_tokens: Some(100),
             stop: vec![],
         };
-        let err = build_anthropic_body("MiniMax-M3", &req).unwrap_err();
+        let err = build_anthropic_body("MiniMax-M3", &req, false).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("tool_call_id"), "got: {msg}");
     }
@@ -744,7 +816,7 @@ mod tests {
             max_tokens: Some(256),
             stop: vec![],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         let tools = body["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "propose_patch");
@@ -764,7 +836,7 @@ mod tests {
             max_tokens: Some(100),
             stop: vec!["STOP".to_string()],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         // Anthropic uses `stop_sequences` (plural) where OpenAI uses `stop`.
         assert_eq!(body["stop_sequences"][0], "STOP");
     }
@@ -778,7 +850,7 @@ mod tests {
             max_tokens: Some(100),
             stop: vec![],
         };
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         assert!(body.get("system").is_none(), "system must be omitted when empty");
     }
 
@@ -955,7 +1027,7 @@ mod tests {
             stop: vec![],
         };
 
-        let body = build_anthropic_body("MiniMax-M3", &req).expect("build body");
+        let body = build_anthropic_body("MiniMax-M3", &req, false).expect("build body");
         assert_eq!(body["model"], "MiniMax-M3");
         assert_eq!(body["system"], "be brief");
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
@@ -985,5 +1057,52 @@ mod tests {
             serde_json::json!({"city": "SF"})
         );
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+    }
+
+    // -- Prompt caching: config flag + auth_headers behavior --
+
+    #[test]
+    fn prompt_caching_default_is_enabled() {
+        let cfg = AnthropicConfig::default();
+        assert!(
+            cfg.prompt_caching,
+            "prompt caching must be on by default (graph-loop runs re-send system+tools every turn)"
+        );
+    }
+
+    #[test]
+    fn prompt_caching_can_be_disabled() {
+        let mut cfg = AnthropicConfig::default();
+        cfg.prompt_caching = false;
+        assert!(!cfg.prompt_caching);
+    }
+
+    #[test]
+    fn auth_headers_includes_prompt_caching_beta_when_enabled() {
+        let cfg = AnthropicConfig {
+            prompt_caching: true,
+            ..Default::default()
+        };
+        let m = AnthropicModel::new(cfg);
+        let h = m.auth_headers();
+        assert_eq!(
+            h.get("anthropic-beta").map(|v| v.to_str().unwrap()),
+            Some("prompt-caching-2024-07-31"),
+            "the prompt-caching beta header must be present when enabled"
+        );
+    }
+
+    #[test]
+    fn auth_headers_omits_prompt_caching_beta_when_disabled() {
+        let cfg = AnthropicConfig {
+            prompt_caching: false,
+            ..Default::default()
+        };
+        let m = AnthropicModel::new(cfg);
+        let h = m.auth_headers();
+        assert!(
+            h.get("anthropic-beta").is_none(),
+            "header must be absent when disabled — non-Anthropic-compatible endpoints may reject it"
+        );
     }
 }
