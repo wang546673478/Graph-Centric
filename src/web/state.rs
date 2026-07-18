@@ -411,6 +411,7 @@ impl EngineConfig {
                     advisor_api_key: std::env::var("ADVISOR_API_KEY")
                         .ok()
                         .filter(|s| !s.is_empty())
+                        .or_else(|| std::env::var("MODEL_API_KEY").ok().filter(|s| !s.is_empty()))
                         .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()))
                         .unwrap_or_default(),
                     advisor_api_key_masked: String::new(),
